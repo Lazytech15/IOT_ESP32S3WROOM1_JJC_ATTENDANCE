@@ -17,6 +17,7 @@
 #include <ArduinoJson.h>
 #include "employee_profile_display.h"
 #include "aes_decryptor.h"
+#include "sd_database.h"   // needed for SDDatabase::savePhoto() in downloadAllPhotosZip
 
 #define AES_KEY_B64 "wSDp34MhW1pp7RJ8V01ovioEMYKI2hJceZ91VzZcA7s="
 
@@ -228,18 +229,22 @@ public:
     // ══════════════════════════════════════════════════════════════════════════
     // downloadProfileImage
     // ══════════════════════════════════════════════════════════════════════════════
-    // downloadProfileImage
+    // KEY FIX v4: Corrected endpoint from "/api/profile/<uid>/default" (which
+    // does NOT exist in the PHP router) to "/api/profile/<uid>" (GET handler
+    // that streams the most recent profile image directly — see profile.php).
+    //
     // KEY FIX: Uses a LOCAL HTTPClient instead of the shared class member `http`.
     // The shared `http` can be mid-session from fetchAllEmployeesEach, which
     // causes downloadProfileImage to silently get 0 bytes. A fresh local
     // HTTPClient always starts clean and connects correctly.
-    // KEY FIX: Targets /api/profile/<uid>/default directly to skip 301 redirect.
     // ══════════════════════════════════════════════════════════════════════════════
     bool downloadProfileImage(const String& uid, uint8_t** outBuffer, int* outSize,
                                const String& overridePath = "") {
         if (uid.length() == 0 || !outBuffer || !outSize) return false;
 
-        // Build URL — go straight to /default to skip any server-side redirect
+        // Build URL — GET /api/profile/<uid> streams the most recent photo directly.
+        // This is the correct route (see profile.php GET /api/profile/:uid handler).
+        // "/default" does NOT exist in the PHP router and always returns 404.
         String url;
         if (overridePath.length() > 0) {
             if (overridePath.startsWith("http://") || overridePath.startsWith("https://"))
@@ -249,7 +254,7 @@ public:
             else
                 url = serverURL + "/" + overridePath;
         } else {
-            url = serverURL + "/api/profile/" + uid + "/default";
+            url = serverURL + "/api/profile/" + uid;   // ← correct endpoint
         }
 
         Serial.println("[IMG] GET " + url);
@@ -275,12 +280,12 @@ public:
         Serial.println("[IMG] Code: " + String(code));
         Serial.flush();
 
-        // If overridePath failed, automatically retry with the /default path
+        // If overridePath failed, retry with the canonical /api/profile/<uid>
         if (code != 200 && overridePath.length() > 0) {
-            Serial.println("[IMG] Retrying with /default path...");
+            Serial.println("[IMG] Retrying with canonical /api/profile/<uid>...");
             Serial.flush();
             imgHttp.end();
-            String fallback = serverURL + "/api/profile/" + uid + "/default";
+            String fallback = serverURL + "/api/profile/" + uid;
             imgHttp.setTimeout(15000);
             imgHttp.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
             imgHttp.begin(fallback);
@@ -694,5 +699,341 @@ public:
         Serial.printf("[HTTP] ===== fetchAllEmployeesEach DONE: %d =====\n", total);
         Serial.flush();
         return total;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // downloadAllPhotosZip
+    // ══════════════════════════════════════════════════════════════════════════
+    // Downloads ALL employee profile photos in a single HTTP request as a ZIP
+    // archive from POST /api/profile/bulk/download, then extracts each JPEG
+    // directly to /photos/<uid>.jpg on the SD card.
+    //
+    // This replaces the 1-per-employee HTTP loop used previously and cuts total
+    // download time from minutes to seconds for a typical 50-employee roster.
+    //
+    // ZIP format assumed: flat archive where each entry filename is
+    //   <uid>_<FirstName>_<LastName>.jpg   (as the PHP bulk/download produces)
+    //
+    // Returns number of photos successfully saved to SD.
+    // ══════════════════════════════════════════════════════════════════════════
+    int downloadAllPhotosZip(const String* uidArray, int uidCount,
+                              void (*progressCb)(int cur, int total, const String& uid) = nullptr) {
+        if (uidCount == 0) return 0;
+
+        // ── Build POST body: { "uids": [1, 2, ...] } ──────────────────────────
+        // Use a char buffer to avoid ArduinoJson overhead for a plain int array.
+        String body = "{\"uids\":[";
+        for (int i = 0; i < uidCount; i++) {
+            body += uidArray[i];
+            if (i < uidCount - 1) body += ",";
+        }
+        body += "],\"include_summary\":false}";
+
+        String url = serverURL + "/api/profile/bulk/download";
+        Serial.println("[ZIP] POST " + url);
+        Serial.printf("[ZIP] Requesting %d photos  heap=%u psram=%u\n",
+                      uidCount, ESP.getFreeHeap(), ESP.getFreePsram());
+        Serial.flush();
+
+        HTTPClient zipHttp;
+        zipHttp.setTimeout(60000);   // bulk download can take a while
+        zipHttp.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        zipHttp.begin(url);
+        zipHttp.addHeader("Content-Type", "application/json");
+        zipHttp.addHeader("X-Client-Type", "ESP32");
+        if (authToken.length() > 0)
+            zipHttp.addHeader("Authorization", "Bearer " + authToken);
+
+        int code = zipHttp.POST(body);
+        Serial.printf("[ZIP] HTTP code: %d\n", code);
+        Serial.flush();
+
+        if (code != 200 && code != 201) {
+            Serial.println("[ZIP] FAILED: unexpected HTTP code " + String(code));
+            String errBody = zipHttp.getString();
+            Serial.println("[ZIP] Error body: " + errBody.substring(0, 200));
+            Serial.flush();
+            zipHttp.end();
+            return 0;
+        }
+
+        int zipSize = zipHttp.getSize();
+        Serial.printf("[ZIP] Content-Length: %d\n", zipSize);
+        Serial.flush();
+
+        // ── Allocate buffer for the entire ZIP (PSRAM preferred) ──────────────
+        const int MAX_ZIP = 10 * 1024 * 1024;  // 10 MB cap
+        if (zipSize > MAX_ZIP) {
+            Serial.printf("[ZIP] FAILED: ZIP too large (%d B)\n", zipSize);
+            zipHttp.end();
+            return 0;
+        }
+
+        int allocSize = (zipSize > 0) ? (zipSize + 256) : 524288;  // default 512 KB
+        uint8_t* zipBuf = nullptr;
+        if (psramFound()) zipBuf = (uint8_t*)ps_malloc(allocSize);
+        if (!zipBuf)      zipBuf = (uint8_t*)malloc(allocSize);
+        if (!zipBuf) {
+            Serial.printf("[ZIP] FAILED: alloc %d B  heap=%u psram=%u\n",
+                          allocSize, ESP.getFreeHeap(), ESP.getFreePsram());
+            Serial.flush();
+            zipHttp.end();
+            return 0;
+        }
+
+        // ── Stream entire ZIP into buffer ─────────────────────────────────────
+        WiFiClient* stream = zipHttp.getStreamPtr();
+        int got = 0;
+        unsigned long lastData = millis();
+        const int CHUNK = 4096;
+        while (true) {
+            if (millis() - lastData > 30000) {
+                Serial.println("[ZIP] TIMEOUT reading stream");
+                Serial.flush();
+                break;
+            }
+            int avail = stream ? stream->available() : 0;
+            if (avail > 0) {
+                if (got + avail > allocSize) {
+                    int newSz = min(got + avail + 65536, MAX_ZIP);
+                    uint8_t* nb = psramFound() ? (uint8_t*)ps_realloc(zipBuf, newSz)
+                                               : (uint8_t*)realloc(zipBuf, newSz);
+                    if (nb) { zipBuf = nb; allocSize = newSz; }
+                    else    { avail = allocSize - got; if (avail <= 0) break; }
+                }
+                int rd = stream->readBytes(zipBuf + got,
+                                            min(avail, min(CHUNK, allocSize - got)));
+                if (rd > 0) { got += rd; lastData = millis(); }
+            } else {
+                if (zipSize > 0 && got >= zipSize) break;
+                if (!zipHttp.connected()) break;
+                delay(10);
+            }
+            if (zipSize > 0 && got >= zipSize) break;
+            if (got >= MAX_ZIP) break;
+            yield();
+        }
+        zipHttp.end();
+
+        Serial.printf("[ZIP] Stream done: got=%d expected=%d\n", got, zipSize);
+        Serial.flush();
+
+        if (got < 22) {  // ZIP local file header minimum
+            Serial.println("[ZIP] FAILED: data too short to be a ZIP");
+            free(zipBuf);
+            return 0;
+        }
+
+        // ── Validate PK magic bytes ────────────────────────────────────────────
+        if (zipBuf[0] != 0x50 || zipBuf[1] != 0x4B) {
+            Serial.printf("[ZIP] FAILED: not a ZIP (magic %02X %02X). Preview: ", zipBuf[0], zipBuf[1]);
+            char preview[201]; int plen = min(got, 200);
+            memcpy(preview, zipBuf, plen); preview[plen] = 0;
+            Serial.println(String(preview));
+            Serial.flush();
+            free(zipBuf);
+            return 0;
+        }
+
+        // ── Parse ZIP local file headers and extract each image ───────────────
+        // ZIP local file header layout (APPNOTE §4.3.7):
+        //   Offset  Len  Field
+        //      0     4   Signature  0x04034B50
+        //      4     2   Version needed
+        //      6     2   General purpose bit flag
+        //      8     2   Compression method  (0=stored, 8=deflate)
+        //     10     2   Last mod time
+        //     12     2   Last mod date
+        //     14     4   CRC-32
+        //     18     4   Compressed size
+        //     22     4   Uncompressed size
+        //     26     2   File name length
+        //     28     2   Extra field length
+        //     30     n   File name
+        //    30+n    m   Extra field
+        //  30+n+m   cs   File data
+        //
+        // We only support method 0 (stored) because ESP32 has no zlib decompressor
+        // in Arduino-land without an extra library.  The PHP bulk/download handler
+        // uses ZipArchive::CREATE which defaults to DEFLATE.  We therefore request
+        // the server send stored files by adding "compression_level":0 in the body.
+
+        // Re-issue the request with compression_level:0 if the first entry is compressed
+        // (i.e. method byte at offset 8 is non-zero).
+        // Actually let's re-request with level 0 upfront for reliability:
+        // (We already have the data — just check if stored; if compressed, re-fetch.)
+
+        bool needRedownload = false;
+        if (got >= 10) {
+            uint16_t method = (uint16_t)zipBuf[8] | ((uint16_t)zipBuf[9] << 8);
+            if (method != 0) {
+                Serial.printf("[ZIP] Compressed (method=%d) — re-fetching with compression_level:0\n", method);
+                Serial.flush();
+                needRedownload = true;
+            }
+        }
+
+        if (needRedownload) {
+            // Re-request with explicit compression_level:0 so files are STORED
+            body = "{\"uids\":[";
+            for (int i = 0; i < uidCount; i++) {
+                body += uidArray[i];
+                if (i < uidCount - 1) body += ",";
+            }
+            body += "],\"include_summary\":false,\"compression_level\":0}";
+
+            HTTPClient zipHttp2;
+            zipHttp2.setTimeout(60000);
+            zipHttp2.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+            zipHttp2.begin(url);
+            zipHttp2.addHeader("Content-Type", "application/json");
+            zipHttp2.addHeader("X-Client-Type", "ESP32");
+            if (authToken.length() > 0)
+                zipHttp2.addHeader("Authorization", "Bearer " + authToken);
+
+            int code2 = zipHttp2.POST(body);
+            Serial.printf("[ZIP] Re-fetch code: %d\n", code2);
+            Serial.flush();
+
+            if (code2 == 200 || code2 == 201) {
+                int zipSize2 = zipHttp2.getSize();
+                if (zipSize2 > 0 && zipSize2 <= MAX_ZIP) {
+                    uint8_t* nb = psramFound() ? (uint8_t*)ps_realloc(zipBuf, zipSize2 + 256)
+                                               : (uint8_t*)realloc(zipBuf, zipSize2 + 256);
+                    if (nb) { zipBuf = nb; allocSize = zipSize2 + 256; }
+                }
+                WiFiClient* s2 = zipHttp2.getStreamPtr();
+                got = 0; lastData = millis();
+                while (true) {
+                    if (millis() - lastData > 30000) break;
+                    int av = s2 ? s2->available() : 0;
+                    if (av > 0) {
+                        if (got + av > allocSize) break;
+                        int rd = s2->readBytes(zipBuf + got, min(av, min(CHUNK, allocSize - got)));
+                        if (rd > 0) { got += rd; lastData = millis(); }
+                    } else {
+                        if (zipHttp2.connected() == false) break;
+                        delay(10);
+                    }
+                    if (zipSize2 > 0 && got >= zipSize2) break;
+                    yield();
+                }
+                zipHttp2.end();
+                Serial.printf("[ZIP] Re-fetch done: got=%d\n", got);
+                Serial.flush();
+            } else {
+                zipHttp2.end();
+            }
+        }
+
+        // ── Walk local file headers ────────────────────────────────────────────
+        int saved = 0;
+        int pos   = 0;
+        int entry = 0;
+
+        while (pos + 30 <= got) {
+            // Check local file header signature
+            uint32_t sig = (uint32_t)zipBuf[pos]        |
+                           ((uint32_t)zipBuf[pos + 1] << 8)  |
+                           ((uint32_t)zipBuf[pos + 2] << 16) |
+                           ((uint32_t)zipBuf[pos + 3] << 24);
+
+            if (sig == 0x02014B50 || sig == 0x06054B50) break;  // central dir / EOCD
+            if (sig != 0x04034B50) { pos++; continue; }          // skip non-header bytes
+
+            uint16_t method      = (uint16_t)zipBuf[pos +  8] | ((uint16_t)zipBuf[pos +  9] << 8);
+            uint32_t compSize    = (uint32_t)zipBuf[pos + 18] | ((uint32_t)zipBuf[pos + 19] << 8)
+                                 | ((uint32_t)zipBuf[pos + 20] << 16) | ((uint32_t)zipBuf[pos + 21] << 24);
+            uint32_t uncompSize  = (uint32_t)zipBuf[pos + 22] | ((uint32_t)zipBuf[pos + 23] << 8)
+                                 | ((uint32_t)zipBuf[pos + 24] << 16) | ((uint32_t)zipBuf[pos + 25] << 24);
+            uint16_t fnLen       = (uint16_t)zipBuf[pos + 26] | ((uint16_t)zipBuf[pos + 27] << 8);
+            uint16_t extraLen    = (uint16_t)zipBuf[pos + 28] | ((uint16_t)zipBuf[pos + 29] << 8);
+
+            int dataOffset = pos + 30 + fnLen + extraLen;
+
+            // Extract filename
+            char fname[256] = {0};
+            int  fnCopy = min((int)fnLen, 255);
+            memcpy(fname, zipBuf + pos + 30, fnCopy);
+            fname[fnCopy] = 0;
+            String filename(fname);
+
+            entry++;
+            Serial.printf("[ZIP] Entry %d: '%s' method=%d stored=%u\n",
+                          entry, fname, method, uncompSize);
+            Serial.flush();
+
+            if (dataOffset + (int)compSize > got) {
+                Serial.println("[ZIP] Entry extends beyond buffer — stopping");
+                Serial.flush();
+                break;
+            }
+
+            // Skip non-image files (e.g. download_summary.json)
+            String fnLower = filename; fnLower.toLowerCase();
+            bool isImg = fnLower.endsWith(".jpg") || fnLower.endsWith(".jpeg") ||
+                         fnLower.endsWith(".png") || fnLower.endsWith(".webp") ||
+                         fnLower.endsWith(".gif");
+
+            if (!isImg) {
+                Serial.println("[ZIP] Skip non-image: " + filename);
+                pos = dataOffset + compSize;
+                continue;
+            }
+
+            // Extract UID: PHP names files "<uid>_FirstName_LastName.ext"
+            // So UID is everything before the first '_'.
+            String uid = "";
+            int underscore = filename.indexOf('_');
+            if (underscore > 0) {
+                uid = filename.substring(0, underscore);
+            }
+
+            if (uid.length() == 0) {
+                Serial.println("[ZIP] Cannot extract UID from filename: " + filename);
+                pos = dataOffset + compSize;
+                continue;
+            }
+
+            const uint8_t* imgData = zipBuf + dataOffset;
+            uint32_t       imgLen  = (method == 0) ? uncompSize : compSize;
+
+            if (progressCb) progressCb(entry, uidCount, uid);
+
+            // Validate image magic bytes
+            bool validImg = false;
+            if (imgLen >= 4) {
+                if (imgData[0] == 0xFF && imgData[1] == 0xD8 && imgData[2] == 0xFF)             validImg = true;
+                else if (imgData[0] == 0x89 && imgData[1] == 0x50 && imgData[2] == 0x4E)       validImg = true;
+                else if (imgData[0] == 0x47 && imgData[1] == 0x49 && imgData[2] == 0x46)       validImg = true;
+                else if (imgLen >= 12 && imgData[0] == 0x52 && imgData[1] == 0x49 &&
+                         imgData[8] == 0x57 && imgData[9] == 0x45)                              validImg = true;
+            }
+
+            if (!validImg) {
+                Serial.printf("[ZIP] Bad magic for uid=%s: %02X %02X %02X %02X\n",
+                              uid.c_str(), imgData[0], imgData[1], imgData[2], imgData[3]);
+                pos = dataOffset + compSize;
+                continue;
+            }
+
+            // Save to SD
+            if (SDDatabase::savePhoto(uid, imgData, (size_t)imgLen)) {
+                saved++;
+                Serial.printf("[ZIP] ✅ Saved uid=%s (%u bytes)\n", uid.c_str(), imgLen);
+            } else {
+                Serial.printf("[ZIP] ❌ savePhoto failed uid=%s\n", uid.c_str());
+            }
+            Serial.flush();
+
+            pos = dataOffset + compSize;
+            yield();
+        }
+
+        free(zipBuf);
+
+        Serial.printf("[ZIP] Extract done: %d/%d photos saved\n", saved, entry);
+        Serial.flush();
+        return saved;
     }
 };

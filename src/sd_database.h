@@ -22,6 +22,8 @@
 #include <FS.h>
 #include <ArduinoJson.h>
 #include "employee_profile_display.h"
+#include "sd_logger.h"
+#include "sd_file_manager.h"
 
 // ── SDMMC 1-bit pin definitions ───────────────────────────────────────────────
 #define SD_MMC_CLK_PIN  39

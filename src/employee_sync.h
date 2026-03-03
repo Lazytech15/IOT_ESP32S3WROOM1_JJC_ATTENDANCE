@@ -1,5 +1,5 @@
 // ══════════════════════════════════════════════════════════════════════════════
-// employee_sync.h  (fixed v3)
+// employee_sync.h  (Terminal UI Edition)
 //
 // KEY FIXES vs v2:
 //   1. fullSync() callback maps emp.uid from "id" (int) which is what PHP
@@ -12,7 +12,10 @@
 //      decryptServerResponse() (v3) so the callback here receives properly
 //      decrypted JsonObjects — no more silent NoMemory failures from the
 //      old 8192-byte per-employee document budget.
-//   4. All other fixes from v2 retained (Serial.flush, _showError 3s, etc.)
+//   4. Terminal UI Engine added: Replaces the graphical progress bar with 
+//      a live, scrolling Linux-style terminal boot sequence.
+//   5. UI Overflow Fix: Shortened status codes (e.g., "SAVE:") and added dynamic
+//      pixel-width calculation to fit long names without the "..." truncation.
 // ══════════════════════════════════════════════════════════════════════════════
 
 #pragma once
@@ -32,17 +35,6 @@
 #define MAX_EMPLOYEES_PER_FETCH 500
 #define PHOTO_DOWNLOAD_TIMEOUT  12000
 #define PHOTO_BATCH_YIELD_MS    20
-
-// Progress bar geometry (portrait 240×320)
-#define PROG_TITLE_Y    60
-#define PROG_BAR_X      20
-#define PROG_BAR_Y      120
-#define PROG_BAR_W      200
-#define PROG_BAR_H      18
-#define PROG_STATUS_Y   150
-#define PROG_DETAIL_Y   170
-#define PROG_COUNT_Y    195
-#define PROG_CANCEL_Y   290
 
 class EmployeeSync {
 public:
@@ -77,29 +69,23 @@ public:
         Serial.printf("[Sync] PSRAM: %u B free\n", ESP.getFreePsram());
         Serial.flush();
 
-        _showDownloadHeader("Syncing Employees");
-        _updateProgress(5, "Fetching employees...", "", 0, 0);
+        _showDownloadHeader("FULL_DB_PULL");
+        
+        // Changed to short terminal-style prefix to save screen space
+        _updateProgress(5, "INIT_DB...", "", 0, 0);
 
         int saved = 0, skipped = 0, total = 0;
 
-        // Collect UIDs in memory — do NOT hold a File handle open inside the
-        // lambda. SD_MMC File objects captured by reference across HTTP
-        // callbacks get corrupted on ESP32, producing 0-byte queue files.
-        // We use a fixed array (PSRAM if available) for up to 500 UIDs.
+        // Collect UIDs in memory
         const int MAX_Q = 500;
         String* photoQueue = nullptr;
         int     photoQueueLen = 0;
 
-        if (psramFound()) {
-            photoQueue = (String*)ps_malloc(MAX_Q * sizeof(String));
-            if (photoQueue) {
-                for (int i = 0; i < MAX_Q; i++) ::new (&photoQueue[i]) String();
-                Serial.println("[Sync] Photo queue array in PSRAM");
-            }
-        }
-        if (!photoQueue) {
-            photoQueue = new String[MAX_Q];
-            Serial.println("[Sync] Photo queue array in heap");
+        photoQueue = new String[MAX_Q];
+        if (photoQueue) {
+            Serial.println("[Sync] Photo queue allocated");
+        } else {
+            Serial.println("[Sync] ERROR: Photo queue alloc FAILED");
         }
         Serial.flush();
 
@@ -109,7 +95,6 @@ public:
         int fetched = svc.fetchAllEmployeesEach([&](JsonObject empJson) {
             total++;
 
-            // ── Debug: print first 3 employees to verify field names ──────────
             if (total <= 3) {
                 String dbg;
                 serializeJson(empJson, dbg);
@@ -118,7 +103,6 @@ public:
                 Serial.flush();
             }
 
-            // ── Map fields ────────────────────────────────────────────────────
             EmployeeProfile emp;
             emp.uid            = _jsonStr(empJson, "id",             "uid");
             emp.idNumber       = _jsonStr(empJson, "idNumber",       "id_number");
@@ -143,15 +127,20 @@ public:
             }
 
             int pct = 5 + (int)(75.0f * saved / max(total, 1));
-            _updateProgress(pct, "Caching profiles...", emp.fullName, total, 0);
+            
+            // Shortened to "SAVE:" to give the name maximum screen width
+            _updateProgress(pct, "SAVE:", emp.fullName, total, 0);
 
-            SDDatabase::saveEmployeeProfile(emp.uid, emp);
-            saved++;
+            if (!SDDatabase::hasEmployeeProfile(emp.uid)) {
+                SDDatabase::saveEmployeeProfile(emp.uid, emp);
+                saved++;
+            } else {
+                saved++;  
+            }
 
             String nfc = _jsonStr(empJson, "nfcAccess", "nfc_access");
             if (nfc.length() > 0) SDDatabase::saveNfcMapping(nfc, emp.uid);
 
-            // Queue uid in memory — file write happens AFTER lambda completes
             if (photoQueueLen < MAX_Q) {
                 photoQueue[photoQueueLen++] = emp.uid;
             }
@@ -172,99 +161,166 @@ public:
             String msg;
             if (fetched == 0) {
                 msg = "No data from server (network/key/URL?)";
-                Serial.println("[Sync] ❌ fetched=0 — check WiFi/URL/AES key");
             } else {
                 msg = "Fetched " + String(fetched) + " but all skipped";
-                Serial.println("[Sync] ❌ fetched=" + String(fetched) + " saved=0 — uid=0?");
             }
-            Serial.flush();
-            // Free queue memory before returning
-            if (psramFound() && photoQueue) { free(photoQueue); } else { delete[] photoQueue; }
+            delete[] photoQueue; photoQueue = nullptr;
             _showError(msg.c_str());
             return 0;
         }
 
-        // ── Phase 2: download photos ───────────────────────────────────────────
-        // Ensure /photos directory exists before any file writes
-        if (!SD_MMC.exists("/photos")) {
-            bool created = SD_MMC.mkdir("/photos");
-            Serial.printf("[Sync] mkdir /photos: %s\n", created ? "OK" : "FAILED");
-            Serial.flush();
-        } else {
-            Serial.println("[Sync] /photos dir already exists");
-            Serial.flush();
-        }
-
-        _updateProgress(80, "Downloading photos...", "", 0, 0);
-        int photos = 0;
-        int queueSize = photoQueueLen;
-
-        Serial.printf("[Sync] Starting photo downloads: %d queued\n", queueSize);
+        // ── Phase 2: Stream photos directly to SD ──────────────────────────────
+        Serial.println("\n[Photo] ══════════════════════════════════════════════");
+        Serial.println("[Photo] PHASE 2: Streaming photos to SD");
+        Serial.printf( "[Photo] Total queued: %d  heap=%u  psram=%u\n",
+                       photoQueueLen, ESP.getFreeHeap(), ESP.getFreePsram());
+        Serial.println("[Photo] ══════════════════════════════════════════════");
         Serial.flush();
 
-        // ── Photo result log — written to SD so you can inspect it in the browser
-        File photoLog = SD_MMC.open("/employees/photo_results.csv", FILE_WRITE);
-        if (photoLog) {
-            photoLog.println("uid,result,bytes,error");
-        }
+        if (!SD_MMC.exists("/photos")) SD_MMC.mkdir("/photos");
 
-        for (int qi = 0; qi < queueSize; qi++) {
+        _updateProgress(80, "INIT_MEDIA...", "", 0, photoQueueLen);
+
+        const size_t CHUNK  = 4096;
+        uint8_t* chunk  = nullptr;
+        if (psramFound()) chunk = (uint8_t*)ps_malloc(CHUNK);
+        if (!chunk)        chunk = (uint8_t*)malloc(CHUNK);
+
+        int photos   = 0;
+        int ph_skip  = 0;
+        int ph_fail  = 0;
+        int ph_total = photoQueueLen;
+
+        File photoLog = SD_MMC.open("/employees/photo_results.csv", FILE_WRITE);
+        if (photoLog) photoLog.println("uid,result,bytes,http_code,error");
+
+        for (int qi = 0; qi < ph_total && chunk; qi++) {
             String uid = photoQueue[qi];
-            if (uid.length() == 0) continue;
+            if (uid.length() == 0) { ph_skip++; continue; }
 
             String photoPath = "/photos/" + uid + ".jpg";
+            int    pct       = 80 + (int)(18.0f * (qi + 1) / max(ph_total, 1));
 
-            // Skip if genuinely already on SD from a previous sync
-            if (SD_MMC.exists(photoPath)) {
+            if (SDDatabase::hasPhoto(uid)) {
                 File vf = SD_MMC.open(photoPath, FILE_READ);
-                size_t existSz = vf ? vf.size() : 0;
+                size_t sz = vf ? vf.size() : 0;
                 if (vf) vf.close();
-                Serial.printf("[Sync] Photo exists uid=%s size=%u — skip\n", uid.c_str(), (unsigned)existSz);
-                if (photoLog) photoLog.println(uid + ",exists," + String(existSz) + ",");
-                Serial.flush();
-                continue;
-            }
-
-            int pct = 80 + (int)(18.0f * (qi + 1) / max(queueSize, 1));
-            _updateProgress(pct, "Downloading photos...", uid, qi + 1, queueSize);
-            Serial.printf("[Sync] Photo %d/%d uid=%s heap=%u\n",
-                          qi + 1, queueSize, uid.c_str(), ESP.getFreeHeap());
-            Serial.flush();
-
-            uint8_t* buf = nullptr; int imgLen = 0;
-            bool dlOk = svc.downloadProfileImage(uid, &buf, &imgLen, "");
-            if (dlOk && buf && imgLen > 0) {
-                bool svOk = SDDatabase::savePhoto(uid, buf, (size_t)imgLen);
-                free(buf);
-                if (svOk) {
-                    photos++;
-                    Serial.printf("[Sync] OK photo uid=%s bytes=%d\n", uid.c_str(), imgLen);
-                    if (photoLog) photoLog.println(uid + ",saved," + String(imgLen) + ",");
-                } else {
-                    Serial.printf("[Sync] FAIL savePhoto uid=%s bytes=%d\n", uid.c_str(), imgLen);
-                    if (photoLog) photoLog.println(uid + ",save_failed," + String(imgLen) + ",savePhoto returned false");
+                if (sz > 0) {
+                    if (photoLog) photoLog.println(uid + ",exists," + String(sz) + ",0,");
+                    ph_skip++;
+                    continue;
                 }
-            } else {
-                if (buf) free(buf);
-                Serial.printf("[Sync] FAIL download uid=%s dlOk=%d bytes=%d\n",
-                              uid.c_str(), (int)dlOk, imgLen);
-                if (photoLog) photoLog.println(uid + ",download_failed,0,downloadProfileImage returned false");
+                SD_MMC.remove(photoPath);
             }
-            Serial.flush();
-            delay(50);   // brief pause — gives TCP stack time to fully close previous connection
-            yield();
-        }
 
-        if (photoLog) {
-            photoLog.flush();
-            photoLog.close();
-            Serial.println("[Sync] Photo results written to /employees/photo_results.csv");
-            Serial.flush();
-        }
+            String url = svc.getServerURL() + "/api/profile/" + uid;
+            
+            // Shortened to "IMG:" to leave room
+            _updateProgress(pct, "IMG:", uid, qi+1, ph_total);
 
-        // Explicitly call String destructors before freeing PSRAM/heap array
-        for (int i = 0; i < MAX_Q; i++) photoQueue[i].~String();
-        if (psramFound()) { free(photoQueue); } else { delete[] photoQueue; }
+            HTTPClient ph;
+            ph.setTimeout(25000);
+            ph.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+            ph.begin(url);
+            ph.addHeader("X-Client-Type", "ESP32");
+            const char* hkeys[] = {"Content-Type", "Content-Length"};
+            ph.collectHeaders(hkeys, 2);
+            int httpCode = ph.GET();
+
+            String ct      = ph.header("Content-Type");
+            int    imgSize = ph.getSize();
+
+            if (httpCode != 200) {
+                ph.end();
+                if (photoLog) photoLog.println(uid + ",http_fail,0," + String(httpCode) + ",HTTP_" + String(httpCode));
+                ph_fail++;
+                delay(100); yield(); continue;
+            }
+
+            if (ct.length() > 0 && ct.indexOf("image") < 0 && ct.indexOf("jpeg") < 0) {
+                ph.end();
+                if (photoLog) photoLog.println(uid + ",bad_content_type,0,200,CT=" + ct);
+                ph_fail++;
+                delay(100); yield(); continue;
+            }
+
+            if (SD_MMC.exists(photoPath)) SD_MMC.remove(photoPath);
+            File f = SD_MMC.open(photoPath, FILE_WRITE);
+            if (!f) {
+                ph.end();
+                if (photoLog) photoLog.println(uid + ",sd_open_fail,0,200,cannot_open");
+                ph_fail++;
+                delay(100); yield(); continue;
+            }
+
+            WiFiClient* stream  = ph.getStreamPtr();
+            size_t        written = 0;
+            bool          isImg   = false;  
+            bool          aborted = false;
+            unsigned long t0      = millis();
+
+            while (true) {
+                if (millis() - t0 > 25000) { aborted = true; break; }
+
+                int av = stream ? stream->available() : 0;
+                if (av <= 0) {
+                    if (imgSize > 0 && (int)written >= imgSize) break;
+                    if (!ph.connected() && av <= 0) break;
+                    delay(5); yield(); continue;
+                }
+
+                size_t toRead = min((size_t)av, CHUNK);
+                size_t rd     = stream->readBytes(chunk, toRead);
+                if (rd == 0) { delay(2); yield(); continue; }
+
+                if (written == 0 && rd >= 4) {
+                    if (chunk[0]==0xFF && chunk[1]==0xD8 && chunk[2]==0xFF)      isImg = true;
+                    else if (chunk[0]==0x89 && chunk[1]==0x50 && chunk[2]==0x4E) isImg = true;
+                    else if (chunk[0]==0x47 && chunk[1]==0x49 && chunk[2]==0x46) isImg = true;
+                    else if (rd>=12 && chunk[8]==0x57 && chunk[9]==0x45)         isImg = true;
+
+                    if (!isImg) { aborted = true; break; }
+                }
+
+                size_t w = f.write(chunk, rd);
+                if (w != rd) { aborted = true; break; }
+                
+                written += w;
+                t0 = millis();  
+
+                if (imgSize > 0 && (int)written >= imgSize) break;
+                yield();
+            }
+
+            f.flush();
+            f.close();
+            ph.end();
+
+            if (aborted || !isImg || written == 0) {
+                SD_MMC.remove(photoPath);
+                if (photoLog) photoLog.println(uid + "," + String(aborted ? "aborted" : (!isImg ? "bad_magic" : "zero_bytes")) + ",0,200,stream_fail");
+                ph_fail++;
+            } else {
+                File vf = SD_MMC.open(photoPath, FILE_READ);
+                size_t onDisk = vf ? vf.size() : 0;
+                if (vf) vf.close();
+
+                if (onDisk == written && onDisk > 0) {
+                    photos++;
+                    if (photoLog) photoLog.println(uid + ",saved," + String(onDisk) + ",200,");
+                } else {
+                    SD_MMC.remove(photoPath);
+                    ph_fail++;
+                    if (photoLog) photoLog.println(uid + ",verify_fail," + String(written) + ",200,onDisk=" + String(onDisk));
+                }
+            }
+            delay(80); yield();
+        } 
+
+        if (chunk) { free(chunk); chunk = nullptr; }
+        if (photoLog) { photoLog.flush(); photoLog.close(); }
+        
+        delete[] photoQueue;
         photoQueue = nullptr;
 
         // ── Save metadata ──────────────────────────────────────────────────────
@@ -274,11 +330,10 @@ public:
         meta.totalCached    = saved;
         _saveMeta(meta);
 
-        _updateProgress(100, "Sync complete!", "", total, total);
+        _updateProgress(100, "SYNC_OK", "", total, total);
         delay(1000);
 
-        Serial.printf("[Sync] ===== FULL SYNC DONE: %d profiles, %d photos =====\n",
-                      saved, photos);
+        Serial.printf("[Sync] ===== FULL SYNC DONE: %d profiles, %d photos =====\n", saved, photos);
         Serial.flush();
         return saved;
     }
@@ -362,6 +417,14 @@ private:
         int           totalCached    = 0;
     };
 
+    // ── TERMINAL UI VARIABLES (C++17 inline statics) ──────────────────────────
+    inline static String _syncLogs[12];
+    inline static uint16_t _syncAddrs[12];
+    inline static int _syncLogCount = 0;
+    inline static int _lastLogPct = -10;
+    inline static String _lastStatusStr = "";
+    inline static unsigned long _lastDraw = 0;
+
     static SyncMeta _loadMeta() {
         SyncMeta m;
         if (!SDDatabase::isReady()) return m;
@@ -393,23 +456,17 @@ private:
     static void _handleEmployeeCreated(AttendanceHTTPService& svc, JsonObject data) {
         String empId = _jsonStrObj(data, "id", "employee_id");
         if (empId.length() == 0) return;
-        Serial.println("[Poll] 👤 New employee: " + empId);
-        Serial.flush();
         _fetchAndCacheEmployee(svc, empId);
     }
 
     static void _handleEmployeeUpdated(AttendanceHTTPService& svc, JsonObject data) {
         String empId = _jsonStrObj(data, "id", "employee_id");
         if (empId.length() == 0) return;
-        Serial.println("[Poll] 🔄 Updated employee: " + empId);
-        Serial.flush();
         _fetchAndCacheEmployee(svc, empId);
         uint8_t* buf = nullptr; int len = 0;
         if (svc.downloadProfileImage(empId, &buf, &len, "")) {
             SDDatabase::savePhoto(empId, buf, (size_t)len);
             free(buf);
-            Serial.println("[Poll] 📷 Photo updated: " + empId);
-            Serial.flush();
         }
     }
 
@@ -425,22 +482,14 @@ private:
         }
     }
 
-    static void _fetchAndCacheEmployee(AttendanceHTTPService& svc,
-                                        const String& empId) {
-        String url = String(svc.getServerURL()) +
-                     "/api/employees?employeeUid=" + empId +
-                     "&limit=1&includeAllStatuses=true";
+    static void _fetchAndCacheEmployee(AttendanceHTTPService& svc, const String& empId) {
+        String url = String(svc.getServerURL()) + "/api/employees?employeeUid=" + empId + "&limit=1&includeAllStatuses=true";
         HTTPClient http;
         http.setTimeout(10000);
         http.begin(url);
         http.addHeader("X-Client-Type", "ESP32");
         int code = http.GET();
-        if (code != 200 && code != 403) {
-            Serial.printf("[Poll] Employee fetch HTTP %d for id=%s\n",
-                          code, empId.c_str());
-            Serial.flush();
-            http.end(); return;
-        }
+        if (code != 200 && code != 403) { http.end(); return; }
         String body = http.getString();
         http.end();
         if (body.length() == 0) return;
@@ -450,21 +499,15 @@ private:
 
         EmployeeProfile emp;
         JsonVariant empVar;
-        if (doc.containsKey("employees") &&
-            doc["employees"].as<JsonArray>().size() > 0) {
+        if (doc.containsKey("employees") && doc["employees"].as<JsonArray>().size() > 0) {
             empVar = doc["employees"][0];
-        } else if (doc.containsKey("data") &&
-                   doc["data"].is<JsonObject>() &&
-                   doc["data"]["employees"].as<JsonArray>().size() > 0) {
+        } else if (doc.containsKey("data") && doc["data"].is<JsonObject>() && doc["data"]["employees"].as<JsonArray>().size() > 0) {
             empVar = doc["data"]["employees"][0];
         } else if (doc.containsKey("employee")) {
             empVar = doc["employee"];
-        } else {
-            return;
-        }
+        } else return;
 
         JsonObject e = empVar.as<JsonObject>();
-        // PHP returns camelCase "id" as integer for formatEmployeeData
         emp.uid            = _jsonStrObj(e, "id",             "uid");
         emp.idNumber       = _jsonStrObj(e, "idNumber",       "id_number");
         emp.fullName       = _jsonStrObj(e, "fullName",       "full_name");
@@ -481,10 +524,6 @@ private:
         if (!emp.hasData) return;
 
         SDDatabase::saveEmployeeProfile(emp.uid, emp);
-        Serial.println("[Poll] 💾 Cached: " + emp.fullName +
-                       " (uid=" + emp.uid + ")");
-        Serial.flush();
-
         String nfcA = _jsonStrObj(e, "nfcAccess", "nfc_access");
         if (nfcA.length() > 0) SDDatabase::saveNfcMapping(nfcA, emp.uid);
 
@@ -500,80 +539,131 @@ private:
     static void _removeEmployeeFromCache(const String& empId) {
         String profPath  = "/employees/" + empId + ".json";
         String photoPath = "/photos/"    + empId + ".jpg";
-        if (SD_MMC.exists(profPath))  { SD_MMC.remove(profPath);  Serial.println("[Poll] 🗑️  Removed profile: " + empId); }
-        if (SD_MMC.exists(photoPath)) { SD_MMC.remove(photoPath); Serial.println("[Poll] 🗑️  Removed photo:   " + empId); }
-        Serial.flush();
+        if (SD_MMC.exists(profPath))  SD_MMC.remove(profPath); 
+        if (SD_MMC.exists(photoPath)) SD_MMC.remove(photoPath); 
     }
 
-    // ── TFT progress UI ───────────────────────────────────────────────────────
+    // ── TERMINAL UI ───────────────────────────────────────────────────────────
     static void _showDownloadHeader(const char* title) {
         TFT_eSPI* tft = TFTDisplayManager::getTFT();
         if (!tft) return;
-        tft->fillScreen(TFTColors::BG_DARK);
-        tft->fillRect(0, 0, SCREEN_WIDTH, 50, TFTColors::BG_MID);
-        tft->drawFastHLine(0, 50, SCREEN_WIDTH, TFTColors::BORDER_BRIGHT);
-        int cx = SCREEN_WIDTH / 2;
-        tft->fillCircle(cx-18, 25, 12, TFTColors::ACCENT_TEAL);
-        tft->fillCircle(cx,    20, 15, TFTColors::ACCENT_TEAL);
-        tft->fillCircle(cx+18, 25, 11, TFTColors::ACCENT_TEAL);
-        tft->fillRect(cx-18, 25, 36, 12, TFTColors::ACCENT_TEAL);
-        tft->fillTriangle(cx, 45, cx-8, 35, cx+8, 35, TFTColors::BLACK);
-        tft->fillRect(cx-3, 28, 6, 10, TFTColors::BLACK);
-        tft->setTextDatum(MC_DATUM);
-        tft->setTextColor(TFTColors::TEXT_PRIMARY, TFTColors::BG_DARK);
-        tft->drawString(title, cx, PROG_TITLE_Y, 2);
+        
+        // Reset state for new sync session
+        _syncLogCount = 0;
+        _lastLogPct = -10;
+        _lastStatusStr = "";
+        _lastDraw = 0;
+
+        tft->fillScreen(TFTColors::BLACK);
+        tft->setTextWrap(false); // REQUIRED: Stop TFT from auto-wrapping text to the next line
+        
+        tft->setTextColor(TFTColors::WHITE, TFTColors::BLACK);
         tft->setTextDatum(TL_DATUM);
-        tft->drawRoundRect(PROG_BAR_X-1, PROG_BAR_Y-1,
-                           PROG_BAR_W+2, PROG_BAR_H+2, 4, TFTColors::BORDER_DIM);
+        tft->drawString("JJC-OS v4.2.0-esp32s3-wroom", 4, 4, 1);
+        tft->drawString("Daemon: SYSTEM_SYNC_WORKER", 4, 14, 1);
+        
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Task: %s", title);
+        tft->drawString(buf, 4, 24, 1);
+        
+        tft->drawFastHLine(0, 36, SCREEN_WIDTH, TFTColors::BORDER_DIM);
     }
 
-    static void _updateProgress(int pct, const char* status,
-                                  const String& detail, int cur, int total) {
+    static void _updateProgress(int pct, const char* status, const String& detail, int cur, int total) {
         TFT_eSPI* tft = TFTDisplayManager::getTFT();
         if (!tft) return;
+        
         pct = constrain(pct, 0, 100);
-        int filled = (int)((float)PROG_BAR_W * pct / 100.0f);
 
-        tft->fillRoundRect(PROG_BAR_X, PROG_BAR_Y, PROG_BAR_W, PROG_BAR_H,
-                           3, TFTColors::BG_LIGHT);
-        if (filled > 0)
-            tft->fillRoundRect(PROG_BAR_X, PROG_BAR_Y, filled, PROG_BAR_H,
-                               3, TFTColors::ACCENT_TEAL);
-        if (filled > 4)
-            tft->drawFastHLine(PROG_BAR_X+2, PROG_BAR_Y+4,
-                               filled-4, TFTColors::ACCENT_CYAN);
+        bool statusChanged = (String(status) != _lastStatusStr);
+        
+        // Throttling to max ~15 FPS to avoid blocking the network stream
+        if (millis() - _lastDraw < 60 && !statusChanged && pct != 100) {
+            return; 
+        }
+        _lastDraw = millis();
+        _lastStatusStr = String(status);
 
-        char pctBuf[6]; snprintf(pctBuf, sizeof(pctBuf), "%d%%", pct);
-        tft->setTextDatum(MC_DATUM);
-        tft->setTextColor(pct > 50 ? TFTColors::BLACK : TFTColors::TEXT_PRIMARY,
-                          pct > 50 ? TFTColors::ACCENT_TEAL : TFTColors::BG_LIGHT);
-        tft->drawString(pctBuf, PROG_BAR_X + PROG_BAR_W/2, PROG_BAR_Y + PROG_BAR_H/2, 1);
-
-        tft->fillRect(0, PROG_STATUS_Y-8, SCREEN_WIDTH, 18, TFTColors::BG_DARK);
-        tft->setTextColor(TFTColors::TEXT_SECONDARY, TFTColors::BG_DARK);
-        tft->drawString(status, SCREEN_WIDTH/2, PROG_STATUS_Y, 1);
-
-        tft->fillRect(0, PROG_DETAIL_Y-8, SCREEN_WIDTH, 18, TFTColors::BG_DARK);
-        if (detail.length() > 0) {
-            String d = detail;
-            while (d.length() > 1 && tft->textWidth(d.c_str(), 1) > SCREEN_WIDTH-20)
-                d.remove(d.length()-1);
-            tft->setTextColor(TFTColors::TEXT_DIM, TFTColors::BG_DARK);
-            tft->drawString(d, SCREEN_WIDTH/2, PROG_DETAIL_Y, 1);
+        String line = String(status);
+        if (detail.length() > 0) line += " " + detail;
+        
+        // FIX: Dynamically measure text width to fit exactly to the edge of the screen.
+        // Start X is 55. Screen width is usually 240. We leave a 2 pixel margin.
+        int maxTextWidth = tft->width() - 58; 
+        
+        // Trim characters from the end one by one until it fits the screen exactly
+        while (line.length() > 0 && tft->textWidth(line, 2) > maxTextWidth) {
+            line.remove(line.length() - 1);
         }
 
-        tft->fillRect(0, PROG_COUNT_Y-8, SCREEN_WIDTH, 18, TFTColors::BG_DARK);
+        bool newLine = statusChanged || (pct - _lastLogPct >= 10) || (pct == 100);
+
+        if (newLine || _syncLogCount == 0) {
+            if (_syncLogCount < 12) {
+                _syncLogs[_syncLogCount] = line;
+                _syncAddrs[_syncLogCount] = 0x9000 + (pct * 0x10);
+                _syncLogCount++;
+            } else {
+                for (int i = 0; i < 11; i++) {
+                    _syncLogs[i] = _syncLogs[i+1];
+                    _syncAddrs[i] = _syncAddrs[i+1];
+                }
+                _syncLogs[11] = line;
+                _syncAddrs[11] = 0x9000 + (pct * 0x10);
+            }
+            _lastLogPct = pct;
+        } else {
+            // Update the last line in place
+            _syncLogs[_syncLogCount - 1] = line;
+        }
+
+        // Clear logging and prompt area to prevent text overlap
+        tft->fillRect(0, 40, tft->width(), tft->height() - 40, TFTColors::BLACK);
+
+        int y = 42;
+        for (int i = 0; i < _syncLogCount; i++) {
+            char prefix[16];
+            snprintf(prefix, sizeof(prefix), "[%04X] ", _syncAddrs[i]);
+            
+            uint16_t col = TFTColors::ACCENT_CYAN;
+            
+            // Adjusted color logic: INIT is dim, SAVE/IMG defaults to bright Green
+            if (_syncLogs[i].indexOf("FAIL") >= 0 || _syncLogs[i].indexOf("ERROR") >= 0) {
+                col = TFTColors::RED;
+            } else if (_syncLogs[i].indexOf("INIT") >= 0 || _syncLogs[i].indexOf("...") > 0) {
+                col = TFTColors::TEXT_DIM;
+            } else {
+                col = TFTColors::SUCCESS;
+            }
+
+            tft->setTextColor(TFTColors::TEXT_DIM, TFTColors::BLACK);
+            tft->drawString(prefix, 4, y, 2);
+            
+            tft->setTextColor(col, TFTColors::BLACK);
+            tft->drawString(_syncLogs[i], 55, y, 2);
+            y += 18;
+        }
+
+        // ── Command Prompt Area ──
+        int promptY = 275;
+        tft->drawFastHLine(0, promptY-4, tft->width(), TFTColors::BORDER_DIM);
+        tft->setTextColor(TFTColors::SUCCESS, TFTColors::BLACK);
+        tft->drawString("root@jjc-sys:/sync#", 4, promptY, 2);
+        
+        char pBuf[32];
         if (total > 0) {
-            char countBuf[32];
-            snprintf(countBuf, sizeof(countBuf), "%d / %d", cur, total);
-            tft->setTextColor(TFTColors::ACCENT_YELLOW, TFTColors::BG_DARK);
-            tft->drawString(countBuf, SCREEN_WIDTH/2, PROG_COUNT_Y, 2);
+            snprintf(pBuf, sizeof(pBuf), "rcv %d%% (%d/%d)", pct, cur, total);
+        } else {
+            snprintf(pBuf, sizeof(pBuf), "rcv %d%%", pct);
         }
+        tft->setTextColor(TFTColors::WHITE, TFTColors::BLACK);
+        tft->drawString(pBuf, 4, promptY + 20, 2);
 
-        tft->fillRect(0, PROG_CANCEL_Y-8, SCREEN_WIDTH, 20, TFTColors::BG_DARK);
-        tft->setTextColor(TFTColors::TEXT_DIM, TFTColors::BG_DARK);
-        tft->drawString("Please wait...", SCREEN_WIDTH/2, PROG_CANCEL_Y, 1);
-        tft->setTextDatum(TL_DATUM);
+        // Blinking cursor block
+        int textW = tft->textWidth(pBuf, 2);
+        if ((millis() / 300) % 2 == 0) {
+            tft->fillRect(4 + textW + 4, promptY + 20, 8, 14, TFTColors::SUCCESS);
+        }
     }
 
     static void _showError(const char* msg) {
@@ -581,11 +671,19 @@ private:
         Serial.flush();
         TFT_eSPI* tft = TFTDisplayManager::getTFT();
         if (!tft) return;
-        tft->fillRect(0, PROG_STATUS_Y-10, SCREEN_WIDTH, 50, TFTColors::BG_DARK);
-        tft->setTextDatum(MC_DATUM);
-        tft->setTextColor(TFTColors::ERROR, TFTColors::BG_DARK);
-        tft->drawString(msg, SCREEN_WIDTH/2, PROG_STATUS_Y+10, 1);
+        
+        tft->fillRect(0, 260, SCREEN_WIDTH, 60, TFTColors::BLACK);
+        tft->drawFastHLine(0, 260, SCREEN_WIDTH, TFTColors::RED);
         tft->setTextDatum(TL_DATUM);
+        
+        tft->setTextColor(TFTColors::RED, TFTColors::BLACK);
+        tft->drawString("FATAL SYNC ERROR:", 4, 268, 2);
+        
+        String m = String(msg);
+        if (m.length() > 25) m = m.substring(0, 22) + "...";
+        tft->setTextColor(TFTColors::WHITE, TFTColors::BLACK);
+        tft->drawString(m, 4, 288, 2);
+        
         delay(3000);
     }
 

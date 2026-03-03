@@ -1,10 +1,48 @@
 // ══════════════════════════════════════════════════════════════════════════════
 // sd_database.cpp  — uses SD_MMC (SDMMC 1-bit, pins 38/39/40)
+//
+// FIX v2 — NFC UID filenames now use sanitized names.
+//
+// ROOT CAUSE OF MISSING EMPLOYEE PROFILE DISPLAY:
+//   NFC card UIDs look like "04:A3:2F:12:6B:4C:80".
+//   saveNfcMapping() was constructing filenames like:
+//       /employees/nfc_04:A3:2F:12:6B:4C:80.json
+//   The SD card is formatted as FAT32, which does NOT allow colons ':' in
+//   filenames. SD_MMC.open() silently fails to create such a file, so the
+//   mapping was never written.
+//   loadUidForNfc() therefore always returned "" for every card scan,
+//   the employee lookup fell through to the server every time, and the
+//   photo path was always empty on the first scan → only initials drawn.
+//
+// FIX:
+//   _sanitizeForFilename() replaces every ':' with '-' before the filename
+//   is composed. Files are now stored as e.g.:
+//       /employees/nfc_04-A3-2F-12-6B-4C-80.json
+//   Both saveNfcMapping() and loadUidForNfc() use the same helper so
+//   they always agree on the filename.
 // ══════════════════════════════════════════════════════════════════════════════
 
 #include "sd_database.h"
+#include "sd_logger.h"
 
 bool SDDatabase::_ready = false;
+
+// ── Private helper: replace characters illegal on FAT32 ──────────────────────
+// FAT32 forbids: \ / : * ? " < > |
+// NFC UIDs only ever contain hex digits and ':', so we just replace ':' → '-'.
+static String _sanitizeForFilename(const String& s) {
+    String out = s;
+    out.replace(":", "-");   // "04:A3:2F" → "04-A3-2F"
+    out.replace("/", "-");
+    out.replace("\\", "-");
+    out.replace("*", "-");
+    out.replace("?", "-");
+    out.replace("\"", "-");
+    out.replace("<", "-");
+    out.replace(">", "-");
+    out.replace("|", "-");
+    return out;
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // begin
@@ -50,6 +88,8 @@ bool SDDatabase::begin() {
     ensureDir("/photos");
 
     _ready = true;
+    ensureDir("/logs");
+    SDLogger::begin();
     Serial.println("[SD] Ready");
     return true;
 }
@@ -211,8 +251,8 @@ bool SDDatabase::saveEmployeeProfile(const String& empUid, const EmployeeProfile
     doc["email"]          = emp.email;
     doc["status"]         = emp.status;
     doc["employmentType"] = emp.employmentType;
-    doc["accessGranted"]   = emp.accessGranted;
-    doc["profilePicture"]  = emp.profilePicture;
+    doc["accessGranted"]  = emp.accessGranted;
+    doc["profilePicture"] = emp.profilePicture;
 
     serializeJson(doc, f);
     f.close();
@@ -248,11 +288,12 @@ bool SDDatabase::loadEmployeeProfile(const String& empUid, EmployeeProfile& out)
     out.email          = doc["email"]          | "";
     out.status         = doc["status"]         | "Active";
     out.employmentType = doc["employmentType"] | "";
-    out.accessGranted   = doc["accessGranted"]  | false;
-    out.profilePicture  = doc["profilePicture"]  | "";
-    out.hasData         = true;
+    out.accessGranted  = doc["accessGranted"]  | false;
+    out.profilePicture = doc["profilePicture"] | "";
+    out.hasData        = true;
 
-    Serial.println("[SD] Loaded cached: " + out.fullName);
+    Serial.println("[SD] Loaded cached: " + out.fullName + "  uid=" + out.uid +
+                   "  photo=" + out.profilePicture);
     return true;
 }
 
@@ -295,7 +336,7 @@ bool SDDatabase::savePhoto(const String& empUid, const uint8_t* data, size_t len
         yield();
     }
 
-    f.flush();  // flush SD buffer to card before close
+    f.flush();
     f.close();
 
     if (written != length) {
@@ -350,9 +391,10 @@ void SDDatabase::printInfo() {
                   freeBytes()         / 1048576);
     Serial.println("[SD] Attendance files:\n" + listAttendanceDates());
 }
-// ================================================================================
+
+// ══════════════════════════════════════════════════════════════════════════════
 // hasCheckedInToday
-// ================================================================================
+// ══════════════════════════════════════════════════════════════════════════════
 bool SDDatabase::hasCheckedInToday(const String& empUid) {
     if (!_ready) return false;
     String path = todayFilename();
@@ -383,31 +425,65 @@ bool SDDatabase::hasCheckedInToday(const String& empUid) {
     return (lastEvent == "check-in");
 }
 
-// ================================================================================
-// saveNfcMapping - store card->uid lookup file
-// ================================================================================
+// ══════════════════════════════════════════════════════════════════════════════
+// saveNfcMapping / loadUidForNfc
+//
+// FIX: NFC UIDs contain colons (e.g. "04:A3:2F:12:6B:4C:80").
+// FAT32 forbids ':' in filenames — SD_MMC.open() silently fails on such names,
+// so the mapping was NEVER written and NEVER read back.
+//
+// Solution: _sanitizeForFilename() replaces ':' with '-' before composing
+// the path. Both functions use the same helper so they always agree.
+//
+// Old filename: /employees/nfc_04:A3:2F:12:6B:4C:80.json  ← INVALID on FAT32
+// New filename: /employees/nfc_04-A3-2F-12-6B-4C-80.json  ← valid
+// ══════════════════════════════════════════════════════════════════════════════
 bool SDDatabase::saveNfcMapping(const String& cardId, const String& empUid) {
-    if (!_ready||cardId.length()==0||empUid.length()==0) return false;
-    String path = "/employees/nfc_" + cardId + ".json";
+    if (!_ready || cardId.length() == 0 || empUid.length() == 0) return false;
+
+    String safeId = _sanitizeForFilename(cardId);
+    String path   = "/employees/nfc_" + safeId + ".json";
+
+    Serial.println("[SD] saveNfcMapping: " + cardId + " → " + empUid +
+                   "  file=" + path);
+
     File f = SD_MMC.open(path, FILE_WRITE);
-    if (!f) return false;
+    if (!f) {
+        Serial.println("[SD] saveNfcMapping: open FAILED for " + path);
+        return false;
+    }
     f.print("{\"uid\":\""); f.print(empUid); f.print("\"}");
     f.close();
+
+    Serial.println("[SD] saveNfcMapping: saved OK");
     return true;
 }
 
-// ================================================================================
-// loadUidForNfc - reverse lookup card->uid
-// ================================================================================
 String SDDatabase::loadUidForNfc(const String& cardId) {
-    if (!_ready||cardId.length()==0) return "";
-    if (SD_MMC.exists("/employees/"+cardId+".json")) return cardId;
-    String mp = "/employees/nfc_"+cardId+".json";
-    if (!SD_MMC.exists(mp)) return "";
+    if (!_ready || cardId.length() == 0) return "";
+
+    // First check: if cardId itself is an employee uid (numeric id scan)
+    if (SD_MMC.exists("/employees/" + cardId + ".json")) return cardId;
+
+    // Second check: NFC mapping file (use same sanitized filename)
+    String safeId = _sanitizeForFilename(cardId);
+    String mp = "/employees/nfc_" + safeId + ".json";
+
+    Serial.println("[SD] loadUidForNfc: looking for " + mp);
+
+    if (!SD_MMC.exists(mp)) {
+        Serial.println("[SD] loadUidForNfc: not found → will go to server");
+        return "";
+    }
+
     File f = SD_MMC.open(mp, FILE_READ);
     if (!f) return "";
+
     DynamicJsonDocument doc(128);
     deserializeJson(doc, f);
     f.close();
-    return doc["uid"] | "";
+
+    String uid = doc["uid"] | "";
+    Serial.println("[SD] loadUidForNfc: found empUid=" + uid);
+    return uid;
 }

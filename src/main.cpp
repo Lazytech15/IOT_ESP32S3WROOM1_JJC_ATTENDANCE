@@ -21,6 +21,7 @@
 
 #include <Arduino.h>
 #include <SD_MMC.h>
+#include <time.h>                   // ← NEW: Required for NTP time sync
 #include "TFTDisplayManager.h"
 #include "dashboard.h"
 #include "nfc_manager.h"
@@ -30,11 +31,11 @@
 #include "employee_profile_display.h"
 #include "attendance_http_service.h"
 #include "sd_database.h"
-#include "employee_sync.h"          // ← NEW
+#include "employee_sync.h"
 
 // ─── Timing constants ────────────────────────────────────────────────────────
-#define NFC_CARD_DISPLAY_MS    4000
-#define NFC_STATUS_DISPLAY_MS  2000
+#define NFC_CARD_DISPLAY_MS    2500   // was 4000 (-1.5s)
+#define NFC_STATUS_DISPLAY_MS   500   // was 2000 (-1.5s)
 #define NFC_POLL_INTERVAL_MS    500
 #define CLOCK_UPDATE_MS        1000
 #define STATS_REFRESH_MS      30000
@@ -125,6 +126,25 @@ String        lastClockType  = "check-in";
 static void          enterState(SystemState s) { currentState = s; stateEnteredAt = millis(); }
 static unsigned long stateElapsed()            { return millis() - stateEnteredAt; }
 
+// ─── NTP Time Sync ────────────────────────────────────────────────────────────
+void syncNTPTime() {
+    if (wifiConfig.isConnected()) {
+        Serial.println("[Time] Syncing with NTP...");
+        // Set timezone to UTC+8 hours
+        configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+        
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo, 10000)) { // 10 second timeout
+            clkH = timeinfo.tm_hour;
+            clkM = timeinfo.tm_min;
+            clkS = timeinfo.tm_sec;
+            Serial.printf("[Time] Synced: %02d:%02d:%02d\n", clkH, clkM, clkS);
+        } else {
+            Serial.println("[Time] Failed to obtain time");
+        }
+    }
+}
+
 // ─── downloadAndCachePhoto ────────────────────────────────────────────────────
 static String downloadAndCachePhoto(const EmployeeProfile& emp) {
     if (!SDDatabase::isReady())       return "";
@@ -191,131 +211,16 @@ static void triggerInitialSync() {
         Serial.flush();
     }
 
-    // ── PHOTO DIAGNOSTIC TEST ─────────────────────────────────────────────────
-    // Downloads employee #1's photo using a raw HTTPClient (no service layer)
-    // and writes it directly to SD. This isolates exactly which step fails:
-    //   STEP A: Can we do HTTPS GET at all?
-    //   STEP B: Do we receive bytes?
-    //   STEP C: Can we open SD for write?
-    //   STEP D: Does the file appear after write?
-    {
-        Serial.println("\n[PhotoTest] ========== PHOTO DIAGNOSTIC START ==========");
-        Serial.printf("[PhotoTest] Heap: %u  PSRAM: %u\n", ESP.getFreeHeap(), ESP.getFreePsram());
-        Serial.flush();
-
-        // Step A: Raw HTTPS GET — bypass all service/wrapper code
-        String testUrl = String(SERVER_URL) + "/api/profile/1/default";
-        Serial.println("[PhotoTest] A: GET " + testUrl);
-        Serial.flush();
-
-        HTTPClient diagHttp;
-        diagHttp.setTimeout(20000);
-        diagHttp.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-        diagHttp.begin(testUrl);
-        diagHttp.addHeader("X-Client-Type", "ESP32");
-        int diagCode = diagHttp.GET();
-
-        Serial.printf("[PhotoTest] A: HTTP code=%d\n", diagCode);
-        Serial.printf("[PhotoTest] A: Content-Type: %s\n", diagHttp.header("Content-Type").c_str());
-        Serial.printf("[PhotoTest] A: Content-Length: %d\n", diagHttp.getSize());
-        Serial.flush();
-
-        if (diagCode == 200) {
-            // Step B: Read bytes from stream
-            WiFiClient* diagStream = diagHttp.getStreamPtr();
-            int diagSize = diagHttp.getSize();
-            int diagAlloc = (diagSize > 0 && diagSize < 400000) ? diagSize + 16 : 65536;
-
-            uint8_t* diagBuf = nullptr;
-            if (psramFound()) diagBuf = (uint8_t*)ps_malloc(diagAlloc);
-            if (!diagBuf)     diagBuf = (uint8_t*)malloc(diagAlloc);
-
-            Serial.printf("[PhotoTest] B: alloc=%d buf=%s\n", diagAlloc, diagBuf ? "OK" : "FAILED");
-            Serial.flush();
-
-            int diagGot = 0;
-            if (diagBuf && diagStream) {
-                unsigned long t0 = millis();
-                while (millis() - t0 < 15000) {
-                    int avail = diagStream->available();
-                    if (avail > 0) {
-                        if (diagGot + avail > diagAlloc) {
-                            int newSz = min(diagGot + avail + 16384, 400000);
-                            uint8_t* nb = (uint8_t*)realloc(diagBuf, newSz);
-                            if (nb) { diagBuf = nb; diagAlloc = newSz; }
-                            else avail = diagAlloc - diagGot;
-                            if (avail <= 0) break;
-                        }
-                        int rd = diagStream->readBytes(diagBuf + diagGot, min(avail, min(4096, diagAlloc - diagGot)));
-                        if (rd > 0) { diagGot += rd; t0 = millis(); }
-                    } else {
-                        if (diagSize > 0 && diagGot >= diagSize) break;
-                        if (!diagHttp.connected()) break;
-                        delay(5);
-                    }
-                    if (diagSize > 0 && diagGot >= diagSize) break;
-                    yield();
-                }
-            }
-            diagHttp.end();
-
-            Serial.printf("[PhotoTest] B: got=%d bytes\n", diagGot);
-            if (diagGot > 0) {
-                Serial.printf("[PhotoTest] B: first bytes: %02X %02X %02X %02X\n",
-                              diagBuf[0], diagBuf[1], diagBuf[2], diagBuf[3]);
-            }
-            Serial.flush();
-
-            // Step C: Write to SD
-            if (diagGot > 0 && SDDatabase::isReady()) {
-                String diagPath = "/photos/diag_test.jpg";
-                if (SD_MMC.exists(diagPath)) SD_MMC.remove(diagPath);
-                File diagF = SD_MMC.open(diagPath, FILE_WRITE);
-                Serial.printf("[PhotoTest] C: open %s → %s\n",
-                              diagPath.c_str(), diagF ? "OK" : "FAILED");
-                Serial.flush();
-
-                if (diagF) {
-                    size_t written = diagF.write(diagBuf, diagGot);
-                    diagF.flush();
-                    diagF.close();
-                    Serial.printf("[PhotoTest] C: wrote %u / %d bytes\n", (unsigned)written, diagGot);
-                    Serial.flush();
-
-                    // Step D: Verify file on SD
-                    if (SD_MMC.exists(diagPath)) {
-                        File vf = SD_MMC.open(diagPath, FILE_READ);
-                        size_t onDisk = vf ? vf.size() : 0;
-                        if (vf) vf.close();
-                        Serial.printf("[PhotoTest] D: file on SD = %u bytes — %s\n",
-                                      (unsigned)onDisk,
-                                      (onDisk == (size_t)diagGot) ? "VERIFIED OK" : "SIZE MISMATCH");
-                    } else {
-                        Serial.println("[PhotoTest] D: file NOT found on SD after write!");
-                    }
-                    Serial.flush();
-                }
-            } else if (diagGot == 0) {
-                Serial.println("[PhotoTest] B: ZERO BYTES — HTTP layer is the problem");
-                Serial.flush();
-            } else if (!SDDatabase::isReady()) {
-                Serial.println("[PhotoTest] C: SD not ready — SD is the problem");
-                Serial.flush();
-            }
-
-            if (diagBuf) free(diagBuf);
-        } else {
-            diagHttp.end();
-            Serial.printf("[PhotoTest] A: FAILED — HTTP %d. Network/TLS issue.\n", diagCode);
-            Serial.flush();
-        }
-
-        Serial.println("[PhotoTest] ========== PHOTO DIAGNOSTIC END ==========\n");
-        Serial.flush();
-    }
-    // ── END PHOTO DIAGNOSTIC ──────────────────────────────────────────────────
-
-    EmployeeSync::fullSyncIfNeeded(attService, true);  // force=true: always sync first WiFi connect each session
+    // Force sync only if there are no cached employees yet.
+    // If SD already has profiles, skip the full re-download to save time.
+    bool hasCache = SDDatabase::isReady() &&
+                    SD_MMC.exists("/employees") &&
+                    SD_MMC.exists("/employees/sync_meta.json");
+    Serial.printf("[Sync] hasCache=%s → force=%s\n",
+                  hasCache ? "YES" : "NO",
+                  hasCache ? "NO" : "YES");
+    Serial.flush();
+    EmployeeSync::fullSyncIfNeeded(attService, !hasCache);
 
     Serial.printf("[Sync] Heap after sync: %u B free\n", ESP.getFreeHeap());
     Serial.println("[Sync] Sync complete");
@@ -329,7 +234,16 @@ static void triggerInitialSync() {
 
 // ─── handleNFCDetected ────────────────────────────────────────────────────────
 static void handleNFCDetected(const String& cardIdentifier) {
-    Serial.println("\n[NFC] Card: " + cardIdentifier);
+    Serial.println("\n================================================");
+    Serial.println("[NFC-SCAN] >>> NFC CARD DETECTED <<<");
+    Serial.println("[NFC-SCAN] CardIdentifier: " + cardIdentifier);
+    Serial.printf("[NFC-SCAN] Heap: %u  PSRAM: %u\n", ESP.getFreeHeap(), ESP.getFreePsram());
+    Serial.printf("[NFC-SCAN] SD ready: %s  WiFi: %s\n",
+        SDDatabase::isReady() ? "YES" : "NO",
+        wifiConfig.isConnected() ? "YES" : "NO");
+    Serial.println("================================================");
+    Serial.flush();
+
     lastNFCUid = cardIdentifier;
     enterState(STATE_NFC_LOADING);
     empDisplay->showLoading();
@@ -337,29 +251,69 @@ static void handleNFCDetected(const String& cardIdentifier) {
     EmployeeProfile emp;
     bool fromCache = false;
 
-    // ── STEP 1: resolve empUid from NFC card identifier ───────────────────────
+    // STEP 1: resolve empUid from NFC card identifier
+    Serial.println("[STEP-1] Resolving empUid from cardIdentifier...");
+    Serial.flush();
     String empUid = SDDatabase::loadUidForNfc(cardIdentifier);
-    if (empUid.length() == 0 && SDDatabase::hasEmployeeProfile(cardIdentifier))
+    Serial.println("[STEP-1] loadUidForNfc returned: '" + empUid + "'");
+    if (empUid.length() == 0 && SDDatabase::hasEmployeeProfile(cardIdentifier)) {
+        Serial.println("[STEP-1] cardIdentifier itself is empUid (direct match)");
         empUid = cardIdentifier;
-
-    // ── STEP 2: load profile from SD cache ────────────────────────────────────
-    if (empUid.length() > 0 && SDDatabase::hasEmployeeProfile(empUid)) {
-        Serial.println("[SD] Cache HIT uid=" + empUid);
-        if (SDDatabase::loadEmployeeProfile(empUid, emp))
-            fromCache = true;
     }
+    if (empUid.length() == 0) {
+        Serial.println("[STEP-1] WARNING: empUid is EMPTY - no NFC mapping found on SD!");
+    } else {
+        Serial.println("[STEP-1] empUid resolved: '" + empUid + "'");
+    }
+    Serial.flush();
 
-    // ── STEP 3: server lookup (WiFi fallback) ─────────────────────────────────
+    // STEP 2: load profile from SD cache
+    Serial.println("[STEP-2] SD cache lookup for uid='" + empUid + "'");
+    Serial.flush();
+    if (empUid.length() > 0 && SDDatabase::hasEmployeeProfile(empUid)) {
+        Serial.println("[STEP-2] Cache HIT - loading profile...");
+        Serial.flush();
+        if (SDDatabase::loadEmployeeProfile(empUid, emp)) {
+            fromCache = true;
+            Serial.println("[STEP-2] Profile loaded OK: '" + emp.fullName + "'");
+            Serial.println("[STEP-2]   uid='" + emp.uid + "'  idNumber='" + emp.idNumber + "'");
+            Serial.println("[STEP-2]   profilePicture='" + emp.profilePicture + "'");
+            Serial.println("[STEP-2]   accessGranted=" + String(emp.accessGranted ? "true" : "false"));
+        } else {
+            Serial.println("[STEP-2] ERROR: hasEmployeeProfile=true but loadEmployeeProfile FAILED!");
+        }
+    } else {
+        if (empUid.length() == 0)
+            Serial.println("[STEP-2] SKIP: empUid is empty - must fetch from server");
+        else
+            Serial.println("[STEP-2] Cache MISS: /employees/" + empUid + ".json not on SD");
+    }
+    Serial.printf("[STEP-2] fromCache=%s\n", fromCache ? "YES" : "NO");
+    Serial.flush();
+
+    // STEP 3: server lookup (WiFi fallback)
     if (!fromCache) {
+        Serial.println("[STEP-3] No local cache - attempting server fetch...");
+        Serial.printf("[STEP-3] WiFi connected: %s\n", wifiConfig.isConnected() ? "YES" : "NO");
+        Serial.flush();
         if (!wifiConfig.isConnected()) {
-            Serial.println("[NFC] No cache + no WiFi → deny");
+            Serial.println("[STEP-3] FAIL: No WiFi - cannot fetch. Showing error.");
+            Serial.flush();
             empDisplay->showError("Card not in local cache");
             enterState(STATE_NFC_ERROR);
             return;
         }
-        Serial.println("[HTTP] Fetching from server: " + cardIdentifier);
+        Serial.println("[STEP-3] Calling authenticateNFC: '" + cardIdentifier + "'");
+        Serial.flush();
         bool granted = attService.authenticateNFC(cardIdentifier, deviceId, emp);
+        Serial.printf("[STEP-3] authenticateNFC result: %s\n", granted ? "GRANTED" : "DENIED/FAILED");
+        Serial.printf("[STEP-3] emp.hasData=%s  emp.uid='%s'  emp.fullName='%s'\n",
+            emp.hasData ? "true" : "false", emp.uid.c_str(), emp.fullName.c_str());
+        Serial.println("[STEP-3] emp.profilePicture='" + emp.profilePicture + "'");
+        Serial.flush();
         if (!granted) {
+            Serial.println("[STEP-3] Access denied - showing error screen");
+            Serial.flush();
             empDisplay->showError(emp.hasData ? "Access denied" : "Card not registered");
             char ts[12]; snprintf(ts, sizeof(ts), "%02d:%02d:%02d", clkH, clkM, clkS);
             emp.clockType = "denied";
@@ -369,52 +323,114 @@ static void handleNFCDetected(const String& cardIdentifier) {
         }
         // Cache profile on SD
         if (SDDatabase::isReady() && emp.uid.length() > 0) {
-            SDDatabase::saveEmployeeProfile(emp.uid, emp);
-            SDDatabase::saveNfcMapping(cardIdentifier, emp.uid);
-            Serial.println("[SD] Cached profile uid=" + emp.uid);
+            bool profSaved = SDDatabase::saveEmployeeProfile(emp.uid, emp);
+            bool nfcSaved  = SDDatabase::saveNfcMapping(cardIdentifier, emp.uid);
+            Serial.printf("[STEP-3] SD cache: saveProfile=%s  saveNfcMapping=%s\n",
+                profSaved ? "OK" : "FAIL", nfcSaved ? "OK" : "FAIL");
+            Serial.flush();
+        } else {
+            Serial.printf("[STEP-3] SKIP SD cache: ready=%s uid.len=%d\n",
+                SDDatabase::isReady() ? "YES" : "NO", (int)emp.uid.length());
+            Serial.flush();
         }
     }
 
-    // ── STEP 4: ensure photo is cached ────────────────────────────────────────
+    // STEP 4: ensure photo is cached
+    Serial.println("[STEP-4] --- PHOTO LOOKUP ---");
+    Serial.println("[STEP-4] emp.uid='" + emp.uid + "'");
+    Serial.printf("[STEP-4] SD ready=%s  uid.len=%d\n",
+        SDDatabase::isReady() ? "YES" : "NO", (int)emp.uid.length());
+    Serial.flush();
     String photoPath = "";
     if (SDDatabase::isReady() && emp.uid.length() > 0) {
-        if (SDDatabase::hasPhoto(emp.uid)) {
-            photoPath = SDDatabase::photoPath(emp.uid);
-            Serial.println("[Photo] Using cached: " + photoPath);
-        } else {
-            photoPath = downloadAndCachePhoto(emp);
+        bool photoExists = SDDatabase::hasPhoto(emp.uid);
+        Serial.printf("[STEP-4] SDDatabase::hasPhoto('%s') = %s\n",
+            emp.uid.c_str(), photoExists ? "YES" : "NO");
+        Serial.flush();
+        if (photoExists) {
+            String candidatePath = SDDatabase::photoPath(emp.uid);
+            Serial.println("[STEP-4] Candidate path: " + candidatePath);
+            // Double-check actual file presence and size
+            if (SD_MMC.exists(candidatePath)) {
+                File pf = SD_MMC.open(candidatePath, FILE_READ);
+                size_t psz = pf ? pf.size() : 0;
+                if (pf) pf.close();
+                Serial.printf("[STEP-4] File exists on SD, size=%u bytes\n", (unsigned)psz);
+                if (psz >= 100) {
+                    photoPath = candidatePath;
+                    Serial.println("[STEP-4] Using cached photo: " + photoPath);
+                } else {
+                    Serial.println("[STEP-4] WARNING: File too small (" + String(psz) + " B) - will re-download");
+                }
+            } else {
+                Serial.println("[STEP-4] WARNING: hasPhoto=true but SD_MMC.exists=false! Stale index.");
+            }
+            Serial.flush();
         }
-    }
 
-    // ── STEP 5: resolve clock type ────────────────────────────────────────────
-    String clockType = SDDatabase::isReady()
-        ? (SDDatabase::hasCheckedInToday(emp.uid) ? "check-out" : "check-in")
-        : "check-in";
+        if (photoPath.length() == 0) {
+            Serial.println("[STEP-4] No valid cached photo - attempting download...");
+            Serial.printf("[STEP-4] WiFi: %s  profilePicture: '%s'\n",
+                wifiConfig.isConnected() ? "YES" : "NO",
+                emp.profilePicture.c_str());
+            Serial.flush();
+            if (wifiConfig.isConnected()) {
+                photoPath = downloadAndCachePhoto(emp);
+                Serial.println("[STEP-4] downloadAndCachePhoto returned: '" + photoPath + "'");
+                if (photoPath.length() == 0) {
+                    Serial.println("[STEP-4] FAIL: Could not download photo - will use initials fallback");
+                }
+            } else {
+                Serial.println("[STEP-4] SKIP download: no WiFi - using initials fallback");
+            }
+            Serial.flush();
+        }
+    } else {
+        Serial.println("[STEP-4] SKIP: SD not ready or emp.uid empty - using initials fallback");
+        Serial.flush();
+    }
+    Serial.println("[STEP-4] Final photoPath: '" + photoPath + "'");
+    Serial.println("[STEP-4] Will show: " + String(photoPath.length() ? "JPEG photo" : "INITIALS AVATAR"));
+    Serial.flush();
+
+    // STEP 5: resolve clock type
+    bool alreadyCheckedIn = SDDatabase::isReady() && SDDatabase::hasCheckedInToday(emp.uid);
+    String clockType = alreadyCheckedIn ? "check-out" : "check-in";
     emp.clockType = clockType;
     lastClockType = clockType;
     lastEmployee  = emp;
+    Serial.printf("[STEP-5] hasCheckedInToday=%s  clockType=%s\n",
+        alreadyCheckedIn ? "YES" : "NO", clockType.c_str());
+    Serial.flush();
 
-    Serial.println("[NFC] " + emp.fullName + " → " + clockType +
-                   " | photo=" + (photoPath.length() ? photoPath : "initials"));
-
-    // ── STEP 6: show profile card ─────────────────────────────────────────────
+    // STEP 6: show profile card
+    Serial.println("[STEP-6] --- CALLING showEmployeeProfile ---");
+    Serial.println("[STEP-6] emp.uid='" + emp.uid + "'");
+    Serial.println("[STEP-6] emp.fullName='" + emp.fullName + "'");
+    Serial.println("[STEP-6] emp.idNumber='" + emp.idNumber + "'");
+    Serial.println("[STEP-6] emp.position='" + emp.position + "'");
+    Serial.println("[STEP-6] emp.department='" + emp.department + "'");
+    Serial.println("[STEP-6] emp.clockType='" + emp.clockType + "'");
+    Serial.println("[STEP-6] photoPath='" + photoPath + "'");
+    Serial.printf("[STEP-6] empDisplay ptr valid: %s\n", empDisplay ? "YES" : "NULL - CRASH!");
+    Serial.printf("[STEP-6] Heap before render: %u  PSRAM: %u\n", ESP.getFreeHeap(), ESP.getFreePsram());
+    Serial.flush();
     empDisplay->showEmployeeProfile(emp, photoPath);
+    Serial.println("[STEP-6] showEmployeeProfile() RETURNED OK");
+    Serial.println("================================================");
+    Serial.flush();
     enterState(STATE_NFC_PROFILE);
 }
 
 // ─── setup ───────────────────────────────────────────────────────────────────
 void setup() {
     // ── USB-CDC Serial init ───────────────────────────────────────────────────
-    // With ARDUINO_USB_CDC_ON_BOOT=1 the ESP32-S3 uses USB-CDC for Serial.
-    // We MUST wait for the host to open the COM port, otherwise all boot
-    // messages are lost.  Timeout after 5 s so the device still boots
-    // headless (no PC connected).
     Serial.begin(115200);
     {
         unsigned long t0 = millis();
         while (!Serial && (millis() - t0 < 5000)) delay(10);
     }
-    delay(200);   // small extra settle
+    delay(200);
 
     Serial.println();
     Serial.println("========================================");
@@ -426,7 +442,7 @@ void setup() {
     Serial.println("========================================");
     Serial.flush();
 
-    // ── Step 1: TFT (also sets GPIO9 backlight OUTPUT) ──────────────────────
+    // ── Step 1: TFT ────────────────────────────────────────────────────────
     Serial.println("[Boot] Step 1/6: TFT init...");
     if (!TFTDisplayManager::init(0)) {
         Serial.println("[Boot] ❌ TFT init FAILED — halting");
@@ -475,6 +491,7 @@ void setup() {
         Serial.println("[Boot] ✅ WiFi connected: " + wifiConfig.getSSID() +
                        "  IP=" + wifiConfig.getIPAddress());
         Serial.flush();
+        syncNTPTime(); // ← NEW: Sync time right away on boot
     } else {
         showLoadingAnimation(80, "WiFi: AP mode");
         Serial.println("[Boot] ⚠️  WiFi not connected — AP mode, will retry background");
@@ -494,8 +511,8 @@ void setup() {
 
     // Ready splash
     TFT_eSPI* t = dashboardGetTFT();
-    t->fillScreen(TFT_BLACK);
-    t->setTextColor(TFT_GREEN); t->setTextDatum(MC_DATUM);
+    t->fillScreen(TFTColors::BLACK);
+    t->setTextColor(TFTColors::GREEN); t->setTextDatum(MC_DATUM);
     t->drawString("READY!", SCREEN_W / 2, SCREEN_H / 2, 4);
     t->setTextDatum(TL_DATUM);
     delay(500);
@@ -538,8 +555,9 @@ void loop() {
     bool isConnected = wifiConfig.isConnected();
     if (isConnected && !wasConnected) {
         wasConnected = true;
-        Serial.println("[WiFi] Connected → triggering initial sync");
+        Serial.println("[WiFi] Connected → triggering initial sync and time update");
         triggerInitialSync();
+        syncNTPTime(); // ← NEW: Resync time upon fresh connection
         drawStaticUI();
         updateStatusDots(true, SDDatabase::isReady(), true);
     }
@@ -624,6 +642,12 @@ void loop() {
         tickClock(); pulseStatus(tick % 2);
         updateClock(clkH, clkM, clkS);
         if (tick % 60 == 0) updateDate(buildDateStr());
+        
+        // Let's resync the clock automatically once an hour (3600 seconds) 
+        // to prevent time drift.
+        if (tick % 3600 == 0 && wifiConfig.isConnected()) {
+            syncNTPTime();
+        }
     }
 
     // ── Stats ─────────────────────────────────────────────────────────────────

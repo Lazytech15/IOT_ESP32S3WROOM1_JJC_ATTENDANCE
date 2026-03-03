@@ -2,11 +2,19 @@
 // WiFiManager.h  — Web Admin Portal for ESP32-S3 NFC Attendance
 //
 // Tabs (in order):
-//   1. Dashboard  — today's stats + quick actions
+//   1. Dashboard  — today's stats + quick actions + LIVE SSE feed
 //   2. SD Files   — raw SD card browser: list ALL files, view/download any file
-//   3. Attendance — today's log table + CSV downloads
+//                 + NEW: Rename, Move, Copy, Delete
+//   3. Attendance — today's log table + CSV downloads 
+//                 + NEW: Raw Log Editor (Fix clock in/out times)
 //   4. Actions    — reboot, clear cache, manage employees
 //   5. WiFi       — moved LAST; background scan runs silently
+//
+// SSE Live Push:
+//   - /api/events  — SSE stream (text/event-stream, keep-alive)
+//   - broadcastEvent("stats", json)  — call when attendance counters change
+//   - broadcastEvent("scan",  json)  — call on every NFC tap with name/type/time
+//   - broadcastEvent("ping")         — call every ~20s to keep connection alive
 //
 // Login: admin / jjcadmin
 // Port:  8080
@@ -19,6 +27,7 @@
 #include <ArduinoJson.h>
 #include "WiFiConfig.h"
 #include "sd_database.h"
+#include "sd_file_manager.h" // Ensure file manager tools are included
 
 // Some cores don't expose WIFI_SCAN_RUNNING; ensure we have a fallback
 #ifndef WIFI_SCAN_RUNNING
@@ -36,6 +45,11 @@ static int16_t    _scanResult    = WIFI_SCAN_RUNNING;
 static bool       _scanRunning   = false;
 static unsigned long _scanStart  = 0;
 
+// ── SSE (Server-Sent Events) live push ───────────────────────────────────────
+// Tracks the one active SSE client. ESP32 WebServer handles one stream at a time.
+static WiFiClient _sseClient;
+static bool       _sseConnected = false;
+
 // ════════════════════════════════════════════════════════════════════════════
 class WiFiManager {
 public:
@@ -46,13 +60,10 @@ public:
         _cfg      = cfg;
         _setupRoutes();
         // Must register Cookie header BEFORE begin() so _authed() works.
-        // IMPORTANT: array must be static — WebServer stores a raw pointer,
-        // so a local array would dangle after init() returns.
         static const char* _hdrs[] = {"Cookie"};
         _srv.collectHeaders(_hdrs, 1);
         _srv.begin();
         Serial.printf("[WM] Portal at http://x.x.x.x:%d\n", WM_PORT);
-        // Kick off first silent background scan
         _startScan();
     }
 
@@ -67,6 +78,25 @@ public:
                 Serial.printf("[WiFi] Scan done: %d networks\n", n);
             }
         }
+    }
+
+    // ── Live Push: call this from main.cpp whenever attendance or stats change ──
+    // Sends an SSE event to the browser so the dashboard updates without refresh.
+    // eventType: "scan"  → new NFC scan recorded
+    //            "stats" → attendance counters changed
+    //            "ping"  → keepalive (call every ~20s to keep connection alive)
+    void broadcastEvent(const String& eventType, const String& jsonPayload = "{}") {
+        if (!_sseConnected || !_sseClient.connected()) {
+            _sseConnected = false;
+            return;
+        }
+        // SSE frame: write directly to avoid chunked buffering
+        _sseClient.print("event: ");
+        _sseClient.print(eventType);
+        _sseClient.print("\ndata: ");
+        _sseClient.print(jsonPayload);
+        _sseClient.print("\n\n");
+        Serial.printf("[SSE] >> %s\n", eventType.c_str());
     }
 
 private:
@@ -84,7 +114,6 @@ private:
         Serial.println("[WiFi] Background scan started");
     }
 
-    // ── Auth check ────────────────────────────────────────────────────────────
     bool _authed() {
         if (_srv.hasHeader("Cookie")) {
             String c = _srv.header("Cookie");
@@ -93,7 +122,6 @@ private:
         return false;
     }
 
-    // ── Current device IP ─────────────────────────────────────────────────────
     String _ip() {
         if (_cfg && _cfg->isConnected()) return _cfg->getIPAddress();
         return WiFi.softAPIP().toString();
@@ -166,23 +194,17 @@ label{font-size:.8rem;color:var(--dim);display:block;margin-bottom:4px}
 .tag-wifi .ssid{font-weight:600;font-size:.85rem;flex:1}
 .tag-wifi .rssi{font-size:.75rem;color:var(--dim)}
 .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
-.dot-green{background:var(--green)} .dot-red{background:var(--red)}
-.dot-yellow{background:#f59e0b} .dot-dim{background:var(--dim)}
 .alert{padding:10px 14px;border-radius:7px;font-size:.83rem;margin-top:10px;display:none}
 .alert-ok{background:rgba(16,185,129,.1);color:var(--green);border:1px solid rgba(16,185,129,.2)}
 .alert-err{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}
 .file-row{display:flex;align-items:center;gap:8px;padding:6px 10px;
   background:rgba(255,255,255,.02);border:1px solid var(--border);
-  border-radius:6px;margin-bottom:5px}
+  border-radius:6px;margin-bottom:5px;flex-wrap:wrap;}
 .file-row .fn{font-size:.82rem;flex:1;font-family:monospace;color:var(--cyan);word-break:break-all}
-.file-row .fsz{font-size:.72rem;color:var(--dim);white-space:nowrap}
+.file-row .fsz{font-size:.72rem;color:var(--dim);white-space:nowrap;margin-right:10px;}
 .file-content{background:#000;border:1px solid var(--border);border-radius:6px;
   padding:12px;font-family:monospace;font-size:.78rem;color:#a3e635;
   white-space:pre-wrap;word-break:break-all;max-height:400px;overflow-y:auto;margin-top:10px}
-#loading{display:none;text-align:center;color:var(--dim);padding:20px;font-size:.85rem}
-.spinner{display:inline-block;width:16px;height:16px;border:2px solid var(--border);
-  border-top-color:var(--cyan);border-radius:50%;animation:spin .6s linear infinite;margin-right:6px}
-@keyframes spin{to{transform:rotate(360deg)}}
 .dir-row{background:rgba(13,148,136,.07);border-color:rgba(13,148,136,.2)}
 .dir-row .fn{color:var(--teal)}
 </style></head><body><div class="wrap">
@@ -232,13 +254,26 @@ label{font-size:.8rem;color:var(--dim);display:block;margin-bottom:4px}
         _srv.on("/portal/actions",    HTTP_GET, [this](){ if(!_authed()){_redir();}else _handleActions(); });
         _srv.on("/portal/wifi",       HTTP_GET, [this](){ if(!_authed()){_redir();}else _handleWifi(); });
 
+        // SSE live stream
+        _srv.on("/api/events", HTTP_GET, [this](){ if(!_authed()){_srv.send(401);}else _handleSSE(); });
+
         // API
         _srv.on("/api/status",     HTTP_GET,  [this](){ if(!_authed()){_srv.send(401);}else _apiStatus(); });
+        
+        // File APIs
         _srv.on("/api/sd/list",    HTTP_GET,  [this](){ if(!_authed()){_srv.send(401);}else _apiSdList(); });
         _srv.on("/api/sd/read",    HTTP_GET,  [this](){ if(!_authed()){_srv.send(401);}else _apiSdRead(); });
         _srv.on("/api/sd/dl",      HTTP_GET,  [this](){ if(!_authed()){_srv.send(401);}else _apiSdDownload(); });
         _srv.on("/api/sd/tree",    HTTP_GET,  [this](){ if(!_authed()){_srv.send(401);}else _apiSdTree(); });
-        _srv.on("/api/attendance", HTTP_GET,  [this](){ if(!_authed()){_srv.send(401);}else _apiAttendance(); });
+        
+        // NEW Edit/Delete APIs
+        _srv.on("/api/sd/delete",  HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiSdDelete(); });
+        _srv.on("/api/sd/rename",  HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiSdRename(); });
+        _srv.on("/api/sd/copy",    HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiSdCopy(); });
+        _srv.on("/api/sd/write",   HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiSdWrite(); });
+
+        _srv.on("/api/attendance",       HTTP_GET,  [this](){ if(!_authed()){_srv.send(401);}else _apiAttendance(); });
+        _srv.on("/api/attendance/dates", HTTP_GET,  [this](){ if(!_authed()){_srv.send(401);}else _apiAttendanceDates(); });
         _srv.on("/api/wifi/scan",  HTTP_GET,  [this](){ if(!_authed()){_srv.send(401);}else _apiScan(); });
         _srv.on("/api/wifi/info",  HTTP_GET,  [this](){ if(!_authed()){_srv.send(401);}else _apiWifiInfo(); });
         _srv.on("/api/wifi/connect",    HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiConnect(); });
@@ -278,7 +313,6 @@ button{width:100%;padding:11px;border-radius:7px;border:none;
   background:linear-gradient(135deg,#ea580c,#f97316);color:#0a0e1a;
   font-weight:700;font-size:.9rem;cursor:pointer;transition:.2s}
 button:hover{background:linear-gradient(135deg,#f97316,#fbbf24)}
-.err{color:#ef4444;font-size:.8rem;margin-top:8px;text-align:center;display:none}
 </style></head><body><div class="card">
 <div class="logo"><h2>&#9670; JJC Attendance</h2><p>Admin Portal</p></div>
 <div class="ip">)" + _ip() + ":" + String(WM_PORT) + R"(</div>
@@ -311,12 +345,52 @@ button:hover{background:linear-gradient(135deg,#f97316,#fbbf24)}
         bool wOk = _cfg && _cfg->isConnected();
 
         String html = _head("Dashboard", 0);
+        // IDs targeted by SSE listener for live updates
         html += "<div class='stat-row'>";
-        html += "<div class='stat'><div class='stat-n' style='color:#10b981'>" + String(ins) + "</div><div class='stat-l'>Clock-ins today</div></div>";
-        html += "<div class='stat'><div class='stat-n' style='color:#f97316'>" + String(outs) + "</div><div class='stat-l'>Clock-outs today</div></div>";
-        html += "<div class='stat'><div class='stat-n' style='color:#22d3ee'>" + String(freeMB) + "<span style='font-size:1rem'>MB</span></div><div class='stat-l'>SD Free</div></div>";
-        html += "<div class='stat'><div class='stat-n' style='color:" + String(wOk?"#10b981":"#ef4444") + ";font-size:1rem'>" + (wOk ? "Online" : "Offline") + "</div><div class='stat-l'>WiFi</div></div>";
+        html += "<div class='stat'><div class='stat-n' style='color:#10b981' id='live-ins'>" + String(ins) + "</div><div class='stat-l'>Clock-ins today</div></div>";
+        html += "<div class='stat'><div class='stat-n' style='color:#f97316' id='live-outs'>" + String(outs) + "</div><div class='stat-l'>Clock-outs today</div></div>";
+        html += "<div class='stat'><div class='stat-n' style='color:#22d3ee' id='live-mb'>" + String(freeMB) + "<span style='font-size:1rem'>MB</span></div><div class='stat-l'>SD Free</div></div>";
+        html += "<div class='stat'><div class='stat-n' style='color:" + String(wOk?"#10b981":"#ef4444") + ";font-size:1rem' id='live-wifi'>" + (wOk ? "Online" : "Offline") + "</div><div class='stat-l'>WiFi</div></div>";
         html += "</div>";
+        // Live scan feed
+        html += "<div class='card'><div class='card-title' style='display:flex;align-items:center;gap:8px'>";
+        html += "<span id='live-dot' style='display:inline-block;width:8px;height:8px;border-radius:50%;background:#64748b'></span>";
+        html += "LIVE FEED";
+        html += "<span id='live-status' style='font-size:.72rem;color:#64748b;margin-left:auto'>Connecting...</span></div>";
+        html += "<div id='live-log' style='font-family:monospace;font-size:.8rem;color:#94a3b8;min-height:40px'></div></div>";
+        html += R"SSE(<script>
+(function(){
+  var es=new EventSource('/api/events');
+  var dot=document.getElementById('live-dot');
+  var st=document.getElementById('live-status');
+  var log=document.getElementById('live-log');
+  var lines=[];
+  es.onopen=function(){dot.style.background='#10b981';st.textContent='Live';};
+  es.onerror=function(){dot.style.background='#ef4444';st.textContent='Reconnecting...';};
+  es.addEventListener('stats',function(e){
+    try{
+      var d=JSON.parse(e.data);
+      if(d.ins!==undefined)document.getElementById('live-ins').textContent=d.ins;
+      if(d.outs!==undefined)document.getElementById('live-outs').textContent=d.outs;
+      if(d.free_mb!==undefined)document.getElementById('live-mb').innerHTML=d.free_mb+'<span style="font-size:1rem">MB</span>';
+      if(d.wifi!==undefined){var w=document.getElementById('live-wifi');w.textContent=d.wifi?'Online':'Offline';w.style.color=d.wifi?'#10b981':'#ef4444';}
+    }catch(err){}
+  });
+  es.addEventListener('scan',function(e){
+    try{
+      var d=JSON.parse(e.data);
+      var col=d.type==='check-in'?'#22d3ee':d.type==='check-out'?'#f97316':'#ef4444';
+      lines.unshift('<div style="color:'+col+';margin-bottom:4px">['+( d.time||'--:--')+'] <strong>'+(d.name||'?')+'</strong> &mdash; '+d.type.toUpperCase()+'</div>');
+      if(lines.length>8)lines.length=8;
+      log.innerHTML=lines.join('');
+    }catch(err){}
+  });
+  es.addEventListener('ping',function(){
+    dot.style.background='#10b981';
+    st.textContent='Live \u2022 '+new Date().toLocaleTimeString();
+  });
+})();
+</script>)SSE";
 
         if (wOk) {
             html += "<div class='card'><div class='card-title'>Network</div>";
@@ -329,7 +403,7 @@ button:hover{background:linear-gradient(135deg,#f97316,#fbbf24)}
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // TAB 1 — SD FILES (full raw browser)
+    // TAB 1 — SD FILES (NEW: Move/Copy/Rename/Delete)
     // ════════════════════════════════════════════════════════════════════════
     void _handleFiles() {
         String html = _head("SD Files", 1);
@@ -370,25 +444,52 @@ function renderTree(data){
     var isDir=item.type==='dir';
     var icon=isDir?'&#128193;':'&#128196;';
     var sz=isDir?'DIR':fmtSize(item.size);
-    var nameDisplay=item.name;
     h+='<div class="file-row '+(isDir?'dir-row':'')+'">';
     h+='<span style="font-size:1rem">'+icon+'</span>';
     h+='<span class="fn">'+item.path+'</span>';
     h+='<span class="fsz">'+sz+'</span>';
+    h+='<div style="display:flex;gap:4px;flex-wrap:wrap;">';
     if(isDir){
       h+='<button class="btn btn-ghost btn-sm" onclick="navDir(\''+item.path+'\')">Open</button>';
+      h+='<button class="btn btn-danger btn-sm" onclick="delFile(\''+item.path+'\')">Del</button>';
     } else {
       h+='<button class="btn btn-ghost btn-sm" onclick="viewFile(\''+item.path+'\')">View</button>';
-      h+='<a class="btn btn-primary btn-sm" href="/api/sd/dl?f='+encodeURIComponent(item.path)+'" download="'+item.name+'">DL</a>';
+      h+='<button class="btn btn-ghost btn-sm" onclick="renFile(\''+item.path+'\')">Ren/Mv</button>';
+      h+='<button class="btn btn-ghost btn-sm" onclick="cpFile(\''+item.path+'\')">Cp</button>';
+      h+='<button class="btn btn-danger btn-sm" onclick="delFile(\''+item.path+'\')">Del</button>';
     }
-    h+='</div>';
+    h+='</div></div>';
   });
   document.getElementById('filelist').innerHTML=h;
 }
-function navDir(path){
-  document.getElementById('pathInput').value=path;
-  browseDir();
+
+// Actions
+function delFile(p){
+  if(confirm('Delete '+p+'? This cannot be undone.')){
+    req('/api/sd/delete','POST',JSON.stringify({path:p}),(d)=>{
+      if(d.success) browseDir(); else alert('Delete failed');
+    });
+  }
 }
+function renFile(p){
+  var t=prompt('Rename or Move to path:', p);
+  if(t && t!==p){
+    req('/api/sd/rename','POST',JSON.stringify({from:p,to:t}),(d)=>{
+      if(d.success) browseDir(); else alert('Rename failed');
+    });
+  }
+}
+function cpFile(p){
+  var t=prompt('Copy to path:', p+'_copy');
+  if(t && t!==p){
+    req('/api/sd/copy','POST',JSON.stringify({from:p,to:t}),(d)=>{
+      if(d.success) browseDir(); else alert('Copy failed');
+    });
+  }
+}
+
+// Navigation
+function navDir(path){ document.getElementById('pathInput').value=path; browseDir(); }
 function fmtSize(b){
   if(b===undefined)return'?';
   if(b<1024)return b+'B';
@@ -415,41 +516,82 @@ browseDir();
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // TAB 2 — ATTENDANCE LOG
+    // TAB 2 — ATTENDANCE LOG (NEW: Raw Editor added to fix timestamps)
     // ════════════════════════════════════════════════════════════════════════
     void _handleAttendance() {
+        // Get today's real date for the default option label
+        struct tm ti = {}; getLocalTime(&ti, 0);
+        char todayLabel[32];
+        strftime(todayLabel, sizeof(todayLabel), "Today (%a %b %d, %Y)", &ti);
+
         String html = _head("Attendance", 2);
         html += R"HTML(
 <div class="card">
-  <div class="card-title">Today's Log</div>
-  <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
-    <select id="dateSelect" onchange="loadCsv(this.value)" style="width:auto;flex:1">
-      <option value="today">Today</option>
-    </select>
+  <div class="card-title">Attendance Log</div>
+  <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:center">
+    <select id="dateSelect" onchange="loadCsv(this.value)" style="width:auto;flex:1"></select>
     <a id="dlCsvBtn" href="#" class="btn btn-primary btn-sm" download="attendance.csv">Download CSV</a>
+    <button class="btn btn-ghost btn-sm" onclick="editCsv()">&#9998; Edit Raw Log</button>
   </div>
+  <div id="dateLabel" style="font-size:.78rem;color:#64748b;margin-bottom:10px"></div>
   <div id="tableArea"><p style="color:#64748b;font-size:.82rem">Loading...</p></div>
+  <div id="editArea" style="display:none;">
+    <textarea id="csvEditor" style="width:100%;height:300px;background:#000;color:#a3e635;font-family:monospace;padding:10px;border:1px solid var(--border);border-radius:6px;line-height:1.5" spellcheck="false"></textarea>
+    <div style="margin-top:8px;display:flex;gap:8px">
+      <button class="btn btn-primary" onclick="saveCsv()">Save Changes</button>
+      <button class="btn btn-ghost" onclick="cancelEdit()">Cancel</button>
+    </div>
+    <p style="color:var(--dim);font-size:0.75rem;margin-top:8px;">Format: timestamp,nfc_uid,employee_uid,employee_name,department,event_type,device_id</p>
+  </div>
 </div>
 <script>
-fetch('/api/sd/list').then(r=>r.json()).then(function(d){
-  var sel=document.getElementById('dateSelect');
-  (d.files||[]).forEach(function(f){
-    var o=document.createElement('option');o.value=f;o.textContent=f;sel.appendChild(o);
+var currentFile = '';
+var currentDate = '';
+
+// Load date list from /api/attendance/dates
+fetch('/api/attendance/dates').then(r=>r.json()).then(function(d){
+  var sel = document.getElementById('dateSelect');
+  sel.innerHTML = '';
+  // Today option first
+  var todayOpt = document.createElement('option');
+  todayOpt.value = 'today';
+  todayOpt.textContent = d.today_label || 'Today';
+  sel.appendChild(todayOpt);
+  // Past dates from SD, newest first
+  (d.dates||[]).forEach(function(entry){
+    var o = document.createElement('option');
+    o.value = entry.file;
+    o.textContent = entry.label;  // e.g. "Mon Mar 03, 2026"
+    sel.appendChild(o);
   });
+  loadCsv('today');
 });
+
 function loadCsv(val){
+  currentFile = (val==='today') ? '__today__' : '/attendance/'+val;
   var url='/api/attendance?f='+encodeURIComponent(val);
-  document.getElementById('dlCsvBtn').href='/api/sd/dl?f='+encodeURIComponent(val==='today'?'__today__':val);
+  document.getElementById('dlCsvBtn').href='/api/sd/dl?f='+encodeURIComponent(currentFile);
+
+  // Show selected date label
+  var sel = document.getElementById('dateSelect');
+  var selText = sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].textContent : '';
+  document.getElementById('dateLabel').textContent = selText ? ('Showing records for: ' + selText) : '';
+
   fetch(url).then(r=>r.json()).then(function(d){
     if(!d.rows||d.rows.length===0){
-      document.getElementById('tableArea').innerHTML='<p style="color:#64748b;font-size:.82rem">No records.</p>';
+      document.getElementById('tableArea').innerHTML='<p style="color:#64748b;font-size:.82rem">No records for this date.</p>';
       return;
     }
     var h='<div style="overflow-x:auto"><table><thead><tr>';
+    // Inject Date as first column header, then existing headers
+    h += '<th style="color:#22d3ee">Date</th>';
     (d.headers||[]).forEach(function(hd){h+='<th>'+hd+'</th>';});
     h+='</tr></thead><tbody>';
     d.rows.forEach(function(row){
       h+='<tr>';
+      // Date cell — use d.date from API (the file's date), or parse from timestamp
+      var dateStr = d.date || '';
+      h+='<td style="color:#22d3ee;white-space:nowrap;font-size:.78rem">'+dateStr+'</td>';
       row.forEach(function(cell,i){
         if(i===5){
           var cls=cell==='check-in'?'badge-in':cell==='check-out'?'badge-out':'badge-denied';
@@ -462,6 +604,35 @@ function loadCsv(val){
     document.getElementById('tableArea').innerHTML=h;
   });
 }
+
+function editCsv() {
+  document.getElementById('tableArea').style.display='none';
+  document.getElementById('editArea').style.display='block';
+  document.getElementById('csvEditor').value = 'Loading...';
+  fetch('/api/sd/read?f='+encodeURIComponent(currentFile))
+    .then(r=>r.text()).then(t=>{ document.getElementById('csvEditor').value=t; });
+}
+
+function cancelEdit() {
+  document.getElementById('tableArea').style.display='block';
+  document.getElementById('editArea').style.display='none';
+}
+
+function saveCsv() {
+  var t = document.getElementById('csvEditor').value;
+  if(!confirm("Are you sure you want to overwrite the log file?")) return;
+  fetch('/api/sd/write?f='+encodeURIComponent(currentFile), {
+    method: 'POST', body: t, headers: {'Content-Type':'text/plain'}
+  }).then(r=>r.json()).then(d=>{
+    if(d.success){ 
+        alert('Saved successfully!'); 
+        cancelEdit(); 
+        loadCsv(document.getElementById('dateSelect').value); 
+    }
+    else alert('Failed to save file.');
+  });
+}
+
 loadCsv('today');
 </script>
 )HTML";
@@ -516,7 +687,7 @@ function doReboot(){
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // TAB 4 — WIFI (moved last; uses background scan result)
+    // TAB 4 — WIFI
     // ════════════════════════════════════════════════════════════════════════
     void _handleWifi() {
         bool wOk = _cfg && _cfg->isConnected();
@@ -622,6 +793,64 @@ loadStatus();loadNets();
     // API HANDLERS
     // ════════════════════════════════════════════════════════════════════════
 
+    // Resolves __today__ macro for read/write endpoints
+    String _resolveTodayPath(String p) {
+        if (p == "__today__") {
+            unsigned long day = millis() / 86400000UL;
+            char buf[40]; snprintf(buf, sizeof(buf), "/attendance/day_%06lu.csv", day);
+            return String(buf);
+        }
+        return p;
+    }
+
+    // ── SSE Handler ───────────────────────────────────────────────────────────
+    // Keeps the HTTP connection open and streams events to the browser.
+    void _handleSSE() {
+        // Drop stale connection
+        if (_sseConnected && _sseClient.connected()) _sseClient.stop();
+
+        // Grab the raw TCP socket BEFORE WebServer can close it
+        _sseClient    = _srv.client();
+        _sseConnected = (_sseClient && _sseClient.connected());
+        if (!_sseConnected) return;
+
+        // Write raw HTTP — bypasses WebServer chunked encoding which breaks SSE.
+        // "Transfer-Encoding: identity" explicitly disables chunking.
+        _sseClient.print(
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: keep-alive\r\n"
+            "Transfer-Encoding: identity\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "\r\n"
+        );
+        _sseClient.setNoDelay(true);
+
+        // Push a stats snapshot immediately so the browser gets data on connect
+        _sendStatsSnapshot();
+
+        Serial.println("[SSE] Client connected — raw HTTP stream open");
+    }
+
+    // Pushes current stats as the first event on connect
+    void _sendStatsSnapshot() {
+        if (!_sseConnected || !_sseClient.connected()) return;
+        int ins   = max(0, SDDatabase::countTodayCheckIns());
+        int outs  = max(0, SDDatabase::countTodayCheckOuts());
+        bool wOk  = _cfg && _cfg->isConnected();
+        uint64_t freeMB = SDDatabase::freeBytes() / 1048576;
+
+        char payload[128];
+        snprintf(payload, sizeof(payload),
+            "{\"ins\":%d,\"outs\":%d,\"wifi\":%s,\"free_mb\":%llu}",
+            ins, outs, wOk ? "true" : "false", freeMB);
+
+        _sseClient.print("event: stats\ndata: ");
+        _sseClient.print(payload);
+        _sseClient.print("\n\n");
+    }
+
     void _apiStatus() {
         DynamicJsonDocument doc(512);
         doc["wifi"]    = _cfg && _cfg->isConnected();
@@ -633,7 +862,59 @@ loadStatus();loadNets();
         _srv.send(200,"application/json",out);
     }
 
-    // SD tree: list directory entries with type + size
+    // ── FILE OPERATIONS ───────────────────────────────────────────────────────
+
+    // SD Delete (File or Dir)
+    void _apiSdDelete() {
+        DynamicJsonDocument req(256); deserializeJson(req, _srv.arg("plain"));
+        String p = req["path"] | "";
+        if (p.indexOf("..") >= 0 || p == "/" || p.length() == 0) {
+            _srv.send(403,"application/json","{\"success\":false}"); return;
+        }
+        File f = SD_MMC.open(p);
+        bool isDir = f && f.isDirectory();
+        if (f) f.close();
+
+        bool ok = isDir ? SDFileManager::deleteDir(p) : SDFileManager::deleteFile(p);
+        _srv.send(200,"application/json", ok ? "{\"success\":true}" : "{\"success\":false}");
+    }
+
+    // SD Rename / Move
+    void _apiSdRename() {
+        DynamicJsonDocument req(256); deserializeJson(req, _srv.arg("plain"));
+        String f = req["from"] | "", t = req["to"] | "";
+        if (f.indexOf("..") >= 0 || t.indexOf("..") >= 0 || f.length() == 0 || t.length() == 0) {
+            _srv.send(403,"application/json","{\"success\":false}"); return;
+        }
+        bool ok = SDFileManager::renameFile(f, t);
+        _srv.send(200,"application/json", ok ? "{\"success\":true}" : "{\"success\":false}");
+    }
+
+    // SD Copy
+    void _apiSdCopy() {
+        DynamicJsonDocument req(256); deserializeJson(req, _srv.arg("plain"));
+        String f = req["from"] | "", t = req["to"] | "";
+        if (f.indexOf("..") >= 0 || t.indexOf("..") >= 0 || f.length() == 0 || t.length() == 0) {
+            _srv.send(403,"application/json","{\"success\":false}"); return;
+        }
+        bool ok = SDFileManager::copyFile(f, t);
+        _srv.send(200,"application/json", ok ? "{\"success\":true}" : "{\"success\":false}");
+    }
+
+    // SD Write / Overwrite Text (Used by Attendance Editor)
+    void _apiSdWrite() {
+        if (!_srv.hasArg("f")) { _srv.send(400,"application/json","{\"success\":false,\"error\":\"Missing f\"}"); return; }
+        String path = _resolveTodayPath(_srv.arg("f"));
+        if (path.indexOf("..") >= 0) { _srv.send(403,"application/json","{\"success\":false}"); return; }
+        
+        String content = _srv.arg("plain"); // Raw body
+        bool ok = SDFileManager::writeTextFile(path, content);
+        _srv.send(200,"application/json", ok ? "{\"success\":true}" : "{\"success\":false}");
+    }
+
+    // ── READ & LIST ───────────────────────────────────────────────────────────
+
+    // SD tree
     void _apiSdTree() {
         String path = _srv.hasArg("path") ? _srv.arg("path") : "/";
         if (!SDDatabase::isReady()) {
@@ -649,7 +930,7 @@ loadStatus();loadNets();
         doc["success"] = true;
         doc["path"]    = path;
         JsonArray items = doc.createNestedArray("items");
-        // Add parent directory entry
+        
         if (path != "/" && path.length() > 1) {
             int ls = path.lastIndexOf('/');
             String parent = (ls > 0) ? path.substring(0, ls) : "/";
@@ -660,7 +941,6 @@ loadStatus();loadNets();
         while (entry) {
             JsonObject item = items.createNestedObject();
             String ename = String(entry.name());
-            // entry.name() returns just the name, not full path
             String fpath = (path == "/") ? "/" + ename : path + "/" + ename;
             item["name"] = ename;
             item["path"] = fpath;
@@ -681,7 +961,7 @@ loadStatus();loadNets();
         _srv.send(200,"application/json",out);
     }
 
-    // SD list: just the attendance CSV filenames
+    // SD list CSV files
     void _apiSdList() {
         DynamicJsonDocument doc(2048);
         JsonArray arr = doc.createNestedArray("files");
@@ -701,24 +981,19 @@ loadStatus();loadNets();
         _srv.send(200,"application/json",out);
     }
 
-    // Read a file from SD and return as plain text (for view)
     void _apiSdRead() {
         if (!_srv.hasArg("f")) { _srv.send(400,"text/plain","Missing f param"); return; }
-        String path = _srv.arg("f");
-        // Security: no path traversal
+        String path = _resolveTodayPath(_srv.arg("f"));
         if (path.indexOf("..") >= 0) { _srv.send(403,"text/plain","Forbidden"); return; }
         if (!SDDatabase::isReady()) { _srv.send(503,"text/plain","SD not ready"); return; }
         if (!SD_MMC.exists(path)) { _srv.send(404,"text/plain","Not found"); return; }
         File f = SD_MMC.open(path, FILE_READ);
         if (!f) { _srv.send(500,"text/plain","Open failed"); return; }
 
-        // Check if it's a binary file by extension — send hex dump for binary
-        String ext = path.substring(path.lastIndexOf('.') + 1);
-        ext.toLowerCase();
+        String ext = path.substring(path.lastIndexOf('.') + 1); ext.toLowerCase();
         bool isBinary = (ext=="jpg"||ext=="jpeg"||ext=="png"||ext=="bin"||ext=="dat");
 
         if (isBinary) {
-            // For binary files, show a hex preview (first 512 bytes)
             uint8_t buf[512]; size_t n = f.read(buf, sizeof(buf)); f.close();
             String hex = "[Binary file: " + path + " | size preview (hex)]\n";
             for (size_t i=0;i<n;i++) {
@@ -728,11 +1003,9 @@ loadStatus();loadNets();
             _srv.sendHeader("Access-Control-Allow-Origin","*");
             _srv.send(200,"text/plain",hex);
         } else {
-            // Stream text file
             String content;
             size_t sz = f.size();
             if (sz > 32768) {
-                // Too large — return first 32KB
                 content = "[File too large to display in browser, showing first 32KB]\n\n";
                 content.reserve(32800);
                 size_t got = 0;
@@ -746,17 +1019,11 @@ loadStatus();loadNets();
         }
     }
 
-    // Download file from SD (proper Content-Disposition)
     void _apiSdDownload() {
         if (!_srv.hasArg("f")) { _srv.send(400,"text/plain","Missing f"); return; }
-        String path = _srv.arg("f");
+        String path = _resolveTodayPath(_srv.arg("f"));
         if (path.indexOf("..") >= 0) { _srv.send(403,"text/plain","Forbidden"); return; }
         if (!SDDatabase::isReady()) { _srv.send(503,"text/plain","SD not ready"); return; }
-
-        // Special token for today's file
-        if (path == "__today__") path = SDDatabase::readTodayCSV().length() > 0
-            ? "/attendance/day_" + String(millis()/86400000UL) + ".csv"
-            : "";
 
         if (path.length() == 0 || !SD_MMC.exists(path)) {
             _srv.send(404,"text/plain","Not found"); return;
@@ -778,7 +1045,103 @@ loadStatus();loadNets();
         f.close();
     }
 
-    // Attendance log as JSON rows
+    // Returns all available attendance dates from SD + today's real label
+    void _apiAttendanceDates() {
+        DynamicJsonDocument doc(4096);
+        JsonArray dates = doc.createNestedArray("dates");
+
+        // Today's label from NTP
+        struct tm ti = {};
+        char todayLabel[40] = "Today";
+        if (getLocalTime(&ti, 0)) {
+            strftime(todayLabel, sizeof(todayLabel), "Today (%a %b %d, %Y)", &ti);
+        }
+        doc["today_label"] = todayLabel;
+
+        // Scan /attendance dir for CSV files, build human-readable labels
+        if (SDDatabase::isReady()) {
+            File dir = SD_MMC.open("/attendance");
+            if (dir && dir.isDirectory()) {
+                // Collect filenames first so we can sort newest-first
+                String files[64]; int fc = 0;
+                File e = dir.openNextFile();
+                while (e && fc < 64) {
+                    String fn = String(e.name());
+                    if (!e.isDirectory() && fn.endsWith(".csv")) {
+                        files[fc++] = fn;
+                    }
+                    e.close(); e = dir.openNextFile();
+                }
+                dir.close();
+
+                // Simple reverse sort (newest day_XXXXXX.csv last numerically → reverse)
+                for (int i = 0; i < fc - 1; i++)
+                    for (int j = i+1; j < fc; j++)
+                        if (files[i] < files[j]) { String tmp=files[i]; files[i]=files[j]; files[j]=tmp; }
+
+                for (int i = 0; i < fc; i++) {
+                    JsonObject entry = dates.createNestedObject();
+                    entry["file"] = files[i];
+
+                    // Try to derive a human date from the filename or file content
+                    // Format attempt: day_XXXXXX.csv where XXXXXX = day index
+                    String label = files[i]; // fallback
+                    // If file has a timestamp in first data row, extract date from it
+                    String fp = "/attendance/" + files[i];
+                    File f = SD_MMC.open(fp, FILE_READ);
+                    if (f) {
+                        String firstLine, secondLine;
+                        bool gotFirst = false;
+                        while (f.available()) {
+                            char c = f.read();
+                            if (c == '\n') {
+                                if (!gotFirst) { gotFirst = true; continue; }
+                                break;
+                            }
+                            if (gotFirst) secondLine += c;
+                            else firstLine += c;
+                        }
+                        f.close();
+                        // secondLine is first data row: timestamp,nfc_uid,...
+                        // timestamp format expected: HH:MM:SS or YYYY-MM-DD HH:MM:SS
+                        secondLine.trim();
+                        if (secondLine.length() > 0) {
+                            // Extract date portion — if it starts with digits, try to parse
+                            // Common formats: "08:32:11" (time only) or "2026-03-03 08:32"
+                            int comma = secondLine.indexOf(',');
+                            String ts = comma > 0 ? secondLine.substring(0, comma) : secondLine;
+                            ts.trim();
+                            // If it's a full datetime (contains space or dash-date)
+                            if (ts.indexOf('-') == 4 && ts.length() >= 10) {
+                                // YYYY-MM-DD ... parse
+                                int yr = ts.substring(0,4).toInt();
+                                int mo = ts.substring(5,7).toInt();
+                                int dy = ts.substring(8,10).toInt();
+                                if (yr > 2020 && mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31) {
+                                    struct tm ft = {};
+                                    ft.tm_year = yr - 1900; ft.tm_mon = mo - 1; ft.tm_mday = dy;
+                                    mktime(&ft);
+                                    char lb[32];
+                                    strftime(lb, sizeof(lb), "%a %b %d, %Y", &ft);
+                                    label = String(lb);
+                                }
+                            } else {
+                                // Time-only timestamp — use file modification is unavailable on SD_MMC
+                                // Fall back to filename number as day offset from a base
+                                label = files[i]; // keep filename as label
+                            }
+                        }
+                    }
+                    entry["label"] = label;
+                    yield();
+                }
+            }
+        }
+        String out; serializeJson(doc, out);
+        _srv.sendHeader("Access-Control-Allow-Origin", "*");
+        _srv.send(200, "application/json", out);
+    }
+
     void _apiAttendance() {
         String fileArg = _srv.hasArg("f") ? _srv.arg("f") : "today";
         String csv = (fileArg=="today") ? SDDatabase::readTodayCSV()
@@ -786,6 +1149,35 @@ loadStatus();loadNets();
         DynamicJsonDocument doc(8192);
         JsonArray headers = doc.createNestedArray("headers");
         JsonArray rows    = doc.createNestedArray("rows");
+
+        // Resolve human-readable date for this file
+        // "today" → use NTP local time; named file → parse from first data row or filename
+        char dateStr[32] = "";
+        if (fileArg == "today") {
+            struct tm ti = {};
+            if (getLocalTime(&ti, 0)) strftime(dateStr, sizeof(dateStr), "%a %b %d, %Y", &ti);
+            else strcpy(dateStr, "Today");
+        } else {
+            // Try to extract date from first data row timestamp
+            int nl1 = csv.indexOf('\n');
+            int nl2 = nl1 >= 0 ? csv.indexOf('\n', nl1+1) : -1;
+            String dataRow = (nl1 >= 0 && nl2 > nl1) ? csv.substring(nl1+1, nl2) : "";
+            dataRow.trim();
+            int comma = dataRow.indexOf(',');
+            String ts = comma > 0 ? dataRow.substring(0, comma) : dataRow;
+            ts.trim();
+            if (ts.indexOf('-') == 4 && ts.length() >= 10) {
+                int yr = ts.substring(0,4).toInt(), mo = ts.substring(5,7).toInt(), dy = ts.substring(8,10).toInt();
+                if (yr > 2020 && mo >= 1 && mo <= 12 && dy >= 1 && dy <= 31) {
+                    struct tm ft = {};
+                    ft.tm_year = yr-1900; ft.tm_mon = mo-1; ft.tm_mday = dy;
+                    mktime(&ft);
+                    strftime(dateStr, sizeof(dateStr), "%a %b %d, %Y", &ft);
+                }
+            }
+            if (strlen(dateStr) == 0) strlcpy(dateStr, fileArg.c_str(), sizeof(dateStr));
+        }
+        doc["date"] = dateStr;
 
         if (csv.length() > 0) {
             int start=0, lineNum=0;
@@ -795,7 +1187,6 @@ loadStatus();loadNets();
                 line.trim();
                 if (line.length() > 0) {
                     if (lineNum==0) {
-                        // header row
                         int s=0;
                         while(s<=(int)line.length()){
                             int cm=line.indexOf(',',s);
@@ -822,7 +1213,6 @@ loadStatus();loadNets();
         _srv.send(200,"application/json",out);
     }
 
-    // WiFi scan — returns cached result; triggers new scan if requested
     void _apiScan() {
         if (_srv.hasArg("rescan")) {
             _startScan();
@@ -874,13 +1264,11 @@ loadStatus();loadNets();
             delay(500); attempts++;
         }
         if (WiFi.status() == WL_CONNECTED) {
-            // Credentials saved by WiFiConfig internally after connectToWiFi
             if (_cfg) _cfg->connectToWiFi(ssid, pass);
             DynamicJsonDocument r(128);
             r["success"]=true; r["ip"]=WiFi.localIP().toString();
             String out; serializeJson(r,out);
             _srv.send(200,"application/json",out);
-            // restart background scan with new connection context
             _startScan();
         } else {
             _srv.send(200,"application/json","{\"success\":false,\"error\":\"Connection failed\"}");

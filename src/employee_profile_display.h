@@ -1,35 +1,13 @@
 // ══════════════════════════════════════════════════════════════════════════════
-// employee_profile_display.h  — Portrait 240×320
-//
-// NEW LAYOUT (photo-first, compact info):
-//
-//   ┌──────────────────────────────┐  y=0
-//   │                              │
-//   │    ░░░░░ PHOTO / JPEG ░░░░░  │  cx=120, cy=95, r=82  (164px circle)
-//   │                              │
-//   ├──────────────────────────────┤  y=185
-//   │  Full Name (font 2)          │  y=192
-//   │  ID: XXXXX   (font 1)        │  y=208
-//   │  Position    (font 1)        │  y=220
-//   │  [ Dept badge ]              │  y=233
-//   ├──────────────────────────────┤  y=250
-//   │  ╔══════ CLOCK IN/OUT ═════╗ │  y=256..310
-//   │  ╚════════════════════════╝  │
-//   └──────────────────────────────┘  y=320
-//
-// JPEG rendering: TJpgDec (bundled with TFT_eSPI).
-// Add to platformio.ini:
-//   lib_deps = Bodmer/TJpg_Decoder
-//
-// The profilePicture field holds the SERVER-RELATIVE path returned by the PHP
-// API (e.g. "uploads/photos/17.jpg").  The HTTP service uses it to build the
-// full download URL.  The SD cache stores the file at /photos/<uid>.jpg.
+// employee_profile_display.h  — Portrait 240×320 
+// REDESIGN: Full-width square profile, minimalist name, dynamic bottom container.
 // ══════════════════════════════════════════════════════════════════════════════
 #pragma once
 #include <Arduino.h>
 #include <TFT_eSPI.h>
 #include <SD_MMC.h>
 #include "TFTDisplayManager.h"
+#include "sd_logger.h"
 #include <TJpg_Decoder.h>
 
 #ifndef SCREEN_W
@@ -39,9 +17,6 @@
 #define SCREEN_H 320
 #endif
 
-// ══════════════════════════════════════════════════════════════════════════════
-// EmployeeProfile
-// ══════════════════════════════════════════════════════════════════════════════
 struct EmployeeProfile {
     String uid             = "";
     String idNumber        = "";
@@ -54,16 +29,14 @@ struct EmployeeProfile {
     String status          = "Active";
     String employmentType  = "";
     String authTime        = "";
-    String clockType       = "check-in"; // "check-in"|"check-out"|"denied"
-    // profilePicture: server-relative path, e.g. "uploads/photos/17.jpg"
-    // Used by AttendanceHTTPService to build the download URL.
-    String profilePicture  = "";
+    String clockType       = "check-in";   
+    String profilePicture  = "";           
     bool   accessGranted   = false;
     bool   hasData         = false;
 };
 
 // ══════════════════════════════════════════════════════════════════════════════
-// TJpgDec output callback — pushes decoded rows straight to TFT
+// TJpgDec output callback
 // ══════════════════════════════════════════════════════════════════════════════
 static int16_t   _jpegX   = 0;
 static int16_t   _jpegY   = 0;
@@ -82,12 +55,9 @@ class EmployeeProfileDisplay {
 public:
     EmployeeProfileDisplay() {
         _tft = TFTDisplayManager::getTFT();
-        TJpgDec.setJpgScale(1);
-        TJpgDec.setCallback(_jpegCB);
-        TJpgDec.setSwapBytes(true);  // ESP32 LE → TFT BE swap
+        _initTJpgDec();
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
     void showLoading() {
         if (!_tft) return;
         _tft->fillScreen(TFTColors::BG_DARK);
@@ -102,240 +72,209 @@ public:
         _tft->setTextDatum(TL_DATUM);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
     void showError(const String& message) {
         if (!_tft) return;
         _tft->fillScreen(TFTColors::BG_DARK);
-        int cx = SCREEN_W / 2, cy = 120;
+        int cx = SCREEN_W / 2, cy = 110;
         _tft->fillCircle(cx, cy, 40, TFTColors::ERROR);
         _tft->setTextColor(TFTColors::WHITE, TFTColors::ERROR);
         _tft->setTextDatum(MC_DATUM);
         _tft->drawString("X", cx, cy, 6);
         _tft->setTextColor(TFTColors::ERROR, TFTColors::BG_DARK);
-        _tft->drawString("ACCESS DENIED", SCREEN_W / 2, 185, 2);
+        _tft->drawString("ACCESS DENIED", SCREEN_W / 2, 175, 4);
         _tft->setTextColor(TFTColors::TEXT_SECONDARY, TFTColors::BG_DARK);
-        String m = message; if (m.length() > 26) m = m.substring(0, 26);
-        _tft->drawString(m, SCREEN_W / 2, 205, 1);
+        String m = message;
+        if (m.length() > 26) m = m.substring(0, 26);
+        _tft->drawString(m, SCREEN_W / 2, 205, 2);
         _tft->setTextDatum(TL_DATUM);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
     void showSuccess(const String& name) {
+        // Fast overlay — no full-screen wipe.
+        // Stamps a small green "RECORDED" badge over the existing profile card
+        // so the transition is near-instant and the employee photo stays visible.
         if (!_tft) return;
-        _tft->fillScreen(TFTColors::BG_DARK);
-        int cx = SCREEN_W / 2, cy = 120;
-        _tft->fillCircle(cx, cy, 40, TFTColors::SUCCESS);
-        _tft->setTextColor(TFTColors::BLACK, TFTColors::SUCCESS);
+        const int BDG_W = 160, BDG_H = 36;
+        const int BDG_X = (SCREEN_W - BDG_W) / 2;
+        const int BDG_Y = (SCREEN_H / 2) - (BDG_H / 2);
+        _tft->fillRoundRect(BDG_X, BDG_Y, BDG_W, BDG_H, 6, TFTColors::SUCCESS);
+        _tft->drawRoundRect(BDG_X, BDG_Y, BDG_W, BDG_H, 6, TFTColors::WHITE);
+        _tft->setTextColor(TFTColors::WHITE, TFTColors::SUCCESS);
         _tft->setTextDatum(MC_DATUM);
-        _tft->drawString("OK", cx, cy, 4);
-        _tft->setTextColor(TFTColors::SUCCESS, TFTColors::BG_DARK);
-        _tft->drawString("ATTENDANCE RECORDED", SCREEN_W / 2, 183, 1);
-        _tft->setTextColor(TFTColors::TEXT_PRIMARY, TFTColors::BG_DARK);
-        String n = name;
-        while (n.length() > 1 && _tft->textWidth(n.c_str(), 2) > SCREEN_W - 20)
-            n.remove(n.length() - 1);
-        _tft->drawString(n, SCREEN_W / 2, 200, 2);
+        _tft->drawString("RECORDED", SCREEN_W / 2, BDG_Y + BDG_H / 2, 2);
         _tft->setTextDatum(TL_DATUM);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Main profile card — photo-first, compact info strip below
-    // photoPath = "/photos/<uid>.jpg" on SD card, or "" for initials fallback
-    // ─────────────────────────────────────────────────────────────────────────
-    void showEmployeeProfile(const EmployeeProfile& emp,
-                              const String& photoPath = "") {
+    void showEmployeeProfile(const EmployeeProfile& emp, const String& photoPath = "") {
         if (!_tft) return;
+
+        SDLogger::logf("EPD", SDLogger::INFO,
+            "showEmployeeProfile uid='%s' name='%s' photo='%s'",
+            emp.uid.c_str(), emp.fullName.c_str(), photoPath.c_str());
+
         _tft->fillScreen(TFTColors::BG_DARK);
 
-        bool isCheckIn   = (emp.clockType != "check-out");
-        uint16_t brdCol  = isCheckIn ? TFTColors::SUCCESS : TFTColors::ERROR;
+        bool isCheckIn  = (emp.clockType != "check-out");
+        
+        // Base colors (Green for IN, Red for OUT)
+        uint16_t actionCol = isCheckIn ? TFTColors::SUCCESS : TFTColors::RED;
 
-        // ── Double-line card border ───────────────────────────────────────────
-        _tft->drawRoundRect(1, 1, SCREEN_W - 2, SCREEN_H - 2, 12, brdCol);
-        _tft->drawRoundRect(3, 3, SCREEN_W - 6, SCREEN_H - 6, 10, brdCol);
-
-        // ── Photo / avatar  (large: r=82, top half of screen) ─────────────────
-        const int PH_CX = SCREEN_W / 2;   // 120
-        const int PH_CY = 95;              // vertically centred in top 185px
-        const int PH_R  = 80;              // 160px diameter
-
+        // ── 1. Full-Width Profile Image ───────────────────────────────────────
+        const int IMG_H = 230; // Take up the entire top 230 pixels
         bool photoOk = false;
-        if (photoPath.length() > 0)
-            photoOk = _drawCircularJpeg(photoPath, PH_CX, PH_CY, PH_R, brdCol);
-        if (!photoOk)
-            _drawInitials(emp, PH_CX, PH_CY, PH_R, brdCol);
 
-        // Ring border on top of photo
-        _tft->drawCircle(PH_CX, PH_CY, PH_R + 2, brdCol);
-        _tft->drawCircle(PH_CX, PH_CY, PH_R + 3, brdCol);
+        if (photoPath.length() > 0) {
+            photoOk = _drawRectJpeg(photoPath, 0, 0, SCREEN_W, IMG_H, TFTColors::BG_DARK);
+        }
 
-        // ── Divider below photo ───────────────────────────────────────────────
-        const int INFO_Y = PH_CY + PH_R + 8;  // ≈ 185
-        _tft->drawFastHLine(8, INFO_Y, SCREEN_W - 16, TFTColors::BORDER_DIM);
+        if (!photoOk) {
+            _drawInitialsRect(emp, 0, 0, SCREEN_W, IMG_H, TFTColors::BG_MID, actionCol);
+        }
 
-        // ── Name ──────────────────────────────────────────────────────────────
+        // Clean up any image spill below our boundary and draw a clean divider line
+        _tft->fillRect(0, IMG_H, SCREEN_W, SCREEN_H - IMG_H, TFTColors::BG_DARK);
+        _tft->drawFastHLine(0, IMG_H, SCREEN_W, actionCol);
+        _tft->drawFastHLine(0, IMG_H + 1, SCREEN_W, actionCol);
+
+        // ── 2. Minimalist Name ────────────────────────────────────────────────
         _tft->setTextDatum(MC_DATUM);
+        const int NAME_Y = IMG_H + 20; // Y = 250
+        
         _tft->setTextColor(TFTColors::WHITE, TFTColors::BG_DARK);
-        String nm = emp.fullName.length() ? emp.fullName
-                                          : (emp.firstName + " " + emp.lastName);
-        while (nm.length() > 1 && _tft->textWidth(nm.c_str(), 2) > SCREEN_W - 20)
+        String nm = emp.fullName.length() ? emp.fullName : (emp.firstName + " " + emp.lastName);
+        // Shrink name if it's too long to fit horizontally
+        while (nm.length() > 1 && _tft->textWidth(nm.c_str(), 4) > SCREEN_W - 10)
             nm.remove(nm.length() - 1);
-        _tft->drawString(nm, SCREEN_W / 2, INFO_Y + 10, 2);
+            
+        _tft->drawString(nm, SCREEN_W / 2, NAME_Y, 4);
 
-        // ── ID ────────────────────────────────────────────────────────────────
-        _tft->setTextColor(TFTColors::ACCENT_CYAN, TFTColors::BG_DARK);
-        _tft->drawString("ID: " + emp.idNumber, SCREEN_W / 2, INFO_Y + 25, 1);
+        // ── 3. Dynamic CLOCK IN / OUT Container ───────────────────────────────
+        const int BTN_H = 42;
+        const int BTN_Y = SCREEN_H - BTN_H - 6; // Y = 272
+        const int BTN_W = SCREEN_W - 20;
+        const int BTN_X = 10;
 
-        // ── Position ──────────────────────────────────────────────────────────
-        if (emp.position.length()) {
-            _tft->setTextColor(TFTColors::TEXT_SECONDARY, TFTColors::BG_DARK);
-            String pos = emp.position;
-            while (pos.length() > 1 && _tft->textWidth(pos.c_str(), 1) > SCREEN_W - 22)
-                pos.remove(pos.length() - 1);
-            _tft->drawString(pos, SCREEN_W / 2, INFO_Y + 37, 1);
-        }
-
-        // ── Dept badge ────────────────────────────────────────────────────────
-        if (emp.department.length()) {
-            int bw = _tft->textWidth(emp.department.c_str(), 1) + 12;
-            int bh = 15, bx = (SCREEN_W - bw) / 2, by = INFO_Y + 48;
-            _tft->fillRoundRect(bx, by, bw, bh, 4, TFTColors::BG_LIGHT);
-            _tft->drawRoundRect(bx, by, bw, bh, 4, TFTColors::BORDER_DIM);
-            _tft->setTextColor(TFTColors::TEXT_DIM, TFTColors::BG_LIGHT);
-            _tft->drawString(emp.department, SCREEN_W / 2, by + bh / 2, 1);
-        }
-
+        // Fill Base Color
+        _tft->fillRoundRect(BTN_X, BTN_Y, BTN_W, BTN_H, 6, actionCol);
+        
+        // Draw Double Border (White) to make it pop
+        _tft->drawRoundRect(BTN_X, BTN_Y, BTN_W, BTN_H, 6, TFTColors::WHITE);
+        _tft->drawRoundRect(BTN_X + 1, BTN_Y + 1, BTN_W - 2, BTN_H - 2, 5, TFTColors::WHITE);
+        
+        // Action Text
+        _tft->setTextColor(TFTColors::WHITE, actionCol);
+        _tft->drawString(isCheckIn ? "CLOCK IN" : "CLOCK OUT", SCREEN_W / 2, BTN_Y + (BTN_H / 2), 4);
+        
         _tft->setTextDatum(TL_DATUM);
 
-        // ── CLOCK IN / CLOCK OUT button ───────────────────────────────────────
-        const int BTN_Y  = SCREEN_H - 66;
-        const int BTN_X  = 12;
-        const int BTN_W  = SCREEN_W - 24;
-        const int BTN_H  = 52;
-
-        uint16_t btnFill = isCheckIn ? TFTColors::SUCCESS : TFTColors::ERROR;
-        _tft->fillRoundRect(BTN_X,     BTN_Y,     BTN_W,     BTN_H,     10, brdCol);
-        _tft->fillRoundRect(BTN_X + 2, BTN_Y + 2, BTN_W - 4, BTN_H - 4,  8, btnFill);
-        _tft->setTextDatum(MC_DATUM);
-        _tft->setTextColor(TFTColors::BLACK, btnFill);
-        _tft->drawString(isCheckIn ? "CLOCK IN" : "CLOCK OUT",
-                         SCREEN_W / 2, BTN_Y + BTN_H / 2, 4);
-        _tft->setTextDatum(TL_DATUM);
-
-        Serial.println("[Profile] " + emp.fullName + " [" + emp.clockType +
-                       "] photo=" + (photoOk ? "JPEG" : "initials"));
-    }
-
-    // ── stub preserved for compilation compatibility ──────────────────────────
-    bool downloadPhoto(const String& uid, uint8_t** b, size_t* l) {
-        (void)uid; (void)b; (void)l; return false;
+        SDLogger::logf("EPD", SDLogger::INFO, "Profile drawn successfully");
     }
 
 private:
     TFT_eSPI* _tft = nullptr;
 
-    // ── Initials avatar ───────────────────────────────────────────────────────
-    void _drawInitials(const EmployeeProfile& emp, int cx, int cy, int r,
-                       uint16_t accent) {
-        _tft->fillCircle(cx, cy, r, TFTColors::BG_MID);
+    void _initTJpgDec() {
+        TJpgDec.setJpgScale(1);
+        TJpgDec.setCallback(_jpegCB);
+        TJpgDec.setSwapBytes(true); // REQUIRED: Fixes endianness for SPI
+    }
+
+    void _verifyTJpgDecInit() {
+        TJpgDec.setCallback(_jpegCB);
+        TJpgDec.setSwapBytes(true); // REQUIRED
+    }
+
+    // Fallback: Draws huge initials if there is no photo
+    void _drawInitialsRect(const EmployeeProfile& emp, int x, int y, int w, int h, uint16_t bg, uint16_t fg) {
+        _tft->fillRect(x, y, w, h, bg);
         String ini;
         if (emp.firstName.length())  ini += (char)toupper(emp.firstName[0]);
         if (emp.lastName.length())   ini += (char)toupper(emp.lastName[0]);
         if (!ini.length() && emp.fullName.length())
             ini = String((char)toupper(emp.fullName[0]));
-        _tft->setTextColor(accent, TFTColors::BG_MID);
+        
+        _tft->setTextColor(fg, bg);
         _tft->setTextDatum(MC_DATUM);
-        _tft->drawString(ini, cx, cy, 6);   // font 6 = large
+        
+        // Temporarily scale up font 4 to make it massive
+        _tft->setTextSize(3);
+        _tft->drawString(ini, x + w / 2, y + h / 2, 4);
+        _tft->setTextSize(1); // Reset!
+        
         _tft->setTextDatum(TL_DATUM);
     }
 
-    // ── Circular JPEG from SD ─────────────────────────────────────────────────
-    // Decode JPEG at bounding box top-left = (cx-r, cy-r), then mask corners.
-    bool _drawCircularJpeg(const String& path, int cx, int cy, int r,
-                           uint16_t accent) {
-        if (!_tft) return false;
+    // Core Drawing Engine for Rectangular Constraints
+    bool _drawRectJpeg(const String& path, int x, int y, int maxW, int maxH, uint16_t bg) {
+        if (!_tft || !SD_MMC.exists(path)) return false;
 
-        // ── Existence check ───────────────────────────────────────────────────
-        if (!SD_MMC.exists(path)) {
-            Serial.println("[IMG] Not on SD: " + path);
+        File f = SD_MMC.open(path, FILE_READ);
+        if (!f || f.size() < 4) { if (f) f.close(); return false; }
+        uint8_t magic[4] = {0};
+        f.read(magic, 4);
+        f.close();
+
+        if (magic[0] != 0xFF || magic[1] != 0xD8 || magic[2] != 0xFF) {
+            SD_MMC.remove(path);
             return false;
         }
 
-        // ── Open + size check ─────────────────────────────────────────────────
-        File f = SD_MMC.open(path, FILE_READ);
-        if (!f) { Serial.println("[IMG] Open failed: " + path); return false; }
-        size_t fsz = f.size();
-        if (fsz == 0 || fsz > 2000000) {  // raised from 300 KB → 2 MB
-            Serial.printf("[IMG] Bad size %u: %s\n", fsz, path.c_str());
-            f.close(); return false;
-        }
+        _verifyTJpgDecInit();
+        TJpgDec.setJpgScale(1);
 
-        // ── Read into PSRAM / heap ────────────────────────────────────────────
-        uint8_t* buf = (uint8_t*)ps_malloc(fsz);
-        if (!buf)  buf = (uint8_t*)malloc(fsz);
-        if (!buf) { Serial.println("[IMG] malloc fail"); f.close(); return false; }
-
-        size_t got = f.read(buf, fsz);
-        f.close();
-
-        if (got != fsz) {
-            Serial.printf("[IMG] Short read %u/%u\n", got, fsz);
-            free(buf); return false;
-        }
-
-        // ── JPEG header check ─────────────────────────────────────────────────
-        if (got < 4 || buf[0] != 0xFF || buf[1] != 0xD8 || buf[2] != 0xFF) {
-            Serial.printf("[IMG] Bad JPEG hdr: %02X%02X%02X\n",
-                          buf[0], buf[1], buf[2]);
-            free(buf); return false;
-        }
-
-        // ── Get JPEG size so we can pick the right scale ───────────────────────
         uint16_t jw = 0, jh = 0;
-        TJpgDec.getJpgSize(&jw, &jh, buf, got);
-        Serial.printf("[IMG] JPEG %ux%u, buf=%u\n", jw, jh, got);
+        const size_t PEEK = 512;
+        uint8_t peek[PEEK];
+        File fp = SD_MMC.open(path, FILE_READ);
+        size_t peeked = fp ? fp.read(peek, PEEK) : 0;
+        if (fp) fp.close();
 
-        if (jw == 0 || jh == 0) {
-            Serial.println("[IMG] Could not read JPEG dimensions");
-            free(buf); return false;
-        }
+        if (peeked >= 4) TJpgDec.getJpgSize(&jw, &jh, peek, peeked);
 
-        int dia = r * 2;
-
-        // TJpgDec supports scale 1/2/4/8 only
-        uint8_t scale = 1;
-        if      (jw > (uint16_t)dia * 4 || jh > (uint16_t)dia * 4) scale = 8;
-        else if (jw > (uint16_t)dia * 2 || jh > (uint16_t)dia * 2) scale = 4;
-        else if (jw > (uint16_t)dia     || jh > (uint16_t)dia)     scale = 2;
-        TJpgDec.setJpgScale(scale);
-
-        // ── Fill bounding rect with BG before decode ──────────────────────────
-        _tft->fillRect(cx - r - 1, cy - r - 1, dia + 2, dia + 2,
-                       TFTColors::BG_DARK);
-
-        // ── Point callback at TFT ──────────────────────────────────────────────
-        _jpegTft = _tft;
-        _jpegX   = (int16_t)(cx - r);
-        _jpegY   = (int16_t)(cy - r);
-
-        // drawJpg from memory buffer
-        TJpgDec.drawJpg(_jpegX, _jpegY, buf, got);
-        free(buf);
-
-        // ── Circle mask: overwrite corners with BG_DARK ────────────────────────
-        // Scan only the 4 corner "L-shaped" areas outside the inscribed circle
-        // to avoid repainting the entire square.
-        int r2 = r * r;
-        for (int py = cy - r; py <= cy + r; py++) {
-            int dy2 = (py - cy) * (py - cy);
-            for (int px = cx - r; px <= cx + r; px++) {
-                int dx2 = (px - cx) * (px - cx);
-                if (dx2 + dy2 > r2)
-                    _tft->drawPixel(px, py, TFTColors::BG_DARK);
+        if ((jw == 0 || jh == 0) && SD_MMC.exists(path)) {
+            const size_t PEEK2 = 2048;
+            uint8_t* peek2 = (uint8_t*)malloc(PEEK2);
+            if (peek2) {
+                File fp2 = SD_MMC.open(path, FILE_READ);
+                size_t p2 = fp2 ? fp2.read(peek2, PEEK2) : 0;
+                if (fp2) fp2.close();
+                if (p2 >= 4) TJpgDec.getJpgSize(&jw, &jh, peek2, p2);
+                free(peek2);
             }
         }
 
-        Serial.println("[IMG] Circular JPEG drawn OK");
+        // Scale determination based on boundary limits
+        uint8_t scale = 1;
+        if      (jw >= maxW * 8 || jh >= maxH * 8) scale = 8;
+        else if (jw >= maxW * 4 || jh >= maxH * 4) scale = 4;
+        else if (jw >= maxW * 2 || jh >= maxH * 2) scale = 2;
+        if (jw == 0 || jh == 0) scale = 1; 
+
+        TJpgDec.setJpgScale(scale);
+
+        int rw = (jw > 0) ? (int)(jw / scale) : maxW;
+        int rh = (jh > 0) ? (int)(jh / scale) : maxH;
+        
+        // This forces the JPEG Decoder to center the image perfectly.
+        // If the image is taller or wider than maxW/maxH, the coordinates become negative,
+        // which forces the library to natively 'crop' it like CSS object-fit: cover!
+        int16_t drawX = x + (maxW - rw) / 2;
+        int16_t drawY = y + (maxH - rh) / 2;
+
+        _tft->fillRect(x, y, maxW, maxH, bg);
+
+        _verifyTJpgDecInit();
+        _jpegTft = _tft;
+        _jpegX   = 0;
+        _jpegY   = 0;
+
+        JRESULT res = TJpgDec.drawFsJpg(drawX, drawY, path.c_str(), SD_MMC);
+
+        if (res != JDR_OK) {
+            if (res == JDR_FMT1 || res == JDR_FMT2 || res == JDR_FMT3) SD_MMC.remove(path);
+            return false;
+        }
+
         return true;
     }
 };
