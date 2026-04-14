@@ -26,6 +26,12 @@
 #include "sd_logger.h"
 
 bool SDDatabase::_ready = false;
+DateProviderFn SDDatabase::_dateProvider = nullptr;
+
+void SDDatabase::setDateProvider(DateProviderFn fn) {
+    _dateProvider = fn;
+    Serial.println("[SD] Date provider registered");
+}
 
 // ── Private helper: replace characters illegal on FAT32 ──────────────────────
 // FAT32 forbids: \ / : * ? " < > |
@@ -110,9 +116,17 @@ bool SDDatabase::ensureDir(const char* path) {
     return true;
 }
 
-// "/attendance/day_XXXXXX.csv" — increments per 24h of uptime
-// Replace with NTP-based date if you have NTP set up.
+// Returns "/attendance/YYYY-MM-DD.csv" when NTP is synced,
+// falls back to "/attendance/day_XXXXXX.csv" (uptime-based) otherwise.
+// The NTP-based name resets naturally at midnight because the date changes.
 String SDDatabase::todayFilename() {
+    if (_dateProvider) {
+        String d = _dateProvider();  // "YYYY-MM-DD" or ""
+        if (d.length() == 10) {
+            return "/attendance/" + d + ".csv";
+        }
+    }
+    // Fallback: uptime-based (pre-NTP, device just booted)
     unsigned long day = millis() / 86400000UL;
     char buf[40];
     snprintf(buf, sizeof(buf), "/attendance/day_%06lu.csv", day);
@@ -221,14 +235,93 @@ int SDDatabase::countEventInCSV(const String& path, const String& eventType) {
     int count = 0;
     while (f.available()) {
         String line = f.readStringUntil('\n');
-        if (line.indexOf(eventType) >= 0) count++;
+        line.trim();
+        if (line.length() == 0 || line.startsWith("timestamp")) continue;
+
+        // CSV: timestamp,nfc_uid,employee_uid,name,dept,event_type,device_id
+        // Parse out col5 (event_type) properly so we match the exact field,
+        // not a substring anywhere in the row (e.g. employee name containing "in").
+        int c0 = line.indexOf(',');
+        int c1 = (c0>=0) ? line.indexOf(',', c0+1) : -1;
+        int c2 = (c1>=0) ? line.indexOf(',', c1+1) : -1;
+        int c3 = (c2>=0) ? line.indexOf(',', c2+1) : -1;
+        int c4 = (c3>=0) ? line.indexOf(',', c3+1) : -1;
+        int c5 = (c4>=0) ? line.indexOf(',', c4+1) : -1;
+        if (c4 < 0 || c5 < 0) continue;
+
+        String ev = line.substring(c4+1, c5);
+        ev.trim();
+        if (ev.startsWith("\"")) ev = ev.substring(1);
+        if (ev.endsWith("\""))   ev = ev.substring(0, ev.length()-1);
+
+        if (ev == eventType) count++;
     }
     f.close();
     return count;
 }
 
-int SDDatabase::countTodayCheckIns()  { return countEventInCSV(todayFilename(), "check-in");  }
-int SDDatabase::countTodayCheckOuts() { return countEventInCSV(todayFilename(), "check-out"); }
+// ── Count helpers: match all session variants ─────────────────────────────────
+// Clock types written to CSV:  morning_in, morning_out, afternoon_in,
+//                              afternoon_out, evening_in, evening_out
+// A "check-in"  = any event ending in "_in"
+// A "check-out" = any event ending in "_out"
+int SDDatabase::countTodayCheckIns() {
+    if (!_ready) return 0;
+    String path = todayFilename();
+    if (!SD_MMC.exists(path)) return 0;
+    File f = SD_MMC.open(path, FILE_READ);
+    if (!f) return 0;
+    int count = 0;
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0 || line.startsWith("timestamp")) continue;
+        int c0 = line.indexOf(',');
+        int c1 = (c0>=0) ? line.indexOf(',', c0+1) : -1;
+        int c2 = (c1>=0) ? line.indexOf(',', c1+1) : -1;
+        int c3 = (c2>=0) ? line.indexOf(',', c2+1) : -1;
+        int c4 = (c3>=0) ? line.indexOf(',', c3+1) : -1;
+        int c5 = (c4>=0) ? line.indexOf(',', c4+1) : -1;
+        if (c4 < 0 || c5 < 0) continue;
+        String ev = line.substring(c4+1, c5);
+        ev.trim();
+        if (ev.startsWith("\"")) ev = ev.substring(1);
+        if (ev.endsWith("\""))   ev = ev.substring(0, ev.length()-1);
+        if (ev.endsWith("_in")) count++;
+    }
+    f.close();
+    Serial.printf("[SD] countTodayCheckIns = %d\n", count);
+    return count;
+}
+
+int SDDatabase::countTodayCheckOuts() {
+    if (!_ready) return 0;
+    String path = todayFilename();
+    if (!SD_MMC.exists(path)) return 0;
+    File f = SD_MMC.open(path, FILE_READ);
+    if (!f) return 0;
+    int count = 0;
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0 || line.startsWith("timestamp")) continue;
+        int c0 = line.indexOf(',');
+        int c1 = (c0>=0) ? line.indexOf(',', c0+1) : -1;
+        int c2 = (c1>=0) ? line.indexOf(',', c1+1) : -1;
+        int c3 = (c2>=0) ? line.indexOf(',', c2+1) : -1;
+        int c4 = (c3>=0) ? line.indexOf(',', c3+1) : -1;
+        int c5 = (c4>=0) ? line.indexOf(',', c4+1) : -1;
+        if (c4 < 0 || c5 < 0) continue;
+        String ev = line.substring(c4+1, c5);
+        ev.trim();
+        if (ev.startsWith("\"")) ev = ev.substring(1);
+        if (ev.endsWith("\""))   ev = ev.substring(0, ev.length()-1);
+        if (ev.endsWith("_out")) count++;
+    }
+    f.close();
+    Serial.printf("[SD] countTodayCheckOuts = %d\n", count);
+    return count;
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // saveEmployeeProfile / loadEmployeeProfile / hasEmployeeProfile
@@ -426,6 +519,66 @@ bool SDDatabase::hasCheckedInToday(const String& empUid) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// loadAttendanceToday
+// Returns comma-separated clock_types logged today for a specific empUid.
+// CSV cols: timestamp,nfc_uid,employee_uid,name,dept,event_type,device_id
+//                       col2                          col5
+// e.g. "morning_in,morning_out,afternoon_in"
+// ══════════════════════════════════════════════════════════════════════════════
+String SDDatabase::loadAttendanceToday(const String& empUid) {
+    if (!_ready) return "";
+    String path = todayFilename();
+    if (!SD_MMC.exists(path)) return "";
+    File f = SD_MMC.open(path, FILE_READ);
+    if (!f) return "";
+
+    String result = "";
+    bool   first  = true;
+
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) continue;
+        if (line.startsWith("timestamp")) continue;  // skip header row
+
+        // Parse CSV: col0=timestamp, col1=nfc_uid, col2=employee_uid,
+        //            col3=name, col4=department, col5=event_type, col6=device_id
+        int c0 = line.indexOf(',');
+        int c1 = (c0>=0) ? line.indexOf(',', c0+1) : -1;
+        int c2 = (c1>=0) ? line.indexOf(',', c1+1) : -1;
+        int c3 = (c2>=0) ? line.indexOf(',', c2+1) : -1;
+        int c4 = (c3>=0) ? line.indexOf(',', c3+1) : -1;
+        int c5 = (c4>=0) ? line.indexOf(',', c4+1) : -1;
+        if (c1<0 || c2<0 || c4<0 || c5<0) continue;
+
+        // col2 = employee_uid
+        String uid = line.substring(c1+1, c2);
+        uid.trim();
+        // strip surrounding quotes if csvEscape added them
+        if (uid.startsWith("\"")) uid = uid.substring(1);
+        if (uid.endsWith("\""))   uid = uid.substring(0, uid.length()-1);
+
+        if (uid != empUid) continue;
+
+        // col5 = event_type (clock_type)
+        String evType = line.substring(c4+1, c5);
+        evType.trim();
+        if (evType.startsWith("\"")) evType = evType.substring(1);
+        if (evType.endsWith("\""))   evType = evType.substring(0, evType.length()-1);
+
+        if (evType.length() == 0) continue;
+
+        if (!first) result += ",";
+        result += evType;
+        first = false;
+    }
+    f.close();
+
+    Serial.println("[SD] loadAttendanceToday uid=" + empUid + " -> '" + result + "'");
+    return result;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // saveNfcMapping / loadUidForNfc
 //
 // FIX: NFC UIDs contain colons (e.g. "04:A3:2F:12:6B:4C:80").
@@ -486,4 +639,116 @@ String SDDatabase::loadUidForNfc(const String& cardId) {
     String uid = doc["uid"] | "";
     Serial.println("[SD] loadUidForNfc: found empUid=" + uid);
     return uid;
+}
+// ══════════════════════════════════════════════════════════════════════════════
+// Server-ID Map  — /attendance/server_ids_YYYY-MM-DD.json
+// Stores the server DB record `id` returned after a successful attendance POST
+// so edits can use PUT /{id} instead of POST, preventing duplicate rows.
+// Key: "empUid|clockType|HH:MM:SS"
+// ══════════════════════════════════════════════════════════════════════════════
+
+static String _serverIdMapPath(const String& date) {
+    return "/attendance/server_ids_" + date + ".json";
+}
+
+bool SDDatabase::saveServerIdMapping(const String& date, const String& empUid,
+                                      const String& clockType, const String& timeStr,
+                                      int serverId) {
+    if (!_ready || serverId <= 0 || date.length() == 0) return false;
+
+    String path = _serverIdMapPath(date);
+    DynamicJsonDocument doc(4096);
+
+    // Load existing map (if any)
+    if (SD_MMC.exists(path)) {
+        File rf = SD_MMC.open(path, FILE_READ);
+        if (rf) { deserializeJson(doc, rf); rf.close(); }
+    }
+
+    // Extract time-only portion (HH:MM:SS) from timeStr
+    String t = timeStr;
+    int sp = t.indexOf(' ');
+    if (sp >= 0) t = t.substring(sp + 1);  // "YYYY-MM-DD HH:MM:SS" → "HH:MM:SS"
+
+    String key = empUid + "|" + clockType + "|" + t;
+    doc[key] = serverId;
+
+    // Write back
+    File wf = SD_MMC.open(path, FILE_WRITE);
+    if (!wf) {
+        Serial.println("[SD] saveServerIdMapping: cannot open " + path);
+        return false;
+    }
+    serializeJson(doc, wf);
+    wf.close();
+
+    Serial.printf("[SD] Saved server_id=%d for key=%s\n", serverId, key.c_str());
+    return true;
+}
+
+int SDDatabase::getServerIdForRecord(const String& date, const String& empUid,
+                                      const String& clockType, const String& timeStr) {
+    if (!_ready || date.length() == 0) return 0;
+
+    String path = _serverIdMapPath(date);
+    if (!SD_MMC.exists(path)) return 0;
+
+    File f = SD_MMC.open(path, FILE_READ);
+    if (!f) return 0;
+    DynamicJsonDocument doc(4096);
+    deserializeJson(doc, f);
+    f.close();
+
+    String t = timeStr;
+    int sp = t.indexOf(' ');
+    if (sp >= 0) t = t.substring(sp + 1);
+
+    String key = empUid + "|" + clockType + "|" + t;
+    int id = doc[key] | 0;
+    return id;
+}
+
+String SDDatabase::loadServerIdMapJson(const String& date) {
+    if (!_ready || date.length() == 0) return "{}";
+    String path = _serverIdMapPath(date);
+    if (!SD_MMC.exists(path)) return "{}";
+    File f = SD_MMC.open(path, FILE_READ);
+    if (!f) return "{}";
+    String out;
+    while (f.available()) { out += (char)f.read(); yield(); }
+    f.close();
+    return out;
+}
+
+bool SDDatabase::removeServerIdMapping(const String& date, const String& empUid,
+                                        const String& clockType, const String& timeStr) {
+    if (!_ready || date.length() == 0) return false;
+
+    String path = "/attendance/server_ids_" + date + ".json";
+    if (!SD_MMC.exists(path)) return true;  // nothing to remove
+
+    DynamicJsonDocument doc(4096);
+    {
+        File rf = SD_MMC.open(path, FILE_READ);
+        if (!rf) return false;
+        deserializeJson(doc, rf);
+        rf.close();
+    }
+
+    String t = timeStr;
+    int sp = t.indexOf(' ');
+    if (sp >= 0) t = t.substring(sp + 1);  // strip date portion if present
+
+    String key = empUid + "|" + clockType + "|" + t;
+    if (!doc.containsKey(key)) return true;  // key not found — already gone
+
+    doc.remove(key);
+
+    File wf = SD_MMC.open(path, FILE_WRITE);
+    if (!wf) return false;
+    serializeJson(doc, wf);
+    wf.close();
+
+    Serial.printf("[SD] Removed server_id map entry: %s\n", key.c_str());
+    return true;
 }

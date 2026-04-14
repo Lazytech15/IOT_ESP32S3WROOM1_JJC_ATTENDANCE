@@ -16,6 +16,8 @@
 //      a live, scrolling Linux-style terminal boot sequence.
 //   5. UI Overflow Fix: Shortened status codes (e.g., "SAVE:") and added dynamic
 //      pixel-width calculation to fit long names without the "..." truncation.
+//   6. Scroll Fix: Each unique employee name now always creates a new terminal
+//      row instead of overwriting the last line (_lastDetailStr tracking).
 // ══════════════════════════════════════════════════════════════════════════════
 
 #pragma once
@@ -384,6 +386,7 @@ public:
             Serial.println("[Poll] Event: " + evtName);
             Serial.flush();
 
+            // ── Employee events ───────────────────────────────────────────────
             if (evtName == "employee_created") {
                 _handleEmployeeCreated(svc, data); changes++;
             } else if (evtName == "employee_updated" ||
@@ -392,6 +395,23 @@ public:
             } else if (evtName == "employee_deleted" ||
                        evtName == "employee_bulk_deleted") {
                 _handleEmployeeDeleted(data); changes++;
+
+            // ── Attendance events — keep SD CSV in sync with server ───────────
+            // attendance_created : a new record arrived (another device / portal).
+            // attendance_synced  : batch sync confirmed by server.
+            // attendance_update  : generic refresh event (ESP32's own poll alias).
+            } else if (evtName == "attendance_created" ||
+                       evtName == "attendance_update"  ||
+                       evtName == "attendance_synced") {
+                if (_handleAttendanceCreated(data)) changes++;
+
+            // attendance_updated : clock_type or clock_time was edited.
+            } else if (evtName == "attendance_updated") {
+                if (_handleAttendanceUpdated(data)) changes++;
+
+            // attendance_deleted : single or bulk record removed from server.
+            } else if (evtName == "attendance_deleted") {
+                if (_handleAttendanceDeleted(data)) changes++;
             }
         }
 
@@ -423,6 +443,7 @@ private:
     inline static int _syncLogCount = 0;
     inline static int _lastLogPct = -10;
     inline static String _lastStatusStr = "";
+    inline static String _lastDetailStr  = "";   // each unique name triggers a new row
     inline static unsigned long _lastDraw = 0;
 
     static SyncMeta _loadMeta() {
@@ -480,6 +501,431 @@ private:
                 if (id.length() > 0) _removeEmployeeFromCache(id);
             }
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // ATTENDANCE SD-SYNC HANDLERS
+    //
+    // The SD attendance log is a CSV at /attendance/day_XXXXXX.csv with columns:
+    //   timestamp, nfc_uid, employee_uid, employee_name, department,
+    //   event_type, device_id
+    //
+    // These handlers keep that file in sync whenever the server emits socket
+    // events for attendance_created, attendance_updated, attendance_deleted.
+    //
+    // Only today's file is touched — historical CSVs are left untouched.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // ── _attendanceTodayPath ─────────────────────────────────────────────────
+    // Must match SDDatabase::todayFilename() exactly.
+    static String _attendanceTodayPath() {
+        unsigned long day = millis() / 86400000UL;
+        char buf[40];
+        snprintf(buf, sizeof(buf), "/attendance/day_%06lu.csv", day);
+        return String(buf);
+    }
+
+    // ── _csvEscape ────────────────────────────────────────────────────────────
+    static String _csvEscape(const String& s) {
+        if (s.indexOf(',') >= 0 || s.indexOf('"') >= 0 || s.indexOf('\n') >= 0) {
+            String e = "\"";
+            for (char c : s) { if (c == '"') e += "\"\""; else e += c; }
+            e += "\"";
+            return e;
+        }
+        return s;
+    }
+
+    // ── _extractDate ──────────────────────────────────────────────────────────
+    // Pull "YYYY-MM-DD" from either "YYYY-MM-DD HH:MM:SS" or "HH:MM:SS".
+    // Returns "" if the string doesn't look like a datetime.
+    static String _extractDate(const String& clockTime) {
+        if (clockTime.length() >= 10 && clockTime[4] == '-' && clockTime[7] == '-')
+            return clockTime.substring(0, 10);
+        return "";
+    }
+
+    // ── _extractTime ─────────────────────────────────────────────────────────
+    // Pull "HH:MM:SS" from either "YYYY-MM-DD HH:MM:SS" or "HH:MM:SS".
+    static String _extractTime(const String& clockTime) {
+        int sp = clockTime.indexOf(' ');
+        if (sp >= 0) return clockTime.substring(sp + 1, sp + 9);
+        if (clockTime.length() >= 8) return clockTime.substring(0, 8);
+        return clockTime;
+    }
+
+    // ── _rowMatchesRecord ─────────────────────────────────────────────────────
+    // Returns true if a CSV row belongs to the given employee + clock_type.
+    // Columns: ts, nfc_uid, emp_uid(col2), name(col3), dept(col4),
+    //          event_type(col5), device_id(col6)
+    static bool _rowMatchesRecord(const String& line,
+                                   const String& empUid,
+                                   const String& clockType) {
+        int c0 = line.indexOf(',');
+        int c1 = (c0 >= 0) ? line.indexOf(',', c0+1) : -1;
+        int c2 = (c1 >= 0) ? line.indexOf(',', c1+1) : -1;
+        int c3 = (c2 >= 0) ? line.indexOf(',', c2+1) : -1;
+        int c4 = (c3 >= 0) ? line.indexOf(',', c3+1) : -1;
+        int c5 = (c4 >= 0) ? line.indexOf(',', c4+1) : -1;
+        if (c1 < 0 || c2 < 0 || c4 < 0 || c5 < 0) return false;
+
+        // col2 = employee_uid
+        String uid = line.substring(c1+1, c2); uid.trim();
+        if (uid.startsWith("\"")) uid = uid.substring(1);
+        if (uid.endsWith("\""))   uid = uid.substring(0, uid.length()-1);
+
+        // col5 = event_type
+        String ev = line.substring(c4+1, c5); ev.trim();
+        if (ev.startsWith("\"")) ev = ev.substring(1);
+        if (ev.endsWith("\""))   ev = ev.substring(0, ev.length()-1);
+
+        return (uid == empUid && ev == clockType);
+    }
+
+    // ── _handleAttendanceCreated ──────────────────────────────────────────────
+    // Socket payload (from socket.php attendanceCreated) is the full DB row:
+    //   employee_uid, clock_type, clock_time ("YYYY-MM-DD HH:MM:SS"), date,
+    //   first_name, last_name, department
+    // No nfc_uid or device_id in the socket payload — left blank in CSV.
+    static bool _handleAttendanceCreated(JsonObject data) {
+        if (!SDDatabase::isReady()) return false;
+
+        // ── Field extraction — match socket.php attendanceCreated payload ──
+        String empUid    = _jsonStrObj(data, "employee_uid", "uid");
+        String clockType = _jsonStrObj(data, "clock_type",   "clock_type");
+        String clockTime = _jsonStrObj(data, "clock_time",   "clock_time");
+        String recDate   = _jsonStrObj(data, "date",         "date");
+
+        // Build employee_name from first_name + last_name (no "employee_name" field)
+        String firstName = _jsonStrObj(data, "first_name", "first_name");
+        String lastName  = _jsonStrObj(data, "last_name",  "last_name");
+        String empName   = (firstName + " " + lastName);
+        empName.trim();
+        if (empName.length() == 0) empName = empUid; // fallback
+
+        String dept     = _jsonStrObj(data, "department", "department");
+        // nfc_uid and device_id are NOT in the socket payload — server row has no NFC col
+        String nfcUid   = "";
+        String deviceId = _jsonStrObj(data, "device_info", "device_info");
+
+        if (empUid.length() == 0 || clockType.length() == 0) {
+            Serial.println("[AttSync] CREATE skipped — missing empUid or clockType");
+            return false;
+        }
+
+        // Guard: only mirror records whose date matches today's file.
+        // _attendanceTodayPath() is keyed by millis-day; if recDate is provided
+        // we also verify it matches the file's day to avoid writing stale data.
+        String path = _attendanceTodayPath();
+        bool fileExists = SD_MMC.exists(path);
+
+        // If record has an explicit date and it doesn't look like today, skip it.
+        // We detect "today" by checking whether the file already exists OR
+        // recDate matches the date portion of clockTime (both should equal today).
+        // The safest gate: only touch the file if clockTime's date == recDate
+        // (i.e. the server record is internally consistent).
+        if (recDate.length() > 0 && clockTime.length() >= 10) {
+            String ctDate = _extractDate(clockTime);
+            if (ctDate.length() > 0 && ctDate != recDate) {
+                Serial.printf("[AttSync] CREATE skipped — date mismatch: clockTime=%s recDate=%s\n",
+                              ctDate.c_str(), recDate.c_str());
+                return false;
+            }
+        }
+
+        // Check for duplicate row (same emp_uid + clock_type already in CSV)
+        if (fileExists) {
+            File rf = SD_MMC.open(path, FILE_READ);
+            if (rf) {
+                while (rf.available()) {
+                    String line = rf.readStringUntil('\n');
+                    line.trim();
+                    if (_rowMatchesRecord(line, empUid, clockType)) {
+                        rf.close();
+                        Serial.printf("[AttSync] CREATE skipped — already in CSV: %s %s\n",
+                                      empUid.c_str(), clockType.c_str());
+                        return false;
+                    }
+                }
+                rf.close();
+            }
+        }
+
+        // Append row (create file + header if missing)
+        File f = SD_MMC.open(path, FILE_APPEND);
+        if (!f) {
+            Serial.println("[AttSync] CREATE failed — cannot open CSV");
+            return false;
+        }
+        if (!fileExists) {
+            f.println("timestamp,nfc_uid,employee_uid,employee_name,department,event_type,device_id");
+        }
+
+        // Store HH:MM:SS in the timestamp column (matches ESP32 local scan format)
+        String ts = _extractTime(clockTime);
+        if (ts.length() == 0) ts = clockTime;
+
+        String row = _csvEscape(ts)        + "," +
+                     _csvEscape(nfcUid)    + "," +
+                     _csvEscape(empUid)    + "," +
+                     _csvEscape(empName)   + "," +
+                     _csvEscape(dept)      + "," +
+                     _csvEscape(clockType) + "," +
+                     _csvEscape(deviceId);
+        f.println(row);
+        f.close();
+
+        Serial.printf("[AttSync] CREATE → appended %s %s to %s\n",
+                      empUid.c_str(), clockType.c_str(), path.c_str());
+        return true;
+    }
+
+    // ── _handleAttendanceUpdated ──────────────────────────────────────────────
+    // Socket payload (from socket.php attendanceUpdated) is the full updated DB
+    // row: same fields as attendanceCreated.
+    //
+    // The server does not send an "old_clock_type" field — the DB row is already
+    // the new state. Strategy: scan CSV for any row belonging to this employee
+    // (same emp_uid, any clock_type that starts the same session prefix), then
+    // replace it.  If the clock_type itself changed we need to search by
+    // employee_uid only and match the session (morning/afternoon/evening/overtime
+    // prefix).  Simplest reliable approach: replace the FIRST row for this
+    // emp_uid whose session prefix matches, falling back to any row for emp_uid.
+    static bool _handleAttendanceUpdated(JsonObject data) {
+        if (!SDDatabase::isReady()) return false;
+
+        String empUid       = _jsonStrObj(data, "employee_uid", "uid");
+        String newClockType = _jsonStrObj(data, "clock_type",   "clock_type");
+        String newClockTime = _jsonStrObj(data, "clock_time",   "clock_time");
+
+        String firstName = _jsonStrObj(data, "first_name", "first_name");
+        String lastName  = _jsonStrObj(data, "last_name",  "last_name");
+        String empName   = (firstName + " " + lastName);
+        empName.trim();
+        if (empName.length() == 0) empName = empUid;
+
+        String dept     = _jsonStrObj(data, "department",  "department");
+        String nfcUid   = "";
+        String deviceId = _jsonStrObj(data, "device_info", "device_info");
+
+        if (empUid.length() == 0 || newClockType.length() == 0) {
+            Serial.println("[AttSync] UPDATE skipped — missing empUid or clockType");
+            return false;
+        }
+
+        String path = _attendanceTodayPath();
+        if (!SD_MMC.exists(path)) {
+            // File doesn't exist for today — treat as a new record
+            Serial.println("[AttSync] UPDATE — no today file, delegating to CREATE");
+            return _handleAttendanceCreated(data);
+        }
+
+        File rf = SD_MMC.open(path, FILE_READ);
+        if (!rf) return false;
+
+        String newTs = _extractTime(newClockTime);
+        if (newTs.length() == 0) newTs = newClockTime;
+
+        String newRow = _csvEscape(newTs)       + "," +
+                        _csvEscape(nfcUid)       + "," +
+                        _csvEscape(empUid)       + "," +
+                        _csvEscape(empName)      + "," +
+                        _csvEscape(dept)         + "," +
+                        _csvEscape(newClockType) + "," +
+                        _csvEscape(deviceId);
+
+        // Extract the session prefix of the new clock_type (e.g. "morning" from
+        // "morning_out") so we can match the old row even if the _in/_out flipped.
+        String newSession = newClockType;
+        int uscore = newSession.lastIndexOf('_');
+        if (uscore > 0) newSession = newSession.substring(0, uscore);
+
+        String output  = "";
+        bool   updated = false;
+        while (rf.available()) {
+            String line = rf.readStringUntil('\n');
+            line.trim();
+            if (line.length() == 0) continue;
+
+            if (!updated) {
+                // Primary match: exact emp_uid + exact clock_type
+                bool exactMatch = _rowMatchesRecord(line, empUid, newClockType);
+
+                // Secondary match: same emp_uid, same session prefix
+                // (handles the case where _in was edited to _out or vice versa)
+                bool sessionMatch = false;
+                if (!exactMatch) {
+                    sessionMatch = _rowMatchesSession(line, empUid, newSession);
+                }
+
+                if (exactMatch || sessionMatch) {
+                    output  += newRow + "\n";
+                    updated  = true;
+                    Serial.printf("[AttSync] UPDATE → replaced %s (%s match)\n",
+                                  newClockType.c_str(), exactMatch ? "exact" : "session");
+                    continue;
+                }
+            }
+            output += line + "\n";
+        }
+        rf.close();
+
+        if (!updated) {
+            // Row not in today's CSV — append it as a new record
+            Serial.printf("[AttSync] UPDATE — row not found, appending as new: %s %s\n",
+                          empUid.c_str(), newClockType.c_str());
+            File af = SD_MMC.open(path, FILE_APPEND);
+            if (!af) return false;
+            af.println(newRow);
+            af.close();
+            return true;
+        }
+
+        // Overwrite file
+        SD_MMC.remove(path);
+        File wf = SD_MMC.open(path, FILE_WRITE);
+        if (!wf) {
+            Serial.println("[AttSync] UPDATE failed — cannot reopen CSV for write");
+            return false;
+        }
+        wf.print(output);
+        wf.close();
+
+        Serial.printf("[AttSync] UPDATE → wrote %s %s in %s\n",
+                      empUid.c_str(), newClockType.c_str(), path.c_str());
+        return true;
+    }
+
+    // ── _handleAttendanceDeleted ──────────────────────────────────────────────
+    // Socket payload (from socket.php attendanceDeleted):
+    //   Single delete:    { id, employee_uid, date, clock_type, clock_time,
+    //                       type:"single_delete" }
+    //   Duplicate purge:  { removed_count, type:"duplicate_removal",
+    //                       removed_ids:[...] }   ← no emp_uid/clock_type
+    //
+    // CSV has no DB id — we match on employee_uid + clock_type.
+    // For duplicate_removal (no identifiers) we do nothing on the SD since we
+    // can't know which rows were duplicates. The next full sync will reconcile.
+    static bool _handleAttendanceDeleted(JsonObject data) {
+        if (!SDDatabase::isReady()) return false;
+
+        String path = _attendanceTodayPath();
+        if (!SD_MMC.exists(path)) return false;
+
+        String deleteType = _jsonStrObj(data, "type", "type");
+
+        // ── Duplicate-removal purge — no row-level identifiers available ──────
+        // The server removed duplicate DB rows (same emp+time+type), but we
+        // never write duplicates to the CSV (our CREATE guard prevents it), so
+        // there is nothing to do.
+        if (deleteType == "duplicate_removal") {
+            Serial.println("[AttSync] DELETE — duplicate_removal type, SD CSV unaffected");
+            return false;
+        }
+
+        // ── Single delete ─────────────────────────────────────────────────────
+        struct DelEntry { String uid; String ct; };
+        const int MAX_DEL = 32;
+        DelEntry toDelete[MAX_DEL];
+        int      delCount = 0;
+
+        // Primary: employee_uid + clock_type from the top-level payload
+        String singleUid = _jsonStrObj(data, "employee_uid", "uid");
+        String singleCt  = _jsonStrObj(data, "clock_type",   "clock_type");
+
+        if (singleUid.length() > 0 && singleCt.length() > 0 && delCount < MAX_DEL) {
+            toDelete[delCount++] = {singleUid, singleCt};
+            Serial.printf("[AttSync] DELETE queued: %s %s\n",
+                          singleUid.c_str(), singleCt.c_str());
+        }
+
+        // Secondary: "deleted_employees" array (used by bulk attendance delete
+        // from the admin portal — not the same as employee_bulk_deleted)
+        if (data.containsKey("deleted_employees")) {
+            JsonArray arr = data["deleted_employees"].as<JsonArray>();
+            for (JsonObject item : arr) {
+                String u = _jsonStrObj(item, "employee_uid", "uid");
+                String c = _jsonStrObj(item, "clock_type",   "clock_type");
+                if (u.length() > 0 && c.length() > 0 && delCount < MAX_DEL) {
+                    toDelete[delCount++] = {u, c};
+                    Serial.printf("[AttSync] DELETE queued (bulk): %s %s\n",
+                                  u.c_str(), c.c_str());
+                }
+            }
+        }
+
+        if (delCount == 0) {
+            Serial.println("[AttSync] DELETE skipped — no identifiable records in payload");
+            return false;
+        }
+
+        // Read CSV, drop matching rows, write back
+        File rf = SD_MMC.open(path, FILE_READ);
+        if (!rf) return false;
+
+        String output  = "";
+        int    removed = 0;
+        while (rf.available()) {
+            String line = rf.readStringUntil('\n');
+            line.trim();
+            if (line.length() == 0) continue;
+
+            bool drop = false;
+            for (int i = 0; i < delCount; i++) {
+                if (_rowMatchesRecord(line, toDelete[i].uid, toDelete[i].ct)) {
+                    drop = true;
+                    removed++;
+                    Serial.printf("[AttSync] DELETE → dropping row: %s %s\n",
+                                  toDelete[i].uid.c_str(), toDelete[i].ct.c_str());
+                    break;
+                }
+            }
+            if (!drop) output += line + "\n";
+        }
+        rf.close();
+
+        if (removed == 0) {
+            Serial.println("[AttSync] DELETE — no matching rows found in today's CSV");
+            return false;
+        }
+
+        SD_MMC.remove(path);
+        File wf = SD_MMC.open(path, FILE_WRITE);
+        if (!wf) {
+            Serial.println("[AttSync] DELETE failed — cannot reopen CSV for write");
+            return false;
+        }
+        wf.print(output);
+        wf.close();
+
+        Serial.printf("[AttSync] DELETE → removed %d row(s) from %s\n",
+                      removed, path.c_str());
+        return true;
+    }
+
+    // ── _rowMatchesSession ────────────────────────────────────────────────────
+    // Like _rowMatchesRecord but matches any clock_type that starts with the
+    // given session prefix (e.g. "morning" matches "morning_in" or "morning_out")
+    static bool _rowMatchesSession(const String& line,
+                                    const String& empUid,
+                                    const String& sessionPrefix) {
+        int c0 = line.indexOf(',');
+        int c1 = (c0 >= 0) ? line.indexOf(',', c0+1) : -1;
+        int c2 = (c1 >= 0) ? line.indexOf(',', c1+1) : -1;
+        int c3 = (c2 >= 0) ? line.indexOf(',', c2+1) : -1;
+        int c4 = (c3 >= 0) ? line.indexOf(',', c3+1) : -1;
+        int c5 = (c4 >= 0) ? line.indexOf(',', c4+1) : -1;
+        if (c1 < 0 || c2 < 0 || c4 < 0 || c5 < 0) return false;
+
+        String uid = line.substring(c1+1, c2); uid.trim();
+        if (uid.startsWith("\"")) uid = uid.substring(1);
+        if (uid.endsWith("\""))   uid = uid.substring(0, uid.length()-1);
+
+        String ev = line.substring(c4+1, c5); ev.trim();
+        if (ev.startsWith("\"")) ev = ev.substring(1);
+        if (ev.endsWith("\""))   ev = ev.substring(0, ev.length()-1);
+
+        return (uid == empUid && ev.startsWith(sessionPrefix));
     }
 
     static void _fetchAndCacheEmployee(AttendanceHTTPService& svc, const String& empId) {
@@ -549,10 +995,11 @@ private:
         if (!tft) return;
         
         // Reset state for new sync session
-        _syncLogCount = 0;
-        _lastLogPct = -10;
-        _lastStatusStr = "";
-        _lastDraw = 0;
+        _syncLogCount   = 0;
+        _lastLogPct     = -10;
+        _lastStatusStr  = "";
+        _lastDetailStr  = "";
+        _lastDraw       = 0;
 
         tft->fillScreen(TFTColors::BLACK);
         tft->setTextWrap(false); // REQUIRED: Stop TFT from auto-wrapping text to the next line
@@ -576,18 +1023,20 @@ private:
         pct = constrain(pct, 0, 100);
 
         bool statusChanged = (String(status) != _lastStatusStr);
-        
-        // Throttling to max ~15 FPS to avoid blocking the network stream
-        if (millis() - _lastDraw < 60 && !statusChanged && pct != 100) {
-            return; 
+        bool detailChanged = (detail != _lastDetailStr);  // each new employee name = new row
+
+        // Throttle to ~15 FPS — but always let through if status OR detail changed
+        if (millis() - _lastDraw < 60 && !statusChanged && !detailChanged && pct != 100) {
+            return;
         }
-        _lastDraw = millis();
+        _lastDraw      = millis();
         _lastStatusStr = String(status);
+        _lastDetailStr = detail;
 
         String line = String(status);
         if (detail.length() > 0) line += " " + detail;
         
-        // FIX: Dynamically measure text width to fit exactly to the edge of the screen.
+        // Dynamically measure text width to fit exactly to the edge of the screen.
         // Start X is 55. Screen width is usually 240. We leave a 2 pixel margin.
         int maxTextWidth = tft->width() - 58; 
         
@@ -596,7 +1045,9 @@ private:
             line.remove(line.length() - 1);
         }
 
-        bool newLine = statusChanged || (pct - _lastLogPct >= 10) || (pct == 100);
+        // New row when: status prefix changed, employee name changed,
+        // progress jumped >=10%, or this is the final 100% entry.
+        bool newLine = statusChanged || detailChanged || (pct - _lastLogPct >= 10) || (pct == 100);
 
         if (newLine || _syncLogCount == 0) {
             if (_syncLogCount < 12) {

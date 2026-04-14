@@ -1,13 +1,18 @@
-//current project - AES-256-CBC DECRYPTION FOR ESP32
+// current project - AES-256-CBC DECRYPTION FOR ESP32
 //
-// FIX v2:
-// - All malloc() calls for decode/plaintext buffers now use ps_malloc() first
-//   (PSRAM) and fall back to heap malloc() only if PSRAM is unavailable.
-//   This prevents heap OOM when decrypting large paginated responses
-//   (50 employees with face_descriptor can produce 60-100 KB of base64
-//   ciphertext; the decryptor needs TWO large buffers simultaneously).
-// - Added explicit heap+PSRAM logging before and after each allocation
-//   so OOM failures are visible in Serial output.
+// FIX v3:
+// - decryptServerResponse() now uses a two-pass strategy:
+//     PASS 1: If the body contains "encrypted":true AND a base64 "data"
+//             string field, attempt AES decrypt.
+//     PASS 2: If pass 1 is skipped or fails, attempt direct JSON parse.
+//   This makes the function robust against:
+//     • Server returning plain JSON (e.g. esp32-sync before server fix)
+//     • Any future endpoint where encryption middleware is bypassed
+//     • Field-name mismatches (falls back gracefully)
+// - Added detailed Serial logging at every decision point so failures
+//   are visible without needing a separate body-preview log.
+// - All malloc() calls still use ps_malloc() first (PSRAM) with heap
+//   fallback, same as v2.
 
 #pragma once
 #include <Arduino.h>
@@ -41,6 +46,12 @@ static inline uint8_t* _aes_alloc(size_t size, const char* label) {
     return ptr;
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// AesDecryptor
+// Wraps mbedTLS AES-256-CBC. Key is provided as base64 (same value as PHP
+// API_ENCRYPTION_KEY). decrypt() accepts base64( iv || ciphertext ) — the
+// format produced by the PHP EncryptionMiddleware::encrypt() method.
+// ══════════════════════════════════════════════════════════════════════════════
 class AesDecryptor {
 public:
     explicit AesDecryptor(const char* base64Key) {
@@ -57,6 +68,9 @@ public:
         Serial.flush();
     }
 
+    // ── decrypt ───────────────────────────────────────────────────────────────
+    // Input:  base64-encoded  ( 16-byte IV || AES-CBC ciphertext )
+    // Output: decrypted plaintext String, or "" on any failure.
     String decrypt(const String& base64Payload) {
         if (!_keyReady) {
             Serial.println("[AES] Cannot decrypt — key not ready");
@@ -64,20 +78,21 @@ public:
             return "";
         }
 
-        Serial.printf("[AES] decrypt() called — payload len=%d  heap=%u  psram=%u\n",
+        Serial.printf("[AES] decrypt() — payload len=%d  heap=%u  psram=%u\n",
                       (int)base64Payload.length(),
                       ESP.getFreeHeap(), ESP.getFreePsram());
         Serial.flush();
 
         // ── 1. Base64-decode ──────────────────────────────────────────────────
         size_t decodedLen = 0;
-        const unsigned char* src = (const unsigned char*)base64Payload.c_str();
-        size_t srcLen = base64Payload.length();
+        const unsigned char* src    = (const unsigned char*)base64Payload.c_str();
+        size_t               srcLen = base64Payload.length();
 
+        // First call: get the required buffer size.
         mbedtls_base64_decode(nullptr, 0, &decodedLen, src, srcLen);
 
         if (decodedLen < 17) {
-            Serial.println("[AES] Payload too short: " + String(decodedLen));
+            Serial.println("[AES] Payload too short after base64 decode: " + String(decodedLen));
             Serial.flush();
             return "";
         }
@@ -85,14 +100,13 @@ public:
         Serial.printf("[AES] Decoded size will be %u bytes\n", (unsigned)decodedLen);
         Serial.flush();
 
-        // Use PSRAM-aware alloc for the decode buffer
         uint8_t* decoded = _aes_alloc(decodedLen, "decode-buf");
         if (!decoded) return "";
 
         size_t actualLen = 0;
         int ret = mbedtls_base64_decode(decoded, decodedLen, &actualLen, src, srcLen);
         if (ret != 0) {
-            Serial.println("[AES] Base64 decode failed: " + String(ret));
+            Serial.println("[AES] Base64 decode error: " + String(ret));
             Serial.flush();
             free(decoded);
             return "";
@@ -101,7 +115,7 @@ public:
         // ── 2. Split IV / ciphertext ──────────────────────────────────────────
         const int IV_LEN = 16;
         if ((int)actualLen <= IV_LEN) {
-            Serial.println("[AES] Not enough data after base64 decode");
+            Serial.println("[AES] Not enough data for IV + ciphertext: " + String(actualLen));
             Serial.flush();
             free(decoded);
             return "";
@@ -121,7 +135,6 @@ public:
         }
 
         // ── 3. AES-256-CBC decrypt ─────────────────────────────────────────────
-        // Use PSRAM-aware alloc for the plaintext buffer
         uint8_t* plaintext = _aes_alloc(ciphertextLen + 1, "plain-buf");
         if (!plaintext) {
             free(decoded);
@@ -160,7 +173,7 @@ public:
         // ── 4. Strip PKCS#7 padding ────────────────────────────────────────────
         uint8_t padLen = plaintext[ciphertextLen - 1];
         if (padLen == 0 || padLen > 16) {
-            Serial.println("[AES] Invalid PKCS#7 padding: " + String(padLen));
+            Serial.println("[AES] Invalid PKCS#7 pad byte: " + String(padLen));
             Serial.flush();
             free(plaintext);
             return "";
@@ -200,76 +213,134 @@ private:
 
 
 // ══════════════════════════════════════════════════════════════════════════════
-// decryptServerResponse  (free function)
+// decryptServerResponse  (free function, v3)
+//
+// Strategy (two-pass):
+//
+// PASS 1 — Encrypted path
+//   Triggered when body contains "encrypted":true AND a quoted "data" field
+//   (i.e. "data":"<base64>"). The quoted-value check ensures we only try
+//   AES when data is a string, NOT when data is an object/array (plain JSON).
+//   On success: outDoc is populated from the decrypted JSON → return true.
+//   On failure: fall through to pass 2 (don't give up immediately).
+//
+// PASS 2 — Plain JSON path
+//   Attempt direct deserialisation of the raw body into outDoc.
+//   Handles:
+//     • Endpoints where encryption middleware was bypassed / not yet fixed.
+//     • Future endpoints intentionally left unencrypted.
+//   On success: return true.
+//   On failure: return false (nothing more we can do).
+//
+// Callers don't need to know which path succeeded — the populated outDoc
+// is identical either way.
 // ══════════════════════════════════════════════════════════════════════════════
 inline bool decryptServerResponse(AesDecryptor&        decryptor,
                                   const String&        rawBody,
                                   DynamicJsonDocument& outDoc) {
-    bool isEncrypted = (rawBody.indexOf("\"encrypted\":true") >= 0);
 
-    Serial.printf("[AES] decryptServerResponse: bodyLen=%d encrypted=%s\n",
-                  (int)rawBody.length(), isEncrypted ? "YES" : "NO");
+    // ── Diagnostic header ─────────────────────────────────────────────────────
+    Serial.printf("[AES] decryptServerResponse: bodyLen=%d  heap=%u  psram=%u\n",
+                  (int)rawBody.length(), ESP.getFreeHeap(), ESP.getFreePsram());
+    // Print first 200 chars so we can see whether it's an encrypted envelope
+    // or plain JSON without adding a separate log call in the caller.
+    Serial.println("[AES] Body[0..199]: " +
+                   rawBody.substring(0, min(200, (int)rawBody.length())));
     Serial.flush();
 
-    if (!isEncrypted) {
-        DeserializationError err = deserializeJson(outDoc, rawBody);
-        if (err) {
-            Serial.print("[AES] Direct JSON parse error: ");
-            Serial.println(err.c_str());
+    // ── Detect envelope fields ────────────────────────────────────────────────
+    // "encrypted":true  → server confirms this is an encrypted response.
+    // "data":"          → "data" value is a quoted string (base64), not an
+    //                     object/array.  This is the field we decrypt.
+    bool hasEncryptedFlag = (rawBody.indexOf("\"encrypted\":true") >= 0);
+    // indexOf returns the position of the substring; >= 0 means found.
+    // We look for the literal `"data":"` (8 chars incl. opening quote of value)
+    // so we don't confuse it with `"data":{` (object) or `"data":[` (array).
+    bool hasBase64Data    = (rawBody.indexOf("\"data\":\"") >= 0);
+
+    Serial.printf("[AES] encryptedFlag=%s  base64DataField=%s\n",
+                  hasEncryptedFlag ? "YES" : "NO",
+                  hasBase64Data    ? "YES" : "NO");
+    Serial.flush();
+
+    // ── PASS 1: AES decrypt ───────────────────────────────────────────────────
+    if (hasEncryptedFlag && hasBase64Data) {
+        Serial.println("[AES] PASS 1: attempting AES decrypt");
+        Serial.flush();
+
+        // Extract the base64 ciphertext by string search — avoids allocating
+        // a huge DynamicJsonDocument just to pull one field.
+        int dataKeyIdx = rawBody.indexOf("\"data\":\"");
+        int dataStart  = dataKeyIdx + 8;                      // skip past "data":"
+        int dataEnd    = rawBody.indexOf("\"", dataStart);    // closing quote
+
+        if (dataEnd <= dataStart) {
+            Serial.println("[AES] PASS 1: could not find closing quote of 'data' — skipping to PASS 2");
             Serial.flush();
-            return false;
+            goto pass2;
         }
-        return true;
-    }
 
-    // ── Extract base64 "data" field by string search (avoids huge JSON parse) ─
-    int dataKeyIdx = rawBody.indexOf("\"data\":\"");
-    if (dataKeyIdx < 0) {
-        Serial.println("[AES] No 'data' field found in encrypted envelope");
-        Serial.println("[AES] Body preview: " + rawBody.substring(0, min(200,(int)rawBody.length())));
+        {
+            String encryptedData = rawBody.substring(dataStart, dataEnd);
+            // PHP json_encode escapes forward-slashes; undo that.
+            encryptedData.replace("\\/", "/");
+
+            Serial.printf("[AES] PASS 1: base64 len=%d\n", (int)encryptedData.length());
+            Serial.flush();
+
+            String plainJson = decryptor.decrypt(encryptedData);
+
+            if (plainJson.length() == 0) {
+                Serial.println("[AES] PASS 1: decrypt returned empty — falling through to PASS 2");
+                Serial.flush();
+                goto pass2;
+            }
+
+            Serial.printf("[AES] PASS 1: plaintext len=%d\n", (int)plainJson.length());
+            Serial.println("[AES] PASS 1 plain[0..199]: " +
+                           plainJson.substring(0, min(200, (int)plainJson.length())));
+            Serial.flush();
+
+            outDoc.clear();
+            DeserializationError err = deserializeJson(outDoc, plainJson);
+            if (!err) {
+                Serial.println("[AES] PASS 1: JSON parse OK → success");
+                Serial.flush();
+                return true;
+            }
+
+            Serial.println("[AES] PASS 1: inner JSON parse error: " + String(err.c_str()));
+            Serial.printf("[AES] PASS 1: outDoc capacity=%u  plainJson len=%d\n",
+                          (unsigned)outDoc.capacity(), (int)plainJson.length());
+            Serial.flush();
+            // Fall through to PASS 2 — maybe the body itself is also valid JSON.
+        }
+    } else {
+        Serial.println("[AES] PASS 1: skipped (encrypted envelope not detected)");
         Serial.flush();
-        return false;
     }
 
-    int dataStart = dataKeyIdx + 8;
-    int dataEnd   = rawBody.indexOf("\"", dataStart);
-    if (dataEnd < 0) {
-        Serial.println("[AES] Could not find closing quote of 'data' field");
-        Serial.flush();
-        return false;
-    }
-
-    String encryptedData = rawBody.substring(dataStart, dataEnd);
-    encryptedData.replace("\\/", "/");  // PHP json_encode escapes /
-
-    Serial.printf("[AES] Extracted base64 len: %d  heap: %u  psram: %u\n",
-                  (int)encryptedData.length(),
-                  ESP.getFreeHeap(), ESP.getFreePsram());
+    // ── PASS 2: plain JSON parse ──────────────────────────────────────────────
+    pass2:
+    Serial.println("[AES] PASS 2: attempting direct JSON parse");
     Serial.flush();
 
-    // ── Decrypt ────────────────────────────────────────────────────────────────
-    String plainJson = decryptor.decrypt(encryptedData);
-    if (plainJson.length() == 0) {
-        Serial.println("[AES] Decryption returned empty string");
+    outDoc.clear();
+    {
+        DeserializationError err = deserializeJson(outDoc, rawBody);
+        if (!err) {
+            Serial.println("[AES] PASS 2: JSON parse OK → success");
+            Serial.flush();
+            return true;
+        }
+
+        Serial.println("[AES] PASS 2: JSON parse error: " + String(err.c_str()));
+        Serial.printf("[AES] PASS 2: outDoc capacity=%u  bodyLen=%d\n",
+                      (unsigned)outDoc.capacity(), (int)rawBody.length());
         Serial.flush();
-        return false;
     }
 
-    Serial.printf("[AES] Plain JSON len: %d\n", (int)plainJson.length());
-    Serial.println("[AES] Plain preview: " +
-                   plainJson.substring(0, min(200, (int)plainJson.length())));
+    Serial.println("[AES] Both passes failed — returning false");
     Serial.flush();
-
-    // ── Parse into caller's document ──────────────────────────────────────────
-    DeserializationError err = deserializeJson(outDoc, plainJson);
-    if (err) {
-        Serial.print("[AES] Inner JSON parse error: ");
-        Serial.println(err.c_str());
-        Serial.printf("[AES] outDoc capacity: %u  plainJson len: %d\n",
-                      (unsigned)outDoc.capacity(), (int)plainJson.length());
-        Serial.flush();
-        return false;
-    }
-
-    return true;
+    return false;
 }

@@ -114,8 +114,19 @@ public:
 
         _tft->fillScreen(TFTColors::BG_DARK);
 
-        bool isCheckIn  = (emp.clockType != "check-out");
-        
+        // Correct check: clockType is a session key like "morning_in",
+        // "afternoon_out", "evening_in" — never the literal "check-in"/"check-out".
+        // endsWith("_in") is the only reliable way to detect direction.
+        bool isCheckIn = emp.clockType.endsWith("_in");
+
+        // Build the human-readable session label for the action button.
+        // e.g. "morning_in"    → "MORNING IN"
+        //      "afternoon_out" → "AFTERNOON OUT"
+        //      "evening_in"    → "EVENING IN"
+        String sessionLabel = emp.clockType.length() > 0 ? emp.clockType : (isCheckIn ? "check-in" : "check-out");
+        sessionLabel.replace("_", " ");
+        sessionLabel.toUpperCase();
+
         // Base colors (Green for IN, Red for OUT)
         uint16_t actionCol = isCheckIn ? TFTColors::SUCCESS : TFTColors::RED;
 
@@ -161,9 +172,11 @@ public:
         _tft->drawRoundRect(BTN_X, BTN_Y, BTN_W, BTN_H, 6, TFTColors::WHITE);
         _tft->drawRoundRect(BTN_X + 1, BTN_Y + 1, BTN_W - 2, BTN_H - 2, 5, TFTColors::WHITE);
         
-        // Action Text
+        // Show session label: "MORNING IN", "AFTERNOON OUT", "EVENING IN", etc.
+        // Scale font down slightly if the label is too wide for font 4.
         _tft->setTextColor(TFTColors::WHITE, actionCol);
-        _tft->drawString(isCheckIn ? "CLOCK IN" : "CLOCK OUT", SCREEN_W / 2, BTN_Y + (BTN_H / 2), 4);
+        uint8_t btnFont = (_tft->textWidth(sessionLabel.c_str(), 4) <= BTN_W - 8) ? 4 : 2;
+        _tft->drawString(sessionLabel, SCREEN_W / 2, BTN_Y + (BTN_H / 2), btnFont);
         
         _tft->setTextDatum(TL_DATUM);
 

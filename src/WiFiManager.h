@@ -1,6 +1,6 @@
 // ════════════════════════════════════════════════════════════════════════════
 // WiFiManager.h  — Web Admin Portal for ESP32-S3 NFC Attendance
-//
+// 192.168.4.1:8080 in AP mode; local IP in WiFi mode
 // Tabs (in order):
 //   1. Dashboard  — today's stats + quick actions + LIVE SSE feed
 //   2. SD Files   — raw SD card browser: list ALL files, view/download any file
@@ -28,6 +28,7 @@
 #include "WiFiConfig.h"
 #include "sd_database.h"
 #include "sd_file_manager.h" // Ensure file manager tools are included
+#include "attendance_http_service.h"
 
 // Some cores don't expose WIFI_SCAN_RUNNING; ensure we have a fallback
 #ifndef WIFI_SCAN_RUNNING
@@ -55,9 +56,13 @@ class WiFiManager {
 public:
     WiFiManager() : _srv(WM_PORT) {}
 
-    void init(const String& deviceId, WiFiConfig* cfg) {
-        _deviceId = deviceId;
-        _cfg      = cfg;
+    void init(const String& deviceId, WiFiConfig* cfg,
+              const String& serverURL = "",
+              AttendanceHTTPService* attSvc = nullptr) {
+        _deviceId  = deviceId;
+        _cfg       = cfg;
+        _serverURL = serverURL;
+        _attSvc    = attSvc;
         _setupRoutes();
         // Must register Cookie header BEFORE begin() so _authed() works.
         static const char* _hdrs[] = {"Cookie"};
@@ -102,7 +107,9 @@ public:
 private:
     WebServer  _srv;
     String     _deviceId;
+    String     _serverURL;
     WiFiConfig* _cfg = nullptr;
+    AttendanceHTTPService* _attSvc = nullptr;
 
     // ── Start async background scan ───────────────────────────────────────────
     void _startScan() {
@@ -272,8 +279,10 @@ label{font-size:.8rem;color:var(--dim);display:block;margin-bottom:4px}
         _srv.on("/api/sd/copy",    HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiSdCopy(); });
         _srv.on("/api/sd/write",   HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiSdWrite(); });
 
-        _srv.on("/api/attendance",       HTTP_GET,  [this](){ if(!_authed()){_srv.send(401);}else _apiAttendance(); });
-        _srv.on("/api/attendance/dates", HTTP_GET,  [this](){ if(!_authed()){_srv.send(401);}else _apiAttendanceDates(); });
+        _srv.on("/api/attendance",              HTTP_GET,  [this](){ if(!_authed()){_srv.send(401);}else _apiAttendance(); });
+        _srv.on("/api/attendance/dates",        HTTP_GET,  [this](){ if(!_authed()){_srv.send(401);}else _apiAttendanceDates(); });
+        _srv.on("/api/attendance/update",       HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiAttendanceUpdate(); });
+        _srv.on("/api/attendance/deleterow",    HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiAttendanceDeleteRow(); });
         _srv.on("/api/wifi/scan",  HTTP_GET,  [this](){ if(!_authed()){_srv.send(401);}else _apiScan(); });
         _srv.on("/api/wifi/info",  HTTP_GET,  [this](){ if(!_authed()){_srv.send(401);}else _apiWifiInfo(); });
         _srv.on("/api/wifi/connect",    HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiConnect(); });
@@ -516,10 +525,9 @@ browseDir();
     }
 
     // ════════════════════════════════════════════════════════════════════════
-    // TAB 2 — ATTENDANCE LOG (NEW: Raw Editor added to fix timestamps)
+    // TAB 2 — ATTENDANCE LOG  (Rich row editor + server sync)
     // ════════════════════════════════════════════════════════════════════════
     void _handleAttendance() {
-        // Get today's real date for the default option label
         struct tm ti = {}; getLocalTime(&ti, 0);
         char todayLabel[32];
         strftime(todayLabel, sizeof(todayLabel), "Today (%a %b %d, %Y)", &ti);
@@ -531,107 +539,391 @@ browseDir();
   <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:center">
     <select id="dateSelect" onchange="loadCsv(this.value)" style="width:auto;flex:1"></select>
     <a id="dlCsvBtn" href="#" class="btn btn-primary btn-sm" download="attendance.csv">Download CSV</a>
-    <button class="btn btn-ghost btn-sm" onclick="editCsv()">&#9998; Edit Raw Log</button>
+    <button class="btn btn-ghost btn-sm" onclick="openEditor()">&#9998; Edit Raw Log</button>
   </div>
   <div id="dateLabel" style="font-size:.78rem;color:#64748b;margin-bottom:10px"></div>
   <div id="tableArea"><p style="color:#64748b;font-size:.82rem">Loading...</p></div>
-  <div id="editArea" style="display:none;">
-    <textarea id="csvEditor" style="width:100%;height:300px;background:#000;color:#a3e635;font-family:monospace;padding:10px;border:1px solid var(--border);border-radius:6px;line-height:1.5" spellcheck="false"></textarea>
-    <div style="margin-top:8px;display:flex;gap:8px">
-      <button class="btn btn-primary" onclick="saveCsv()">Save Changes</button>
-      <button class="btn btn-ghost" onclick="cancelEdit()">Cancel</button>
+</div>
+
+<!-- ── Row Editor Modal ── -->
+<div id="editorModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:999;overflow-y:auto;padding:20px">
+  <div style="max-width:800px;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h3 style="font-size:1rem;font-weight:700">&#9998; Edit Attendance Records</h3>
+      <div style="display:flex;gap:8px">
+        <button class="btn btn-primary btn-sm" onclick="saveAllRows()">&#10003; Save &amp; Sync</button>
+        <button class="btn btn-ghost btn-sm" onclick="closeEditor()">&#10005; Close</button>
+      </div>
     </div>
-    <p style="color:var(--dim);font-size:0.75rem;margin-top:8px;">Format: timestamp,nfc_uid,employee_uid,employee_name,department,event_type,device_id</p>
+    <div id="syncStatus" style="display:none;padding:8px 12px;border-radius:6px;font-size:.82rem;margin-bottom:12px"></div>
+    <div style="font-size:.78rem;color:var(--dim);margin-bottom:12px">
+      Edit any field below. Changes are saved to the SD card and synced to the server.
+    </div>
+    <div id="editorRows"></div>
+    <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn btn-primary" onclick="saveAllRows()">&#10003; Save &amp; Sync to Server</button>
+      <button class="btn btn-ghost" onclick="closeEditor()">Cancel</button>
+    </div>
   </div>
 </div>
+
+<style>
+.erow{background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:8px;
+  padding:12px;margin-bottom:10px;position:relative}
+.erow:hover{border-color:var(--teal)}
+.erow-header{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.erow-num{font-size:.7rem;color:var(--dim);min-width:24px}
+.erow-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.erow-field label{font-size:.72rem;color:var(--dim);display:block;margin-bottom:3px}
+.erow-field input,.erow-field select{background:rgba(255,255,255,.06);border:1px solid var(--border);
+  border-radius:5px;color:var(--text);padding:6px 8px;font-size:.8rem;width:100%}
+.erow-field input:focus,.erow-field select:focus{outline:none;border-color:var(--teal)}
+.del-row-btn{position:absolute;top:10px;right:10px;background:rgba(239,68,68,.15);
+  color:var(--red);border:1px solid rgba(239,68,68,.3);border-radius:5px;
+  padding:3px 8px;font-size:.72rem;cursor:pointer}
+.del-row-btn:hover{background:rgba(239,68,68,.3)}
+.badge-morning_in,.badge-morning_out,.badge-afternoon_in,.badge-afternoon_out,
+.badge-evening_in,.badge-evening_out{display:inline-block;padding:2px 8px;
+  border-radius:4px;font-size:.72rem;font-weight:600}
+.badge-morning_in,.badge-afternoon_in,.badge-evening_in{background:rgba(34,211,238,.15);color:#22d3ee}
+.badge-morning_out,.badge-afternoon_out,.badge-evening_out{background:rgba(249,115,22,.15);color:#f97316}
+</style>
+
 <script>
 var currentFile = '';
 var currentDate = '';
+var _editorRows = [];
+var _serverIds  = [];  // parallel to _editorRows: server DB id for each row, 0 if unknown
 
-// Load date list from /api/attendance/dates
 fetch('/api/attendance/dates').then(r=>r.json()).then(function(d){
   var sel = document.getElementById('dateSelect');
   sel.innerHTML = '';
-  // Today option first
   var todayOpt = document.createElement('option');
   todayOpt.value = 'today';
   todayOpt.textContent = d.today_label || 'Today';
   sel.appendChild(todayOpt);
-  // Past dates from SD, newest first
   (d.dates||[]).forEach(function(entry){
     var o = document.createElement('option');
     o.value = entry.file;
-    o.textContent = entry.label;  // e.g. "Mon Mar 03, 2026"
+    o.textContent = entry.label;
     sel.appendChild(o);
   });
   loadCsv('today');
 });
 
+var _autoRetryTimer = null;
+
 function loadCsv(val){
   currentFile = (val==='today') ? '__today__' : '/attendance/'+val;
-  var url='/api/attendance?f='+encodeURIComponent(val);
-  document.getElementById('dlCsvBtn').href='/api/sd/dl?f='+encodeURIComponent(currentFile);
-
-  // Show selected date label
+  var url = '/api/attendance?f='+encodeURIComponent(val);
+  document.getElementById('dlCsvBtn').href = '/api/sd/dl?f='+encodeURIComponent(currentFile);
   var sel = document.getElementById('dateSelect');
   var selText = sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].textContent : '';
-  document.getElementById('dateLabel').textContent = selText ? ('Showing records for: ' + selText) : '';
+  document.getElementById('dateLabel').textContent = selText ? ('Showing records for: '+selText) : '';
+
+  // Show spinner while fetching
+  document.getElementById('tableArea').innerHTML =
+    '<div style="display:flex;align-items:center;gap:10px;padding:12px 0;color:#64748b;font-size:.82rem">'
+    +'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#22d3ee" stroke-width="2"'
+    +' style="animation:spin 1s linear infinite"><circle cx="12" cy="12" r="10" stroke-opacity=".25"/>'
+    +'<path d="M12 2a10 10 0 0 1 10 10"/></svg>'
+    +'Fetching attendance data...</div>'
+    +'<style>@keyframes spin{to{transform:rotate(360deg)}}</style>';
 
   fetch(url).then(r=>r.json()).then(function(d){
-    if(!d.rows||d.rows.length===0){
-      document.getElementById('tableArea').innerHTML='<p style="color:#64748b;font-size:.82rem">No records for this date.</p>';
+    // Cancel any pending auto-retry (previous empty-state timer)
+    if(_autoRetryTimer){ clearTimeout(_autoRetryTimer); _autoRetryTimer=null; }
+
+    // If ESP32 cleaned up server-deleted rows, reload transparently
+    if(d.rows_removed && d.rows_removed > 0){
+      console.log('[SD] '+d.rows_removed+' server-deleted row(s) purged — reloading');
+      loadCsv(val);
       return;
     }
+
+    if(!d.rows || d.rows.length===0){
+      // If this is today's view, schedule one auto-retry in 5s.
+      // The SD sync may still be running in the background at boot time.
+      if(val==='today'){
+        document.getElementById('tableArea').innerHTML=
+          '<div style="display:flex;align-items:center;gap:10px;padding:12px 0;color:#64748b;font-size:.82rem">'
+          +'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#f97316" stroke-width="2"'
+          +' style="animation:spin 1s linear infinite"><circle cx="12" cy="12" r="10" stroke-opacity=".25"/>'
+          +'<path d="M12 2a10 10 0 0 1 10 10"/></svg>'
+          +'SD sync in progress — retrying in 5 s…</div>';
+        _autoRetryTimer = setTimeout(function(){ loadCsv('today'); }, 5000);
+      } else {
+        document.getElementById('tableArea').innerHTML=
+          '<p style="color:#64748b;font-size:.82rem">No records for this date.</p>';
+      }
+      return;
+    }
+
+    // ── Source badge (shown in dateLabel when data came live from server) ──
+    var srcBadge = '';
+    if(d.pulled_from_server){
+      srcBadge = ' <span style="display:inline-block;padding:2px 8px;border-radius:4px;'
+               + 'font-size:.7rem;font-weight:600;background:rgba(34,211,238,.15);'
+               + 'color:#22d3ee;border:1px solid rgba(34,211,238,.2);margin-left:6px">'
+               + '&#8659; live from server</span>';
+    }
+    var lbl = document.getElementById('dateLabel');
+    lbl.innerHTML = (selText ? ('Showing records for: '+selText) : '') + srcBadge;
+
     var h='<div style="overflow-x:auto"><table><thead><tr>';
-    // Inject Date as first column header, then existing headers
-    h += '<th style="color:#22d3ee">Date</th>';
+    h+='<th style="color:#22d3ee">Date</th>';
     (d.headers||[]).forEach(function(hd){h+='<th>'+hd+'</th>';});
+    h+='<th></th>';  // edit button column
     h+='</tr></thead><tbody>';
-    d.rows.forEach(function(row){
+    d.rows.forEach(function(row, idx){
       h+='<tr>';
-      // Date cell — use d.date from API (the file's date), or parse from timestamp
-      var dateStr = d.date || '';
-      h+='<td style="color:#22d3ee;white-space:nowrap;font-size:.78rem">'+dateStr+'</td>';
+      h+='<td style="color:#22d3ee;white-space:nowrap;font-size:.78rem">'+(d.date||'')+'</td>';
       row.forEach(function(cell,i){
         if(i===5){
-          var cls=cell==='check-in'?'badge-in':cell==='check-out'?'badge-out':'badge-denied';
-          h+='<td><span class="badge '+cls+'">'+cell+'</span></td>';
-        } else {h+='<td>'+cell+'</td>';}
+          // event_type badge — handles morning_in, afternoon_out, etc.
+          var et = cell.trim();
+          var isIn = et.endsWith('_in') || et==='check-in';
+          var cls = isIn ? 'badge-in' : (et.endsWith('_out')||et==='check-out') ? 'badge-out' : 'badge-denied';
+          h+='<td><span class="badge '+cls+'">'+et+'</span></td>';
+        } else {
+          h+='<td>'+cell+'</td>';
+        }
       });
+      // Only show edit button for SD-backed rows (server-live rows have no local ID to edit)
+      if(!d.pulled_from_server){
+        h+='<td><button class="btn btn-ghost btn-sm" onclick="editRow('+idx+')">&#9998;</button></td>';
+      } else {
+        h+='<td><span style="font-size:.7rem;color:#64748b" title="Save SD sync first">—</span></td>';
+      }
       h+='</tr>';
     });
     h+='</tbody></table></div>';
-    document.getElementById('tableArea').innerHTML=h;
-  });
-}
-
-function editCsv() {
-  document.getElementById('tableArea').style.display='none';
-  document.getElementById('editArea').style.display='block';
-  document.getElementById('csvEditor').value = 'Loading...';
-  fetch('/api/sd/read?f='+encodeURIComponent(currentFile))
-    .then(r=>r.text()).then(t=>{ document.getElementById('csvEditor').value=t; });
-}
-
-function cancelEdit() {
-  document.getElementById('tableArea').style.display='block';
-  document.getElementById('editArea').style.display='none';
-}
-
-function saveCsv() {
-  var t = document.getElementById('csvEditor').value;
-  if(!confirm("Are you sure you want to overwrite the log file?")) return;
-  fetch('/api/sd/write?f='+encodeURIComponent(currentFile), {
-    method: 'POST', body: t, headers: {'Content-Type':'text/plain'}
-  }).then(r=>r.json()).then(d=>{
-    if(d.success){ 
-        alert('Saved successfully!'); 
-        cancelEdit(); 
-        loadCsv(document.getElementById('dateSelect').value); 
+    if(d.pulled_from_server){
+      h+='<p style="font-size:.75rem;color:#64748b;margin-top:8px;padding:0 4px">'
+        +'&#9432; Showing live server data. SD sync is still running — '
+        +'<a href="#" onclick="loadCsv(\'today\');return false;" '
+        +'style="color:#22d3ee">refresh</a> in a moment to edit records.</p>';
     }
-    else alert('Failed to save file.');
+    document.getElementById('tableArea').innerHTML = h;
+    // Store rows for editor
+    window._csvData = d;
+  }).catch(function(e){
+    document.getElementById('tableArea').innerHTML=
+      '<p style="color:#ef4444;font-size:.82rem">Fetch error: '+e+'</p>';
   });
 }
+
+function editRow(idx){
+  openEditor(idx);
+}
+
+function openEditor(focusIdx){
+  if(!window._csvData || !window._csvData.rows){
+    alert('Load attendance data first.');
+    return;
+  }
+  var d = window._csvData;
+  _editorRows = d.rows.map(function(r){ return r.slice(); });
+  _serverIds  = (d.serverIds||[]).map(function(id){ return id||0; });
+  // Pad to same length in case serverIds is shorter (e.g. offline)
+  while (_serverIds.length < _editorRows.length) _serverIds.push(0);
+
+  var html = '';
+  _editorRows.forEach(function(row, i){
+    var et      = (row[5]||'').trim();
+    var isIn    = et.endsWith('_in') || et==='check-in';
+    var badgeCls= isIn ? 'badge-in' : (et.endsWith('_out')||et==='check-out') ? 'badge-out' : 'badge-denied';
+
+    // Parse timestamp → HH:MM:SS for the time input
+    var rawTs  = (row[0]||'').replace(/"/g,'').trim();
+    // If stored as "HH:MM:SS" already; if "YYYY-MM-DD HH:MM:SS" extract time part
+    var timePart = rawTs;
+    if(rawTs.indexOf(' ') >= 0) timePart = rawTs.split(' ')[1] || rawTs;
+    // <input type="time" step="1"> expects HH:MM:SS
+    if(timePart.split(':').length === 2) timePart += ':00';
+
+    html += '<div class="erow" id="erow_'+i+'">';
+    html += '<div class="erow-header">';
+    html += '<span class="erow-num">#'+(i+1)+'</span>';
+    html += '<span class="badge '+badgeCls+'" id="badge_'+i+'">'+et+'</span>';
+    html += '<span style="font-size:.72rem;color:var(--dim);margin-left:8px">'+
+            (row[3]||'').replace(/"/g,'')+'</span>';
+    html += '</div>';
+
+    // ── Two-column grid: ONLY editable fields ──────────────────────────────
+    html += '<div class="erow-grid">';
+
+    // EDITABLE: Timestamp — time picker
+    html += '<div class="erow-field">';
+    html += '<label>&#128336; Time</label>';
+    html += '<input type="time" step="1" id="f_'+i+'_0" value="'+timePart+'" '+
+            'style="color-scheme:dark" onchange="updateBadge('+i+')">';
+    html += '</div>';
+
+    // EDITABLE: Clock Type — dropdown
+    html += '<div class="erow-field"><label>&#128203; Clock Type</label>';
+    html += '<select id="f_'+i+'_5" onchange="updateBadge('+i+')">';
+    var types=['morning_in','morning_out','afternoon_in','afternoon_out','evening_in','evening_out'];
+    types.forEach(function(t){
+      var lbl = t.replace('_',' ').replace(/\b\w/g,function(c){return c.toUpperCase();});
+      html += '<option value="'+t+'"'+(et===t?' selected':'')+'>'+lbl+'</option>';
+    });
+    html += '</select></div>';
+
+    html += '</div>'; // erow-grid
+
+    // ── Read-only info strip ───────────────────────────────────────────────
+    html += '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:8px;'+
+            'background:rgba(0,0,0,.2);border-radius:6px;padding:8px 10px">';
+
+    html += _roField('Employee', (row[3]||'').replace(/"/g,''));
+    html += _roField('Department', (row[4]||'').replace(/"/g,''));
+    html += _roField('Emp UID', (row[2]||'').replace(/"/g,''));
+
+    html += '</div>'; // read-only strip
+
+    html += '<button class="del-row-btn" onclick="deleteRow('+i+')">&#128465; Delete</button>';
+    html += '</div>'; // erow
+  });
+
+  document.getElementById('editorRows').innerHTML = html;
+  document.getElementById('editorModal').style.display = 'block';
+  document.body.style.overflow = 'hidden';
+
+  if(focusIdx !== undefined){
+    setTimeout(function(){
+      var el = document.getElementById('erow_'+focusIdx);
+      if(el) el.scrollIntoView({behavior:'smooth',block:'center'});
+    },100);
+  }
+}
+
+// Helper: read-only label+value cell
+function _roField(label, val){
+  return '<div><div style="font-size:.68rem;color:var(--dim);margin-bottom:2px">'+label+'</div>'+
+         '<div style="font-size:.78rem;color:var(--text);font-weight:500">'+
+         (val||'—')+'</div></div>';
+}
+
+// Live-update the badge when clock type or time changes
+function updateBadge(i){
+  var sel = document.getElementById('f_'+i+'_5');
+  if(!sel) return;
+  var et = sel.value;
+  var isIn = et.endsWith('_in');
+  var badgeCls = isIn ? 'badge-in' : 'badge-out';
+  var badge = document.getElementById('badge_'+i);
+  if(badge){
+    badge.className = 'badge '+badgeCls;
+    badge.textContent = et;
+  }
+}
+
+function closeEditor(){
+  document.getElementById('editorModal').style.display = 'none';
+  document.body.style.overflow = '';
+  hideSyncStatus();
+}
+
+function deleteRow(idx){
+  if(!confirm('Delete row #'+(idx+1)+'? This will remove it from SD and the server.')) return;
+  var row = _editorRows[idx];
+  var payload = {
+    file: currentFile,
+    rowIndex: idx,
+    empUid: (row[2]||'').replace(/"/g,''),
+    timestamp: (row[0]||'').replace(/"/g,''),
+    eventType: (row[5]||'').replace(/"/g,''),
+    serverId: _serverIds[idx]||0        // pass server DB id directly — no range-query needed
+  };
+  fetch('/api/attendance/deleterow', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  }).then(r=>r.json()).then(function(d){
+    if(d.success){
+      showSyncStatus('Row deleted. ' + (d.server_ok ? 'Server synced.' : 'SD only (offline).'), d.server_ok);
+      _editorRows.splice(idx, 1);
+      var sel = document.getElementById('dateSelect');
+      loadCsv(sel.value);
+      closeEditor();
+    } else {
+      showSyncStatus('Delete failed: '+(d.error||'unknown'), false);
+    }
+  }).catch(function(e){ showSyncStatus('Network error: '+e, false); });
+}
+
+function saveAllRows(){
+  var rows = [];
+  var serverIdsOut = [];
+  for(var i=0; i<_editorRows.length; i++){
+    var el = document.getElementById('erow_'+i);
+    if(!el) continue;
+
+    var orig = _editorRows[i];
+
+    // Reconstruct timestamp: keep date prefix if original had one
+    var timePicker = document.getElementById('f_'+i+'_0');
+    var newTime    = timePicker ? timePicker.value : '';   // "HH:MM" or "HH:MM:SS"
+    // Ensure seconds are included
+    if(newTime && newTime.split(':').length === 2) newTime += ':00';
+    var origTs = (orig[0]||'').replace(/"/g,'').trim();
+    var finalTs = newTime;
+    if(origTs.indexOf(' ') >= 0){
+      // Original was "YYYY-MM-DD HH:MM:SS" — preserve the date portion
+      finalTs = origTs.split(' ')[0] + ' ' + newTime;
+    }
+
+    var clockSel = document.getElementById('f_'+i+'_5');
+    var newClock = clockSel ? clockSel.value : (orig[5]||'');
+
+    var row = [
+      finalTs,                              // 0 timestamp  (edited)
+      (orig[1]||'').replace(/"/g,''),       // 1 nfc_uid    (locked)
+      (orig[2]||'').replace(/"/g,''),       // 2 emp_uid    (locked)
+      (orig[3]||'').replace(/"/g,''),       // 3 emp_name   (locked)
+      (orig[4]||'').replace(/"/g,''),       // 4 dept       (locked)
+      newClock,                             // 5 clock_type (edited)
+      (orig[6]||'').replace(/"/g,'')        // 6 device_id  (locked)
+    ];
+    rows.push(row);
+    serverIdsOut.push(_serverIds[i]||0);
+  }
+
+  var payload = { file: currentFile, rows: rows, serverIds: serverIdsOut };
+  showSyncStatus('Saving to SD and syncing to server...', null);
+
+  fetch('/api/attendance/update', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(payload)
+  }).then(r=>r.json()).then(function(d){
+    if(d.success){
+      var msg = 'Saved to SD.';
+      if(d.server_synced > 0) msg += ' Synced '+d.server_synced+' record(s) to server.';
+      else if(d.server_error) msg += ' Server sync failed: '+d.server_error;
+      else msg += ' Device offline — SD only.';
+      showSyncStatus(msg, d.server_synced > 0);
+      var sel = document.getElementById('dateSelect');
+      loadCsv(sel.value);
+    } else {
+      showSyncStatus('Save failed: '+(d.error||'unknown error'), false);
+    }
+  }).catch(function(e){ showSyncStatus('Network error: '+e, false); });
+}
+
+function showSyncStatus(msg, ok){
+  var el = document.getElementById('syncStatus');
+  el.textContent = msg;
+  if(ok === null){
+    el.style.cssText='display:block;background:rgba(249,115,22,.1);color:#f97316;border:1px solid rgba(249,115,22,.3);padding:8px 12px;border-radius:6px;font-size:.82rem;margin-bottom:12px';
+  } else if(ok){
+    el.style.cssText='display:block;background:rgba(16,185,129,.1);color:#10b981;border:1px solid rgba(16,185,129,.3);padding:8px 12px;border-radius:6px;font-size:.82rem;margin-bottom:12px';
+  } else {
+    el.style.cssText='display:block;background:rgba(239,68,68,.1);color:#ef4444;border:1px solid rgba(239,68,68,.3);padding:8px 12px;border-radius:6px;font-size:.82rem;margin-bottom:12px';
+  }
+}
+function hideSyncStatus(){ document.getElementById('syncStatus').style.display='none'; }
 
 loadCsv('today');
 </script>
@@ -793,11 +1085,23 @@ loadStatus();loadNets();
     // API HANDLERS
     // ════════════════════════════════════════════════════════════════════════
 
-    // Resolves __today__ macro for read/write endpoints
-    String _resolveTodayPath(String p) {
-        if (p == "__today__") {
+    // Resolves __today__ macro to the real NTP-based attendance file path.
+    // Uses getLocalTime() — same source as SDDatabase's date provider —
+    // so this always matches the file that SDDatabase::logAttendance() writes to.
+    String _resolveTodayPath(const String& p) {
+        if (p == "__today__" || p == "today") {
+            // Try NTP first
+            struct tm ti = {};
+            if (getLocalTime(&ti, 0)) {
+                char buf[40];
+                snprintf(buf, sizeof(buf), "/attendance/%04d-%02d-%02d.csv",
+                         ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday);
+                return String(buf);
+            }
+            // Fallback: uptime-based (same as SDDatabase fallback before NTP sync)
             unsigned long day = millis() / 86400000UL;
-            char buf[40]; snprintf(buf, sizeof(buf), "/attendance/day_%06lu.csv", day);
+            char buf[40];
+            snprintf(buf, sizeof(buf), "/attendance/day_%06lu.csv", day);
             return String(buf);
         }
         return p;
@@ -1045,6 +1349,440 @@ loadStatus();loadNets();
         f.close();
     }
 
+    // ── ATTENDANCE UPDATE — save edited rows to SD, PUT/POST server, invalidate summary ──
+    void _apiAttendanceUpdate() {
+        String body = _srv.arg("plain");
+        if (body.length() == 0) {
+            _srv.send(200,"application/json","{\"success\":false,\"error\":\"Empty body\"}");
+            return;
+        }
+
+        DynamicJsonDocument req(16384);
+        if (deserializeJson(req, body) != DeserializationError::Ok) {
+            _srv.send(200,"application/json","{\"success\":false,\"error\":\"JSON parse error\"}");
+            return;
+        }
+
+        String   fileArg   = req["file"]      | "today";
+        String   path      = _resolveTodayPath(fileArg);
+        JsonArray rows     = req["rows"].as<JsonArray>();
+        JsonArray srvIdArr = req["serverIds"].as<JsonArray>(); // parallel to rows
+
+        Serial.printf("[WM] attendance/update path=%s rows=%d\n", path.c_str(), (int)rows.size());
+
+        if (!SDDatabase::isReady()) {
+            _srv.send(200,"application/json","{\"success\":false,\"error\":\"SD not ready\"}");
+            return;
+        }
+
+        // Derive YYYY-MM-DD from file path for clock_time construction
+        String fileDateStr = "";
+        {
+            String fn = path.substring(path.lastIndexOf('/') + 1);
+            fn.replace(".csv","");
+            if (fn.length() == 10 && fn.indexOf('-') == 4) fileDateStr = fn;
+        }
+
+        // ── 1. Rebuild CSV on SD ──────────────────────────────────────────────
+        if (SD_MMC.exists(path)) SD_MMC.remove(path);
+        File f = SD_MMC.open(path, FILE_WRITE);
+        if (!f) {
+            _srv.send(200,"application/json","{\"success\":false,\"error\":\"Cannot open SD file\"}");
+            return;
+        }
+        f.println("timestamp,nfc_uid,employee_uid,employee_name,department,event_type,device_id");
+        int written = 0;
+        for (JsonArray row : rows) {
+            String line = "";
+            for (int i = 0; i < 7; i++) {
+                if (i > 0) line += ",";
+                String cell = row[i] | ""; cell.trim();
+                if (cell.indexOf(',') >= 0 || cell.indexOf('"') >= 0) {
+                    cell.replace("\"","\"\""); cell = "\"" + cell + "\"";
+                }
+                line += cell;
+            }
+            f.println(line); written++; yield();
+        }
+        f.flush(); f.close();
+        Serial.printf("[WM] SD OK: %d rows → %s\n", written, path.c_str());
+
+        // ── 2. Sync each row to server ────────────────────────────────────────
+        int    synced    = 0;
+        String serverErr = "";
+        bool   wifiUp    = (_cfg && _cfg->isConnected());
+
+        if (wifiUp && _serverURL.length() > 0) {
+            int rowIdx = 0;
+            for (JsonArray row : rows) {
+                String empUid = (String)(row[2] | ""); empUid.trim();
+                String rawTs  = (String)(row[0] | ""); rawTs.trim();
+                String evType = (String)(row[5] | ""); evType.trim();
+
+                if (empUid.length() == 0) { rowIdx++; continue; }
+
+                // Split timestamp into date + time
+                String dateStr = fileDateStr, timeStr = rawTs;
+                int sp = rawTs.indexOf(' ');
+                if (sp >= 0) { dateStr = rawTs.substring(0,sp); timeStr = rawTs.substring(sp+1); }
+                String clockTimeFull = dateStr + " " + timeStr;
+
+                // Server id passed from JS (0 = no existing record)
+                int serverId = (rowIdx < (int)srvIdArr.size()) ? (srvIdArr[rowIdx] | 0) : 0;
+
+                Serial.printf("[WM] row[%d] uid=%s type=%s time=%s srvId=%d\n",
+                              rowIdx, empUid.c_str(), evType.c_str(),
+                              clockTimeFull.c_str(), serverId);
+
+                DynamicJsonDocument pd(512);
+                pd["clock_type"]   = evType;
+                pd["clock_time"]   = clockTimeFull;
+                pd["date"]         = dateStr;
+                pd["employee_uid"] = empUid;
+                pd["is_synced"]    = 0;
+                String pdStr; serializeJson(pd, pdStr);
+
+                HTTPClient hc; hc.setTimeout(8000);
+                int code = 0;
+
+                if (serverId > 0) {
+                    // ── PUT /api/attendanceEdit/:id  (update existing) ────────
+                    hc.begin(_serverURL + "/api/attendanceEdit/" + String(serverId));
+                    hc.addHeader("Content-Type","application/json");
+                    hc.addHeader("X-Client-Type","ESP32");
+                    code = hc.PUT(pdStr);
+                    Serial.printf("[WM] PUT /attendanceEdit/%d → %d\n", serverId, code);
+                } else {
+                    // ── POST /api/attendanceEdit  (insert new) ────────────────
+                    hc.begin(_serverURL + "/api/attendanceEdit");
+                    hc.addHeader("Content-Type","application/json");
+                    hc.addHeader("X-Client-Type","ESP32");
+                    code = hc.POST(pdStr);
+                    Serial.printf("[WM] POST /attendanceEdit → %d\n", code);
+
+                    // ── Capture returned server ID → persist to SD map ────────
+                    // Prevents future edits from POSTing again (duplicate row bug).
+                    if ((code == 200 || code == 201) && fileDateStr.length() == 10) {
+                        String postBody = hc.getString();
+                        DynamicJsonDocument postResp(512);
+                        if (deserializeJson(postResp, postBody) == DeserializationError::Ok) {
+                            int newSrvId = postResp["data"]["id"] | postResp["id"] | 0;
+                            if (newSrvId > 0) {
+                                // Key uses the clock_time from the row (col 0), time portion only
+                                String rowTs = (String)(row[0] | ""); rowTs.trim();
+                                int sp2 = rowTs.indexOf(' ');
+                                String timeOnly = (sp2 >= 0) ? rowTs.substring(sp2 + 1) : rowTs;
+                                SDDatabase::saveServerIdMapping(fileDateStr, empUid,
+                                                                evType, timeOnly, newSrvId);
+                                Serial.printf("[WM] New server_id=%d saved to SD map\n", newSrvId);
+                            }
+                        }
+                    }
+                }
+
+                if (code == 200 || code == 201) synced++;
+                else if (serverErr.length() == 0)
+                    serverErr = "HTTP " + String(code) + " uid=" + empUid;
+                hc.end();
+                rowIdx++;
+                yield();
+            }
+
+            // ── 3. Update daily summary: fetch current → patch clock column → PUT ──
+            // For each unique employee on this date:
+            //   a) GET /api/attendanceEdit/summary?employee_uid=X&date=Y
+            //   b) Overwrite only the changed clock_type column(s) with the new time
+            //   c) PUT /api/attendanceEdit/summary/:id  → server recalculates hours + fires socket
+            if (synced > 0 && fileDateStr.length() == 10) {
+
+                // Build map: empUid → { clockType → newTime } from the edited rows
+                // (only include rows that were successfully synced above)
+                // HEAP-allocated to avoid ~10 KB stack overflow (316 bytes × 32 = 10,112 bytes).
+                // EmpPatch on the stack was triggering the "Stack canary watchpoint" crash.
+                struct ClockPatch { String clockType; String newTime; };
+                struct EmpPatch   { String uid; ClockPatch clocks[6]; int count; };
+                EmpPatch* empPatches = new EmpPatch[32];
+                if (!empPatches) {
+                    Serial.println("[WM] OOM: empPatches alloc failed");
+                    _srv.send(500,"application/json","{\"success\":false,\"error\":\"OOM\"}");
+                    return;
+                }
+                int epCount = 0;
+
+                int rowIdx2 = 0;
+                for (JsonArray row : rows) {
+                    String eu = (String)(row[2] | ""); eu.trim();
+                    String ct = (String)(row[5] | ""); ct.trim();
+                    String rawTs = (String)(row[0] | ""); rawTs.trim();
+                    // Extract time portion "HH:MM:SS"
+                    String timeOnly = rawTs;
+                    int sp2 = rawTs.indexOf(' ');
+                    if (sp2 >= 0) timeOnly = rawTs.substring(sp2 + 1);
+
+                    if (eu.length() == 0 || ct.length() == 0) { rowIdx2++; continue; }
+
+                    // Find or create patch entry for this employee
+                    int pi = -1;
+                    for (int k=0;k<epCount;k++) if(empPatches[k].uid==eu){pi=k;break;}
+                    if (pi < 0 && epCount < 32) { empPatches[epCount].uid=eu; empPatches[epCount].count=0; pi=epCount++; }
+                    if (pi >= 0 && empPatches[pi].count < 6) {
+                        empPatches[pi].clocks[empPatches[pi].count++] = {ct, timeOnly};
+                    }
+                    rowIdx2++;
+                }
+
+                // For each employee: fetch summary → patch → PUT
+                DynamicJsonDocument sumFetch(4096); // declared once outside loop to reduce heap churn
+                for (int pi=0; pi<epCount; pi++) {
+                    String empUid = empPatches[pi].uid;
+                    sumFetch.clear();
+
+                    // ── a) Fetch current daily summary ────────────────────────
+                    int summaryId = 0;
+                    bool fetched  = false;
+                    {
+                        HTTPClient hf; hf.setTimeout(6000);
+                        hf.begin(_serverURL + "/api/attendanceEdit/summary?employee_uid="
+                                 + empUid + "&date=" + fileDateStr);
+                        hf.addHeader("X-Client-Type","ESP32");
+                        int fc = hf.GET();
+                        Serial.printf("[WM] GET summary emp=%s date=%s → %d\n",
+                                      empUid.c_str(), fileDateStr.c_str(), fc);
+                        if (fc == 200) {
+                            String rb = hf.getString(); hf.end();
+                            bool ok = false;
+                            if (_attSvc) ok = _attSvc->decryptBody(rb, sumFetch);
+                            if (!ok)     ok = (deserializeJson(sumFetch, rb) == DeserializationError::Ok);
+                            if (ok) {
+                                // Summary may be at top-level or wrapped in "data"
+                                JsonObject sumObj;
+                                if (sumFetch["data"].is<JsonObject>())
+                                    sumObj = sumFetch["data"].as<JsonObject>();
+                                else if (sumFetch.as<JsonObject>().containsKey("id"))
+                                    sumObj = sumFetch.as<JsonObject>();
+                                if (!sumObj.isNull()) {
+                                    summaryId = sumObj["id"] | 0;
+                                    fetched   = (summaryId > 0);
+                                }
+                            }
+                        } else { hf.end(); }
+                    }
+
+                    if (!fetched) {
+                        Serial.printf("[WM] No summary found for uid=%s — skipping\n", empUid.c_str());
+                        continue;
+                    }
+
+                    // ── b) Build PATCH payload: only the changed clock columns ─
+                    // We include ALL 6 clock columns so the server can recalculate
+                    // regular_hours, overtime_hours, is_late from the full picture.
+                    // Unchanged columns are forwarded from the fetched summary.
+                    JsonObject existingSum;
+                    if (sumFetch["data"].is<JsonObject>())
+                        existingSum = sumFetch["data"].as<JsonObject>();
+                    else
+                        existingSum = sumFetch.as<JsonObject>();
+
+                    const char* clockCols[6] = {
+                        "morning_in","morning_out",
+                        "afternoon_in","afternoon_out",
+                        "evening_in","evening_out"
+                    };
+
+                    DynamicJsonDocument putSum(512);
+                    putSum["employee_uid"] = empUid;
+                    putSum["date"]         = fileDateStr;
+
+                    // Start from existing values
+                    for (int c=0;c<6;c++) {
+                        String existing = existingSum[clockCols[c]] | "";
+                        putSum[clockCols[c]] = existing;
+                    }
+
+                    // Apply patches from the edited rows
+                    for (int k=0; k<empPatches[pi].count; k++) {
+                        String ct  = empPatches[pi].clocks[k].clockType;
+                        String val = empPatches[pi].clocks[k].newTime;
+                        // Clock column value format: "HH:MM:SS" or "YYYY-MM-DD HH:MM:SS"
+                        // Server stores full datetime in summary columns
+                        String fullVal = (val.length() == 8 || val.length() == 5)
+                                         ? fileDateStr + " " + val
+                                         : val;
+                        for (int c=0;c<6;c++) {
+                            if (ct == String(clockCols[c])) {
+                                putSum[clockCols[c]] = fullVal;
+                                break;
+                            }
+                        }
+                    }
+
+                    String putSumStr; serializeJson(putSum, putSumStr);
+                    Serial.printf("[WM] PUT summary id=%d uid=%s\n", summaryId, empUid.c_str());
+                    Serial.println("[WM] Summary payload: " + putSumStr);
+
+                    // ── c) PUT /api/attendanceEdit/summary/:id ─────────────────
+                    HTTPClient hps; hps.setTimeout(8000);
+                    hps.begin(_serverURL + "/api/attendanceEdit/summary/" + String(summaryId));
+                    hps.addHeader("Content-Type","application/json");
+                    hps.addHeader("X-Client-Type","ESP32");
+                    int pc = hps.PUT(putSumStr);
+                    Serial.printf("[WM] PUT summary → %d\n", pc);
+                    hps.end();
+                    yield();
+                }
+                delete[] empPatches;  // free heap allocation
+                empPatches = nullptr;
+            }
+        } else {
+            serverErr = wifiUp ? "no server URL" : "offline";
+        }
+
+        DynamicJsonDocument resp(256);
+        resp["success"]       = true;
+        resp["rows_written"]  = written;
+        resp["server_synced"] = synced;
+        if (serverErr.length() > 0) resp["server_error"] = serverErr;
+        String out; serializeJson(resp, out);
+        Serial.println("[WM] Response: " + out);
+        _srv.sendHeader("Access-Control-Allow-Origin","*");
+        _srv.send(200,"application/json",out);
+    }
+
+    // ── ATTENDANCE DELETE ROW — remove one row from SD and notify server ──────
+    void _apiAttendanceDeleteRow() {
+        String body = _srv.arg("plain");
+        DynamicJsonDocument req(512);
+        if (deserializeJson(req, body) != DeserializationError::Ok) {
+            _srv.send(200,"application/json","{\"success\":false,\"error\":\"JSON parse error\"}");
+            return;
+        }
+
+        String fileArg  = req["file"]      | "today";
+        int    rowIndex = req["rowIndex"]   | -1;
+        String empUid   = req["empUid"]     | "";
+        String evType   = req["eventType"]  | "";
+        String rowTs    = req["timestamp"]  | "";  // "HH:MM:SS" or "YYYY-MM-DD HH:MM:SS"
+        int    serverId = req["serverId"]   | 0;   // passed from JS _serverIds[idx]
+
+        String path = _resolveTodayPath(fileArg);
+
+        // Derive date string for SD map lookup
+        String fileDateStr = "";
+        {
+            String fn = path.substring(path.lastIndexOf('/') + 1);
+            fn.replace(".csv","");
+            if (fn.length() == 10 && fn.indexOf('-') == 4) fileDateStr = fn;
+        }
+
+        if (!SDDatabase::isReady()) {
+            _srv.send(200,"application/json","{\"success\":false,\"error\":\"SD not ready\"}");
+            return;
+        }
+        if (!SD_MMC.exists(path)) {
+            _srv.send(200,"application/json","{\"success\":false,\"error\":\"File not found\"}");
+            return;
+        }
+
+        // ── Stream-copy: read source line-by-line → write temp file, skip target row
+        // NEVER buffer all lines in a String array — that overflows the stack.
+        String tmpPath = path + ".tmp";
+
+        File rf = SD_MMC.open(path, FILE_READ);
+        if (!rf) {
+            _srv.send(200,"application/json","{\"success\":false,\"error\":\"Read failed\"}");
+            return;
+        }
+        if (SD_MMC.exists(tmpPath)) SD_MMC.remove(tmpPath);
+        File wf = SD_MMC.open(tmpPath, FILE_WRITE);
+        if (!wf) {
+            rf.close();
+            _srv.send(200,"application/json","{\"success\":false,\"error\":\"Write failed\"}");
+            return;
+        }
+
+        int lineNum = 0;   // 0 = header; 1..N = data rows (1-based)
+        int dataRow = 0;   // 0-based data row counter (increments after header)
+        bool skipped = false;
+
+        while (rf.available()) {
+            String line = rf.readStringUntil('\n');
+            line.trim();
+            if (line.length() == 0) continue;
+
+            if (lineNum == 0) {
+                // Always keep header
+                wf.println(line);
+            } else {
+                // Data row: skip the target index
+                if (dataRow == rowIndex) {
+                    skipped = true;
+                } else {
+                    wf.println(line);
+                }
+                dataRow++;
+            }
+            lineNum++;
+            yield();
+        }
+        rf.close();
+        wf.flush();
+        wf.close();
+
+        // Swap: remove original, rename temp
+        SD_MMC.remove(path);
+        // SD_MMC has no rename — copy tmp → original then remove tmp
+        File src = SD_MMC.open(tmpPath, FILE_READ);
+        File dst = SD_MMC.open(path,    FILE_WRITE);
+        if (src && dst) {
+            uint8_t buf[256];
+            while (src.available()) {
+                int n = src.read(buf, sizeof(buf));
+                if (n > 0) dst.write(buf, n);
+                yield();
+            }
+            src.close(); dst.flush(); dst.close();
+            SD_MMC.remove(tmpPath);
+            Serial.printf("[WM] Deleted row %d from %s (skipped=%d)\n",
+                          rowIndex, path.c_str(), (int)skipped);
+        } else {
+            if (src) src.close();
+            if (dst) dst.close();
+            _srv.send(200,"application/json","{\"success\":false,\"error\":\"Rename failed\"}");
+            return;
+        }
+
+        // ── Notify server via DELETE /api/attendanceEdit/:id ─────────────────
+        // serverId is passed directly from JS (no range-query lookup needed)
+        bool serverOk = false;
+        if (serverId > 0 && _serverURL.length() > 0 && _cfg && _cfg->isConnected()) {
+            HTTPClient hd; hd.setTimeout(6000);
+            hd.begin(_serverURL + "/api/attendanceEdit/" + String(serverId));
+            hd.addHeader("X-Client-Type","ESP32");
+            int dc = hd.sendRequest("DELETE", "");
+            serverOk = (dc == 200 || dc == 204);
+            Serial.printf("[WM] DELETE /attendanceEdit/%d → %d\n", serverId, dc);
+            hd.end();
+        } else if (serverId == 0) {
+            Serial.println("[WM] Delete: no serverId provided, SD only");
+        }
+
+        // ── Remove entry from SD server-ID map so future loads don't keep it ──
+        if (fileDateStr.length() == 10 && empUid.length() > 0 && evType.length() > 0) {
+            // Extract time-only portion from the row timestamp
+            String timeOnly = rowTs;
+            int sp2 = rowTs.indexOf(' ');
+            if (sp2 >= 0) timeOnly = rowTs.substring(sp2 + 1);
+            SDDatabase::removeServerIdMapping(fileDateStr, empUid, evType, timeOnly);
+        }
+
+        DynamicJsonDocument resp(128);
+        resp["success"]   = true;
+        resp["server_ok"] = serverOk;
+        String out; serializeJson(resp, out);
+        _srv.sendHeader("Access-Control-Allow-Origin","*");
+        _srv.send(200,"application/json",out);
+    }
+
     // Returns all available attendance dates from SD + today's real label
     void _apiAttendanceDates() {
         DynamicJsonDocument doc(4096);
@@ -1146,9 +1884,63 @@ loadStatus();loadNets();
         String fileArg = _srv.hasArg("f") ? _srv.arg("f") : "today";
         String csv = (fileArg=="today") ? SDDatabase::readTodayCSV()
                                         : SDDatabase::readCSV(fileArg);
-        DynamicJsonDocument doc(8192);
-        JsonArray headers = doc.createNestedArray("headers");
-        JsonArray rows    = doc.createNestedArray("rows");
+
+        // ── SERVER FALLBACK: if SD has no records for today, fetch live ──────
+        // This handles the boot window where syncTodayAttendanceToSD() has not
+        // yet written anything to SD (page loaded before the sync completed).
+        bool pulledFromServer = false;
+        if (fileArg == "today" && csv.length() == 0
+            && _attSvc && _serverURL.length() > 0
+            && _cfg && _cfg->isConnected()) {
+            struct tm _fti = {}; getLocalTime(&_fti, 0);
+            char _todayDate[12] = "";
+            strftime(_todayDate, sizeof(_todayDate), "%Y-%m-%d", &_fti);
+            if (strlen(_todayDate) == 10) {
+                Serial.printf("[WM] SD empty — fetching live (%s)\n", _todayDate);
+                String _lurl = _serverURL + "/api/attendance/esp32-sync?date="
+                               + String(_todayDate)
+                               + "&limit=500&sort_by=clock_time&sort_order=ASC";
+                HTTPClient _lhc; _lhc.setTimeout(8000);
+                _lhc.begin(_lurl);
+                _lhc.addHeader("X-Client-Type", "ESP32");
+                int _lcode = _lhc.GET();
+                Serial.printf("[WM] Live fetch HTTP %d\n", _lcode);
+                if (_lcode == 200) {
+                    String _lbody = _lhc.getString(); _lhc.end();
+                    DynamicJsonDocument* _lDoc = psramFound()
+                        ? new DynamicJsonDocument(131072)
+                        : new DynamicJsonDocument(32768);
+                    bool _ldec = _attSvc->decryptBody(_lbody, *_lDoc);
+                    if (!_ldec) _ldec = (deserializeJson(*_lDoc, _lbody) == DeserializationError::Ok);
+                    if (_ldec) {
+                        JsonArray _larr;
+                        if ((*_lDoc)["data"].is<JsonArray>())
+                            _larr = (*_lDoc)["data"].as<JsonArray>();
+                        if (!_larr.isNull() && _larr.size() > 0) {
+                            csv = "timestamp,nfc_uid,employee_uid,employee_name,department,clock_type,device_id\n";
+                            for (JsonObject _rec : _larr) {
+                                String _ct = _rec["clock_time"] | "";
+                                int _sp = _ct.indexOf(' ');
+                                if (_sp >= 0) _ct = _ct.substring(_sp + 1);
+                                String _fn = String(_rec["first_name"] | "") + " " + String(_rec["last_name"] | "");
+                                _fn.trim();
+                                csv += _ct + ",," + String(_rec["employee_uid"] | "") + ","
+                                     + _fn + "," + String(_rec["department"] | "") + ","
+                                     + String(_rec["clock_type"] | "") + ",server\n";
+                            }
+                            pulledFromServer = true;
+                            Serial.printf("[WM] Live: %d records\n", (int)_larr.size());
+                        }
+                    }
+                    delete _lDoc;
+                } else { _lhc.end(); }
+            }
+        }
+
+        DynamicJsonDocument doc(12288);
+        JsonArray headers   = doc.createNestedArray("headers");
+        JsonArray rows      = doc.createNestedArray("rows");
+        JsonArray serverIds = doc.createNestedArray("serverIds"); // parallel to rows
 
         // Resolve human-readable date for this file
         // "today" → use NTP local time; named file → parse from first data row or filename
@@ -1178,6 +1970,7 @@ loadStatus();loadNets();
             if (strlen(dateStr) == 0) strlcpy(dateStr, fileArg.c_str(), sizeof(dateStr));
         }
         doc["date"] = dateStr;
+        doc["pulled_from_server"] = pulledFromServer;
 
         if (csv.length() > 0) {
             int start=0, lineNum=0;
@@ -1208,7 +2001,251 @@ loadStatus();loadNets();
                 if(nl<0)break; start=nl+1;
             }
         }
+
+        // ── Fetch server record IDs for this date so the editor can PUT (not POST) ──
+        // ── Build serverIds: SD map first, network lookup as fallback ─────────
+        // Key format: "empUid|clockType|HH:MM:SS"  — includes time so duplicate
+        // clock_type records (e.g. two morning_in rows) get different IDs.
+        bool wifiUp = (_cfg && _cfg->isConnected());
+
+        // Derive YYYY-MM-DD from the resolved file path
+        String resolvedPath = _resolveTodayPath(fileArg == "today" ? "__today__" : fileArg);
+        String fileDateStr  = "";
+        {
+            String fn = resolvedPath.substring(resolvedPath.lastIndexOf('/') + 1);
+            fn.replace(".csv","");
+            if (fn.length() == 10 && fn.indexOf('-') == 4) fileDateStr = fn;
+        }
+
+        // ── Step A: Load SD server-ID map (written by NFC scan on first POST) ──
+        // This handles records that were synced during the scan — most reliable.
+        DynamicJsonDocument sdMap(4096);
+        if (fileDateStr.length() == 10) {
+            String mapJson = SDDatabase::loadServerIdMapJson(fileDateStr);
+            if (mapJson.length() > 2) { // "{}" = 2
+                deserializeJson(sdMap, mapJson);
+                Serial.printf("[WM] SD server_id map: %d entries\n", sdMap.size());
+            }
+        }
+
+        // ── Step B: For rows missing from SD map, fetch from server ──────────
+        // Build server-side lookup keyed on "empUid|clockType|HH:MM:SS" so
+        // duplicate clock_type rows resolve to their correct individual IDs.
+        const int MAP_SZ = 128;
+        // ⚠ Heap-allocate — 128 Strings on the stack overflows with everything else in this function
+        String* sKeys = new String[MAP_SZ];
+        int*    sIds  = new int[MAP_SZ];
+        memset(sIds, 0, sizeof(int) * MAP_SZ);
+        int  sCount = 0;
+        bool serverFetchOk = false;  // true only if we got a valid HTTP 200 + parsed response
+
+        if (wifiUp && _serverURL.length() > 0 && rows.size() > 0 && fileDateStr.length() == 10) {
+            HTTPClient hc; hc.setTimeout(6000);
+            hc.begin(_serverURL + "/api/attendanceEdit/range?start_date=" +
+                     fileDateStr + "&end_date=" + fileDateStr);
+            hc.addHeader("X-Client-Type","ESP32");
+            int code = hc.GET();
+            Serial.printf("[WM] serverIds fetch code=%d\n", code);
+
+            if (code == 200) {
+                String rbody = hc.getString();
+                hc.end();
+
+                DynamicJsonDocument srvDoc(16384);
+                bool ok = false;
+                if (_attSvc) ok = _attSvc->decryptBody(rbody, srvDoc);
+                if (!ok) ok = (deserializeJson(srvDoc, rbody) == DeserializationError::Ok);
+
+                if (ok) {
+                    serverFetchOk = true;
+                    JsonArray srvArr;
+                    if (srvDoc["data"].is<JsonArray>())
+                        srvArr = srvDoc["data"].as<JsonArray>();
+                    else if (srvDoc["data"]["data"].is<JsonArray>())
+                        srvArr = srvDoc["data"]["data"].as<JsonArray>();
+
+                    // Key includes time → no more collision on duplicate clock_types
+                    for (JsonObject rec : srvArr) {
+                        if (sCount >= MAP_SZ) break;
+                        String eu = rec["employee_uid"] | "";
+                        String ct = rec["clock_type"]   | "";
+                        int    id = rec["id"]           | 0;
+                        // clock_time may be "YYYY-MM-DD HH:MM:SS" — extract time only
+                        String ct_time = rec["clock_time"] | "";
+                        int sp = ct_time.indexOf(' ');
+                        if (sp >= 0) ct_time = ct_time.substring(sp + 1);
+                        if (eu.length() == 0 || id == 0) continue;
+                        // Use time-keyed key; fallback to no-time key for old records
+                        String k = eu + "|" + ct + "|" + ct_time;
+                        sKeys[sCount] = k; sIds[sCount] = id; sCount++;
+                    }
+                    Serial.printf("[WM] Server map: %d records (time-keyed)\n", sCount);
+                } else { hc.end(); }
+            } else { hc.end(); }
+        }
+
+        // ── Step B2: Reconcile SD CSV — remove rows deleted on server ─────────
+        // If we got a valid server response, any SD row whose server_id is in our
+        // SD map but NOT in the server response was deleted on the server.
+        // Rule: only remove rows that WERE synced (have entry in SD map).
+        //       Offline-only rows (no map entry) are left untouched.
+        if (serverFetchOk && fileDateStr.length() == 10) {
+            // Build set of active server IDs for fast membership check
+            bool anyStale = false;
+
+            // Load SD map
+            DynamicJsonDocument reconcileMap(4096);
+            String mapJson2 = SDDatabase::loadServerIdMapJson(fileDateStr);
+            bool mapLoaded = (mapJson2.length() > 2) &&
+                             (deserializeJson(reconcileMap, mapJson2) == DeserializationError::Ok);
+
+            if (mapLoaded && reconcileMap.size() > 0) {
+                // Find stale keys: in SD map but server_id not in active sIds[]
+                const int MAX_STALE = 32;
+                String* staleKeys = new String[MAX_STALE];
+                int staleCount = 0;
+
+                for (JsonPair kv : reconcileMap.as<JsonObject>()) {
+                    int mapSrvId = kv.value().as<int>();
+                    if (mapSrvId <= 0) continue;
+                    bool found = false;
+                    for (int j = 0; j < sCount; j++) {
+                        if (sIds[j] == mapSrvId) { found = true; break; }
+                    }
+                    if (!found && staleCount < MAX_STALE) {
+                        staleKeys[staleCount++] = String(kv.key().c_str());
+                        anyStale = true;
+                        Serial.printf("[WM] Stale row detected (server_id=%d deleted): %s\n",
+                                      mapSrvId, kv.key().c_str());
+                    }
+                }
+
+                if (anyStale) {
+                    // Stream-rewrite CSV, skipping rows whose key matches a stale entry
+                    String tmpPath2  = resolvedPath + ".tmp";
+                    String csvPath2  = resolvedPath;
+
+                    File rf2 = SD_MMC.open(csvPath2, FILE_READ);
+                    File wf2 = SD_MMC.open(tmpPath2, FILE_WRITE);
+
+                    if (rf2 && wf2) {
+                        int lineNum2 = 0;
+                        int removedCount = 0;
+                        while (rf2.available()) {
+                            String line2 = rf2.readStringUntil('\n');
+                            line2.trim();
+                            if (line2.length() == 0) continue;
+
+                            if (lineNum2 == 0) {
+                                wf2.println(line2);  // always keep header
+                            } else {
+                                // Parse empUid (col 2), clockType (col 5), timestamp (col 0)
+                                String cols[7]; int ci = 0, s2 = 0;
+                                while (s2 <= (int)line2.length() && ci < 7) {
+                                    int cm2 = line2.indexOf(',', s2);
+                                    cols[ci++] = (cm2 < 0) ? line2.substring(s2) : line2.substring(s2, cm2);
+                                    if (cm2 < 0) break; s2 = cm2 + 1;
+                                }
+                                String rowEu = cols[2]; rowEu.trim();
+                                String rowCt = cols[5]; rowCt.trim();
+                                String rowTs2 = cols[0]; rowTs2.trim();
+                                // Extract time portion only
+                                int sp3 = rowTs2.indexOf(' ');
+                                String rowTime = (sp3 >= 0) ? rowTs2.substring(sp3 + 1) : rowTs2;
+                                String rowKey = rowEu + "|" + rowCt + "|" + rowTime;
+
+                                bool isStale = false;
+                                for (int k2 = 0; k2 < staleCount; k2++) {
+                                    if (staleKeys[k2] == rowKey) { isStale = true; break; }
+                                }
+                                if (isStale) {
+                                    removedCount++;
+                                    Serial.printf("[WM] Removing server-deleted row from SD: %s\n",
+                                                  rowKey.c_str());
+                                } else {
+                                    wf2.println(line2);
+                                }
+                            }
+                            lineNum2++;
+                            yield();
+                        }
+                        rf2.close(); wf2.flush(); wf2.close();
+
+                        // Copy tmp → original (SD_MMC has no rename)
+                        SD_MMC.remove(csvPath2);
+                        File src2 = SD_MMC.open(tmpPath2, FILE_READ);
+                        File dst2 = SD_MMC.open(csvPath2, FILE_WRITE);
+                        if (src2 && dst2) {
+                            uint8_t buf2[256];
+                            while (src2.available()) {
+                                int n = src2.read(buf2, sizeof(buf2));
+                                if (n > 0) dst2.write(buf2, n);
+                                yield();
+                            }
+                            src2.close(); dst2.flush(); dst2.close();
+                            SD_MMC.remove(tmpPath2);
+                            Serial.printf("[WM] SD reconcile: removed %d server-deleted rows\n",
+                                          removedCount);
+                        } else {
+                            if (src2) src2.close();
+                            if (dst2) dst2.close();
+                        }
+
+                        // Remove stale keys from SD map
+                        for (int k2 = 0; k2 < staleCount; k2++) {
+                            reconcileMap.remove(staleKeys[k2].c_str());
+                        }
+                        String mapPath = "/attendance/server_ids_" + fileDateStr + ".json";
+                        File mf = SD_MMC.open(mapPath, FILE_WRITE);
+                        if (mf) { serializeJson(reconcileMap, mf); mf.close(); }
+
+                        // Tell JS how many rows were purged — it will re-fetch automatically
+                        if (removedCount > 0) {
+                            doc["rows_removed"] = removedCount;
+                            Serial.printf("[WM] B2: %d stale rows removed, JS will reload\n",
+                                          removedCount);
+                        }
+                    } else {
+                        if (rf2) rf2.close();
+                        if (wf2) wf2.close();
+                    }
+                }
+                delete[] staleKeys;
+            }
+        }
+
+        // ── Step C: Match each CSV row to its server ID ───────────────────
+        for (JsonArray row : rows) {
+            String eu = (String)(row[2] | ""); eu.trim();
+            String ct = (String)(row[5] | ""); ct.trim();
+            // Extract time from timestamp (col 0): "YYYY-MM-DD HH:MM:SS" or "HH:MM:SS"
+            String ts = (String)(row[0] | ""); ts.trim();
+            int sp = ts.indexOf(' ');
+            String timeOnly = (sp >= 0) ? ts.substring(sp + 1) : ts;
+
+            int sid = 0;
+
+            // 1. SD map (most reliable — written at NFC scan time)
+            String sdKey = eu + "|" + ct + "|" + timeOnly;
+            if (sdMap.containsKey(sdKey)) {
+                sid = sdMap[sdKey] | 0;
+            }
+
+            // 2. Network map fallback (for records synced before this fix)
+            if (sid == 0) {
+                String netKey = eu + "|" + ct + "|" + timeOnly;
+                for (int j = 0; j < sCount; j++) {
+                    if (sKeys[j] == netKey) { sid = sIds[j]; break; }
+                }
+            }
+
+            serverIds.add(sid);
+        }
+
+
         String out; serializeJson(doc,out);
+        delete[] sKeys;
+        delete[] sIds;
         _srv.sendHeader("Access-Control-Allow-Origin","*");
         _srv.send(200,"application/json",out);
     }

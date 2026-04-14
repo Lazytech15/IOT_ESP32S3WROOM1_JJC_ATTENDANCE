@@ -415,30 +415,68 @@ public:
     // ══════════════════════════════════════════════════════════════════════════
     // recordAttendance
     // ══════════════════════════════════════════════════════════════════════════
+    // Records a single attendance tap to the server.
+    // clockType must be the exact column name the server expects:
+    //   morning_in | morning_out | afternoon_in | afternoon_out |
+    //   evening_in | evening_out
+    // clockTimeStr: "HH:MM:SS"   dateStr: "YYYY-MM-DD"
     bool recordAttendance(const String& employeeUid,
                           const String& nfcUid,
                           const String& deviceId,
-                          const String& type = "check-in") {
-        Serial.println("\n[HTTP] 📝 Recording attendance...");
+                          const String& clockType,
+                          const String& clockTimeStr = "",
+                          const String& dateStr      = "") {
+        Serial.println("\n[HTTP] 📝 Recording attendance: " + clockType);
         Serial.flush();
 
-        DynamicJsonDocument doc(256);
+        // Build full datetime string: "YYYY-MM-DD HH:MM:SS"
+        String clockTimeFull = (dateStr.length() > 0 && clockTimeStr.length() > 0)
+                               ? (dateStr + " " + clockTimeStr)
+                               : clockTimeStr;
+
+        DynamicJsonDocument doc(512);
         doc["employee_uid"] = employeeUid;
         doc["nfc_uid"]      = nfcUid;
         doc["nfc_access"]   = nfcUid;
         doc["device_id"]    = deviceId;
-        doc["type"]         = type;
+        // ── Fields the server attendance.php createAttendanceRecord() reads ──
+        doc["clock_type"]   = clockType;          // exact column name
+        doc["clock_time"]   = clockTimeFull;      // full datetime for DB
+        doc["date"]         = dateStr.length() > 0 ? dateStr : clockTimeStr.substring(0,10);
+        doc["is_synced"]    = 1;
         doc["timestamp"]    = millis();
 
         String payload;
         serializeJson(doc, payload);
 
+        Serial.println("[HTTP] Payload: " + payload);
+        Serial.flush();
+
         DynamicJsonDocument respDoc(1024);
-        bool ok = postAndDecrypt(serverURL + "/api/attendance", payload, respDoc);
+        bool ok = postAndDecrypt(serverURL + "/api/attendance/record", payload, respDoc);
         if (ok && respDoc.containsKey("success"))
             ok = respDoc["success"].as<bool>();
 
-        Serial.println("[HTTP] Attendance " + String(ok ? "recorded OK ✅" : "FAILED ❌"));
+        Serial.println("[HTTP] Attendance " + String(ok ? "recorded OK" : "FAILED"));
+        if (!ok && respDoc.containsKey("message"))
+            Serial.println("[HTTP] Error: " + String(respDoc["message"] | ""));
+
+        // Capture server record ID and persist to SD map.
+        // Future edits use PUT /{id} instead of POST -> no duplicate rows.
+        if (ok) {
+            int serverId = 0;
+            if (respDoc["data"]["id"].is<int>())      serverId = respDoc["data"]["id"] | 0;
+            else if (respDoc["id"].is<int>())          serverId = respDoc["id"] | 0;
+
+            if (serverId > 0 && dateStr.length() == 10) {
+                SDDatabase::saveServerIdMapping(dateStr, employeeUid,
+                                                clockType, clockTimeStr, serverId);
+                Serial.printf("[HTTP] server_id=%d saved to SD map\n", serverId);
+            } else {
+                Serial.printf("[HTTP] No server_id in response (id=%d)\n", serverId);
+            }
+        }
+
         Serial.flush();
         return ok;
     }
