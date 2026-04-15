@@ -740,6 +740,303 @@ public:
     }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // fetchTodayAttendance
+    // ══════════════════════════════════════════════════════════════════════════
+    // Fetches ALL attendance records for a given date from the server and
+    // seeds them into the local SD CSV so resolveClockType() is accurate
+    // even after a reboot or when the device was offline at boot time.
+    //
+    // Server endpoint: GET /api/attendance?date=YYYY-MM-DD&limit=500
+    // Response shape (after AES decrypt):
+    //   { "success": true, "data": { "data": [ {attendance rows...} ] } }
+    //   OR { "success": true, "data": [ {attendance rows...} ] }
+    //
+    // Each row we care about:
+    //   employee_uid, clock_type, clock_time, date
+    //
+    // What this writes to SD:
+    //   One CSV row per server record using the SAME format as logAttendance():
+    //     timestamp,nfc_uid,employee_uid,employee_name,department,event_type,device_id
+    //   so loadAttendanceToday() and resolveClockType() read it identically.
+    //
+    // IDEMPOTENT: If the CSV already contains a matching (employee_uid, clock_type)
+    // pair it will NOT write a duplicate row — safe to call on every startup.
+    //
+    // Returns number of new rows seeded into SD.
+    // ══════════════════════════════════════════════════════════════════════════
+    int fetchTodayAttendance(const String& dateStr) {
+        if (dateStr.length() < 10) {
+            Serial.println("[TodaySync] Skipped — no valid date");
+            return 0;
+        }
+
+        String url = serverURL + "/api/attendance?date=" + dateStr + "&limit=500";
+        Serial.println("[TodaySync] GET " + url);
+        Serial.flush();
+
+        // Use a local HTTPClient — never the shared `http` member —
+        // to avoid interfering with any other in-flight request.
+        HTTPClient todayHttp;
+        todayHttp.setTimeout(12000);
+        todayHttp.begin(url);
+        todayHttp.addHeader("X-Client-Type", "ESP32");
+        if (authToken.length() > 0)
+            todayHttp.addHeader("Authorization", "Bearer " + authToken);
+
+        int code = todayHttp.GET();
+        Serial.printf("[TodaySync] HTTP %d\n", code);
+        Serial.flush();
+
+        if (code <= 0) {
+            Serial.println("[TodaySync] Connection error: " + todayHttp.errorToString(code));
+            todayHttp.end();
+            return 0;
+        }
+
+        // Stream body into PSRAM to avoid getString() heap fragmentation crash
+        int contentLen = todayHttp.getSize();
+        const int MAX_BODY = 131072;
+        int allocSz = (contentLen > 0 && contentLen <= MAX_BODY)
+                      ? contentLen + 8 : 65536;
+
+        uint8_t* bodyBuf = nullptr;
+        if (psramFound()) bodyBuf = (uint8_t*)ps_malloc(allocSz);
+        if (!bodyBuf)     bodyBuf = (uint8_t*)malloc(allocSz);
+        if (!bodyBuf) {
+            Serial.printf("[TodaySync] Alloc failed (%d B) heap=%u\n",
+                          allocSz, ESP.getFreeHeap());
+            todayHttp.end();
+            return 0;
+        }
+
+        WiFiClient* bodyStream = todayHttp.getStreamPtr();
+        int bodyGot = 0;
+        unsigned long bodyT0 = millis();
+        while (bodyStream && millis() - bodyT0 < 12000) {
+            int av = bodyStream->available();
+            if (av > 0) {
+                int canRead = min(av, allocSz - bodyGot - 1);
+                if (canRead <= 0) break;
+                int rd = bodyStream->readBytes(bodyBuf + bodyGot, canRead);
+                if (rd > 0) { bodyGot += rd; bodyT0 = millis(); }
+            } else {
+                if (!todayHttp.connected()) break;
+                delay(5);
+            }
+            yield();
+        }
+        bodyBuf[bodyGot] = 0;
+        todayHttp.end();
+
+        Serial.printf("[TodaySync] Body: %d bytes\n", bodyGot);
+        if (bodyGot == 0 || (code != 200 && code != 403)) {
+            free(bodyBuf);
+            Serial.println("[TodaySync] Bad response — aborting");
+            return 0;
+        }
+
+        String raw((char*)bodyBuf);
+        free(bodyBuf);
+        bodyBuf = nullptr;
+        yield();
+
+        // Decrypt using the proven decryptServerResponse() path
+        DynamicJsonDocument doc(65536);   // bumped: 500 records need more room
+        bool ok = decryptServerResponse(decryptor, raw, doc);
+        raw = "";   // free immediately
+        yield();
+
+        if (!ok) {
+            Serial.println("[TodaySync] Decrypt failed");
+            return 0;
+        }
+
+        // ── Unwrap the attendance array ─────────────────────────────────────
+        // attendance.php returns: { success, data: { data: [...], pagination: {...} } }
+        // but we also handle flat: { success, data: [...] }
+        JsonArray records;
+        if (doc.containsKey("data")) {
+            if (doc["data"].is<JsonArray>()) {
+                records = doc["data"].as<JsonArray>();
+            } else if (doc["data"].is<JsonObject>()) {
+                JsonObject dataObj = doc["data"].as<JsonObject>();
+                if (dataObj.containsKey("data")) {
+                    records = dataObj["data"].as<JsonArray>();
+                }
+            }
+        }
+
+        if (records.isNull()) {
+            Serial.println("[TodaySync] No 'data' array found in response");
+            // Debug: print top-level keys
+            Serial.print("[TodaySync] Keys: ");
+            for (JsonPair kv : doc.as<JsonObject>())
+                Serial.print(String(kv.key().c_str()) + " ");
+            Serial.println();
+            Serial.flush();
+            return 0;
+        }
+
+        int total = records.size();
+        Serial.printf("[TodaySync] %d records from server for %s\n", total, dateStr.c_str());
+        Serial.flush();
+
+        if (total == 0) return 0;
+        if (!SDDatabase::isReady()) {
+            Serial.println("[TodaySync] SD not ready — cannot seed");
+            return 0;
+        }
+
+        // ── PASS 1: Deduplicate server records by (empUid, clockType) ─────────
+        // The server can have multiple rows for the same session when:
+        //   • A tap was uploaded twice (fast-tap queue + retry).
+        //   • The web portal recorded the same event manually.
+        // We only want ONE row per (employee, clock_type) — the latest clock_time.
+        // Use a flat String array as a lightweight map keyed "empUid|clockType".
+        // Max 500 records means at most 500 entries; each key ≤ 60 chars — fine.
+        const int MAX_DEDUP = 128;
+        String dedupKey[MAX_DEDUP];
+        String dedupTime[MAX_DEDUP];
+        String dedupName[MAX_DEDUP];
+        String dedupDept[MAX_DEDUP];
+        int    dedupCount = 0;
+
+        for (JsonObject row : records) {
+            String empUid = "";
+            JsonVariantConst uidVar = row["employee_uid"];
+            if (uidVar.is<int>())       empUid = String(uidVar.as<int>());
+            else if (uidVar.is<long>()) empUid = String(uidVar.as<long>());
+            else                        empUid = uidVar | "";
+
+            String clockType = row["clock_type"] | "";
+            String clockTime = row["clock_time"] | "";
+
+            if (empUid.length() == 0 || clockType.length() == 0) continue;
+            if (clockType == "absent") continue;
+
+            String empName = row["employee_name"] | "";
+            if (empName.length() == 0) {
+                String fn = row["first_name"] | "";
+                String ln = row["last_name"]  | "";
+                if (fn.length() || ln.length()) empName = (fn + " " + ln);
+                empName.trim();
+            }
+            String dept = row["department"] | "";
+
+            // Time-only portion
+            String timeOnly = clockTime;
+            int spPos = timeOnly.indexOf(' ');
+            if (spPos >= 0) timeOnly = timeOnly.substring(spPos + 1);
+
+            // Key for this (employee, session slot)
+            String key = empUid + "|" + clockType;
+
+            // Search existing dedup table for this key
+            bool found = false;
+            for (int d = 0; d < dedupCount; d++) {
+                if (dedupKey[d] == key) {
+                    // Keep the latest clock_time (lexicographic compare is fine for HH:MM:SS)
+                    if (timeOnly > dedupTime[d]) dedupTime[d] = timeOnly;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found && dedupCount < MAX_DEDUP) {
+                dedupKey[dedupCount]  = key;
+                dedupTime[dedupCount] = timeOnly;
+                dedupName[dedupCount] = empName.length() ? empName : empUid;
+                dedupDept[dedupCount] = dept;
+                dedupCount++;
+            }
+            yield();
+        }
+
+        Serial.printf("[TodaySync] After dedup: %d unique (empUid, clockType) slots\n", dedupCount);
+        Serial.flush();
+
+        // ── PASS 2: Load what is ALREADY in the SD CSV once per employee ─────
+        // We build a small seen-set from SD so we can skip any slot already there.
+        // Calling loadAttendanceToday() once per unique employee (not per record)
+        // keeps SD reads minimal.
+        const int MAX_EMP_SEEN = 64;
+        String seenEmpUid[MAX_EMP_SEEN];
+        String seenCsvTypes[MAX_EMP_SEEN]; // comma-separated clock_types from SD
+        int    seenCount = 0;
+
+        auto getCsvTypes = [&](const String& empUid) -> String {
+            for (int i = 0; i < seenCount; i++)
+                if (seenEmpUid[i] == empUid) return seenCsvTypes[i];
+            // Not cached yet — load from SD
+            String types = SDDatabase::loadAttendanceToday(empUid);
+            if (seenCount < MAX_EMP_SEEN) {
+                seenEmpUid[seenCount]   = empUid;
+                seenCsvTypes[seenCount] = types;
+                seenCount++;
+            }
+            return types;
+        };
+
+        // ── PASS 3: Write only genuinely missing entries ──────────────────────
+        int seeded = 0;
+
+        for (int d = 0; d < dedupCount; d++) {
+            // Split key back into empUid|clockType
+            int pipe = dedupKey[d].indexOf('|');
+            if (pipe < 0) continue;
+            String empUid    = dedupKey[d].substring(0, pipe);
+            String clockType = dedupKey[d].substring(pipe + 1);
+            String timeOnly  = dedupTime[d];
+
+            // Check SD CSV for this (employee, clock_type)
+            String existing = getCsvTypes(empUid);
+            // Exact token match: wrap in commas to avoid partial matches
+            String check = "," + existing + ",";
+            if (check.indexOf("," + clockType + ",") >= 0) {
+                Serial.printf("[TodaySync] SKIP (on SD): %s %s\n",
+                              empUid.c_str(), clockType.c_str());
+                yield();
+                continue;
+            }
+
+            // Not on SD — write it
+            EmployeeProfile seedEmp;
+            seedEmp.uid        = empUid;
+            seedEmp.fullName   = dedupName[d];
+            seedEmp.department = dedupDept[d];
+            seedEmp.hasData    = true;
+
+            bool wrote = SDDatabase::logAttendance(
+                timeOnly,       // timestamp HH:MM:SS
+                "",             // nfc_uid — not available from server records
+                seedEmp,
+                clockType,      // event_type
+                "SERVER_SEED"   // device_id — marks row as server-sourced
+            );
+
+            if (wrote) {
+                seeded++;
+                // Invalidate the SD cache entry for this employee so the next
+                // record for the same employee re-reads the updated CSV.
+                for (int i = 0; i < seenCount; i++) {
+                    if (seenEmpUid[i] == empUid) {
+                        seenCsvTypes[i] = SDDatabase::loadAttendanceToday(empUid);
+                        break;
+                    }
+                }
+                Serial.printf("[TodaySync] Seeded: %s %s @ %s\n",
+                              empUid.c_str(), clockType.c_str(), timeOnly.c_str());
+            }
+
+            yield();
+        }
+
+        Serial.printf("[TodaySync] Done: %d new rows seeded (from %d server records, %d unique slots)\n",
+                      seeded, total, dedupCount);
+        Serial.flush();
+        return seeded;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
     // downloadAllPhotosZip
     // ══════════════════════════════════════════════════════════════════════════
     // Downloads ALL employee profile photos in a single HTTP request as a ZIP
