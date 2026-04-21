@@ -72,6 +72,12 @@
 #define SOCKET_POLL_MS          8000   // real-time event polling interval
 #define PROFILE_DISPLAY_MS      2000   // profile card display time
 
+// RESEED_INTERVAL_MS: How often the ESP32 re-fetches today's attendance from
+// the server to catch any records entered via the web portal or another device.
+// 5 minutes is a good balance — frequent enough to stay current, rare enough
+// not to hammer the server. Reduce to 60000 (1 min) for near-real-time accuracy.
+#define RESEED_INTERVAL_MS    300000
+
 // ─── NFC scan-gate constants ─────────────────────────────────────────────────
 #define MIN_CARD_ID_LEN          8     // reject partial / noise reads
 #define SCAN_COOLDOWN_MS       3500   // same-card lockout after accepted scan
@@ -343,6 +349,8 @@ static void pollSocketEvents() {
     Serial.printf("[Socket] %d event(s)\n", (int)events.size());
 
     bool statsNeedRefresh = false;
+    bool needReSeed       = false;   // set true when a batch sync arrives from
+                                     // another device so CSV is refreshed
 
     for (JsonObject evt : events) {
         const char* evtName = evt["event"] | "";
@@ -354,6 +362,14 @@ static void pollSocketEvents() {
             strcmp(evtName, "attendance_synced")  == 0) {
 
             statsNeedRefresh = true;
+            needReSeed = true;
+
+            // A batch sync likely means another device (web portal / NFC reader)
+            // just uploaded multiple records — re-seed SD so our clock type
+            // resolution stays accurate.
+            if (strcmp(evtName, "attendance_synced") == 0) {
+                needReSeed = true;
+            }
 
             const char* empName = data["employee_name"] | data["full_name"] | "";
             const char* cType   = data["clock_type"]    | "";
@@ -377,9 +393,31 @@ static void pollSocketEvents() {
         }
     }
 
+    // Re-seed CSV from server when a batch sync arrived from another device.
+    // This keeps resolveClockType() accurate without waiting for the next boot.
+    if (needReSeed && currentState == STATE_DASHBOARD &&
+        SDDatabase::isReady() && dateStr().length() >= 10) {
+        Serial.println("[Socket] Batch sync detected — re-seeding SD from server");
+        int reseeded = attService.fetchTodayAttendanceEsp32(dateStr());
+        int rawSeeded = attService.fetchTodayAttendance(dateStr()); // safety net
+        if (reseeded < 0) reseeded = 0;
+        if (rawSeeded > 0) reseeded += rawSeeded;
+        if (reseeded > 0) {
+            Serial.printf("[Socket] Re-seed wrote %d new CSV row(s)\n", reseeded);
+            statsNeedRefresh = true;
+        }
+    }
+
     if (statsNeedRefresh && currentState == STATE_DASHBOARD) {
-        updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
-                              max(0, SDDatabase::countTodayCheckOuts()));
+        int ins  = max(0, SDDatabase::countTodayCheckIns());
+        int outs = max(0, SDDatabase::countTodayCheckOuts());
+        updateAttendanceStats(ins, outs);
+        uint64_t freeMB = SDDatabase::freeBytes() / 1048576;
+        String statsJson = "{\"ins\":" + String(ins)
+                         + ",\"outs\":" + String(outs)
+                         + ",\"free_mb\":" + String((int)freeMB)
+                         + ",\"wifi\":true}";
+        wifiManager.broadcastEvent("stats", statsJson);
     }
 }
 
@@ -425,17 +463,21 @@ static String downloadAndCachePhoto(const EmployeeProfile& emp) {
 // ════════════════════════════════════════════════════════════════════════════
 // seedTodayAttendanceFromServer
 //
-// Pulls today's attendance records from the server and writes any missing
-// entries into the local SD CSV so resolveClockType() is correct even when:
-//   • The device just booted and the SD CSV is empty for today.
-//   • An employee clocked in on a DIFFERENT device (web portal, another reader).
-//   • The device was offline and missed taps that were recorded elsewhere.
+// Pulls today's attendance from the server and writes missing entries into
+// the local SD CSV so resolveClockType() is correct after reboots or when
+// employees clocked in on another device / the web portal.
 //
-// Only called once per boot, inside triggerInitialSync(), AFTER NTP sync so
-// dateStr() returns a valid "YYYY-MM-DD" string.
+// STRATEGY (v2 — ESP32-sync first):
+//   1. Try GET /api/attendance/esp32-sync?date=…  (daily_attendance_summary)
+//      • One HTTP call, all session slots per employee, saves a JSON snapshot.
+//      • Returns seeded > 0 or 0 (up-to-date) → done.
+//      • Returns -1 on network / decrypt error → fall through to raw endpoint.
+//   2. Fall back to GET /api/attendance?date=… (raw per-row endpoint).
+//      Same behaviour as before v2 — idempotent row-by-row seed.
+//   3. Refresh dashboard stats unconditionally so the display reflects the
+//      freshly seeded data.
 //
-// The function is intentionally lightweight — it only writes rows that are
-// genuinely absent from SD (idempotent), so calling it again is harmless.
+// Only called once per session inside triggerInitialSync(), AFTER NTP sync.
 // ════════════════════════════════════════════════════════════════════════════
 static void seedTodayAttendanceFromServer() {
     if (!wifiConfig.isConnected()) return;
@@ -447,19 +489,57 @@ static void seedTodayAttendanceFromServer() {
         return;
     }
 
-    Serial.println("[Seed] Fetching today's attendance from server: " + today);
+    Serial.println("[Seed] === Seeding today's attendance: " + today + " ===");
     Serial.flush();
 
-    int seeded = attService.fetchTodayAttendance(today);
+    int seeded = 0;
 
-    if (seeded > 0) {
-        Serial.printf("[Seed] %d server record(s) seeded to SD — clock types are now accurate\n", seeded);
-        // Update the dashboard stats to reflect the freshly seeded data
-        updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
-                              max(0, SDDatabase::countTodayCheckOuts()));
+    // ── PASS 1: Raw endpoint + SD profile enrichment (PRIMARY) ───────────
+    //
+    // WHY this is now PRIMARY:
+    //   The esp32-sync endpoint reads daily_attendance_summary, a server-side
+    //   aggregation table populated asynchronously. When the aggregation job
+    //   hasn't run, EVERY row has uid="", name="", all times null → 0 seeded.
+    //
+    //   seedCsvFromRawAttendance reads the LIVE attendance table directly
+    //   (always fresh), then enriches each row with the full employee profile
+    //   from the SD cache (/employees/<uid>.json) so name + dept are canonical.
+    //   This is the function that actually fills the CSV reliably.
+    Serial.println("[Seed] PASS 1: Raw endpoint + SD profile enrichment...");
+    Serial.flush();
+    int rawResult = attService.seedCsvFromRawAttendance(today);
+    if (rawResult > 0) {
+        seeded += rawResult;
+        Serial.printf("[Seed] PASS 1: %d new CSV row(s) seeded\n", rawResult);
+    } else if (rawResult == 0) {
+        Serial.println("[Seed] PASS 1: 0 new rows (already up-to-date or no data yet)");
     } else {
-        Serial.println("[Seed] SD already up-to-date with server (0 new rows)");
+        Serial.println("[Seed] PASS 1: network error (-1)");
     }
+
+    // ── PASS 2: ESP32-sync snapshot refresh (keeps JSON file current) ─────
+    //
+    // Still call fetchTodayAttendanceEsp32 to refresh the snapshot JSON
+    // (/attendance/esp32_YYYY-MM-DD.json) used by the web portal fallback.
+    // Its internal dedup skips anything PASS 1 already wrote to the CSV.
+    // If the aggregation job HAS run, this seeds any remaining session slots.
+    Serial.println("[Seed] PASS 2: ESP32-sync snapshot refresh...");
+    Serial.flush();
+    int syncResult = attService.fetchTodayAttendanceEsp32(today);
+    if (syncResult > 0) {
+        seeded += syncResult;
+        Serial.printf("[Seed] PASS 2: %d additional esp32-sync row(s) seeded\n", syncResult);
+    } else if (syncResult == 0) {
+        Serial.println("[Seed] PASS 2: 0 new rows from esp32-sync (summary empty or all deduped)");
+    } else {
+        Serial.println("[Seed] PASS 2: esp32-sync failed (-1) — snapshot may be stale");
+    }
+
+    // ── Always refresh dashboard stats after seeding ──────────────────────
+    updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
+                          max(0, SDDatabase::countTodayCheckOuts()));
+
+    Serial.printf("[Seed] === Seed complete: %d total new row(s) ===\n", seeded);
     Serial.flush();
 }
 
@@ -489,9 +569,25 @@ static void triggerInitialSync() {
     // ── SEED TODAY'S ATTENDANCE FROM SERVER ───────────────────────────────
     // Must run AFTER fullSyncIfNeeded (employees must be in SD cache first)
     // and AFTER NTP is available (dateStr() must return "YYYY-MM-DD").
+    // v2: tries /api/attendance/esp32-sync first (summary endpoint),
+    //     falls back to /api/attendance?date=… on failure.
     // This ensures resolveClockType() is correct from the first tap of the day
     // even if employees clocked in elsewhere before this device booted.
     seedTodayAttendanceFromServer();
+
+    // Notify any open browser that the seed is done — Attendance tab will
+    // auto-reload its table via the SSE stats listener.
+    {
+        int ins  = max(0, SDDatabase::countTodayCheckIns());
+        int outs = max(0, SDDatabase::countTodayCheckOuts());
+        uint64_t freeMB = SDDatabase::freeBytes() / 1048576;
+        bool wOk = wifiConfig.isConnected();
+        String statsJson = "{\"ins\":" + String(ins)
+                         + ",\"outs\":" + String(outs)
+                         + ",\"free_mb\":" + String((int)freeMB)
+                         + ",\"wifi\":" + (wOk ? "true" : "false") + "}";
+        wifiManager.broadcastEvent("stats", statsJson);
+    }
 
     // Flush any records that were queued before WiFi came up
     if (pendingCount > 0) flushPending();
@@ -628,6 +724,29 @@ static void handleNFCDetected(const String& cardIdentifier) {
     enqueuePending(emp.uid, cardIdentifier, clockType, ts, todayDate);
     Serial.printf("[STEP-8] Enqueued for upload. Queue size: %d\n", pendingCount);
 
+    // ── STEP 9: Broadcast SSE so the web portal updates instantly ─────────
+    // This pushes a "scan" event to the Dashboard live feed AND triggers the
+    // Attendance tab auto-refresh (via the SSE listener added there).
+    {
+        String dispType = clockType;
+        dispType.replace("_", " ");
+        char tsShort[6]; snprintf(tsShort, sizeof(tsShort), "%02d:%02d", clkH, clkM);
+        String scanJson = "{\"name\":\"" + emp.fullName
+                        + "\",\"type\":\"" + dispType
+                        + "\",\"time\":\"" + String(tsShort) + "\"}";
+        wifiManager.broadcastEvent("scan", scanJson);
+
+        // Also push updated stats so Dashboard counters stay live
+        int ins  = max(0, SDDatabase::countTodayCheckIns());
+        int outs = max(0, SDDatabase::countTodayCheckOuts());
+        uint64_t freeMB = SDDatabase::freeBytes() / 1048576;
+        String statsJson = "{\"ins\":" + String(ins)
+                         + ",\"outs\":" + String(outs)
+                         + ",\"free_mb\":" + String((int)freeMB)
+                         + ",\"wifi\":true}";
+        wifiManager.broadcastEvent("stats", statsJson);
+    }
+
     // "RECORDED" badge over the photo
     empDisplay->showSuccess(emp.fullName);
 
@@ -644,9 +763,14 @@ static void handleNFCDetected(const String& cardIdentifier) {
 
 // ─── setup ───────────────────────────────────────────────────────────────────
 void setup() {
+    SDDatabase::begin();
     Serial.begin(115200);
     { unsigned long t0 = millis(); while (!Serial && millis()-t0 < 5000) delay(10); }
     delay(200);
+
+       SDLogger::beginSerial();      
+       SDLogger::flushEarlyBuffer(); 
+       SDLogger::installPanicHandler(); 
 
     Serial.println();
     Serial.println("========================================");
@@ -738,6 +862,11 @@ void setup() {
 
     if (wifiConfig.isConnected()) {
         triggerInitialSync();
+        // Refresh dashboard counts after seeding — triggerInitialSync() already
+        // does this internally but an explicit call here guarantees the display
+        // is up-to-date even if the internal refresh path changes in future.
+        updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
+                              max(0, SDDatabase::countTodayCheckOuts()));
     } else {
         Serial.println("[Ready] SD-only mode — scanning active");
     }
@@ -757,6 +886,7 @@ void loop() {
     static unsigned long lastWifiRetry   = 0;
     static unsigned long lastUploadFlush = 0;   // ← NEW: background upload timer
     static unsigned long lastSocketPoll  = 0;
+    static unsigned long lastReSeed      = 0;   // ← periodic SD re-seed from server
     static bool          wasConnected    = false;
     static uint8_t       tick            = 0;
     unsigned long now = millis();
@@ -793,6 +923,41 @@ void loop() {
         pollSocketEvents();
     }
 
+    // ── Periodic SD re-seed from server ──────────────────────────────────
+    // Runs every RESEED_INTERVAL_MS when on dashboard + WiFi + SD ready.
+    // Keeps the local CSV in sync with records entered from the web portal
+    // or other NFC readers throughout the day, without waiting for a reboot.
+    // Uses the fast esp32-sync summary endpoint; falls back to raw on error.
+    if (isConnected && currentState == STATE_DASHBOARD &&
+        SDDatabase::isReady() && dateStr().length() >= 10 &&
+        (now - lastReSeed >= RESEED_INTERVAL_MS)) {
+        lastReSeed = now;
+        // Always run both endpoints — esp32-sync for speed, raw as safety net.
+        // The dedup checks inside each function prevent duplicate CSV rows.
+        int rs1 = attService.fetchTodayAttendanceEsp32(dateStr());
+        int rs2 = attService.fetchTodayAttendance(dateStr());
+        int rs  = (rs1 > 0 ? rs1 : 0) + (rs2 > 0 ? rs2 : 0);
+        // If both passes yield nothing, try per-employee walk (handles all-NULL summary)
+        if (rs == 0) {
+            int rs3 = attService.fetchAndSeedByEmployeeList(dateStr());
+            if (rs3 > 0) rs += rs3;
+        }
+        if (rs > 0) {
+            Serial.printf("[ReSeed] %d new CSV row(s) from periodic sync (esp32=%d raw=%d)\n",
+                          rs, rs1, rs2);
+            int ins  = max(0, SDDatabase::countTodayCheckIns());
+            int outs = max(0, SDDatabase::countTodayCheckOuts());
+            updateAttendanceStats(ins, outs);
+            // Notify any open browser tabs so they reload the attendance table
+            uint64_t freeMB = SDDatabase::freeBytes() / 1048576;
+            String statsJson = "{\"ins\":" + String(ins)
+                             + ",\"outs\":" + String(outs)
+                             + ",\"free_mb\":" + String((int)freeMB)
+                             + ",\"wifi\":true}";
+            wifiManager.broadcastEvent("stats", statsJson);
+        }
+    }
+
     // ── Background upload scheduler (CORE OF FAST-TAP FIX) ───────────────
     // Runs every UPLOAD_FLUSH_MS when:
     //   • WiFi is connected (server reachable)
@@ -808,8 +973,16 @@ void loop() {
 
         // Refresh stats after upload so the dashboard counts stay live
         if (currentState == STATE_DASHBOARD) {
-            updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
-                                  max(0, SDDatabase::countTodayCheckOuts()));
+            int ins  = max(0, SDDatabase::countTodayCheckIns());
+            int outs = max(0, SDDatabase::countTodayCheckOuts());
+            updateAttendanceStats(ins, outs);
+            // Push updated counts to any open web portal browser
+            uint64_t freeMB = SDDatabase::freeBytes() / 1048576;
+            String statsJson = "{\"ins\":" + String(ins)
+                             + ",\"outs\":" + String(outs)
+                             + ",\"free_mb\":" + String((int)freeMB)
+                             + ",\"wifi\":true}";
+            wifiManager.broadcastEvent("stats", statsJson);
         }
     }
 

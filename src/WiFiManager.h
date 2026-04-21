@@ -595,6 +595,22 @@ var currentDate = '';
 var _editorRows = [];
 var _serverIds  = [];  // parallel to _editorRows: server DB id for each row, 0 if unknown
 
+// ── SSE live-refresh: auto-reload when a scan or reseed arrives ──
+(function(){
+  var _sseAtt = new EventSource('/api/events');
+  var _refreshTimer = null;
+  function _scheduleRefresh(){
+    if(_refreshTimer) clearTimeout(_refreshTimer);
+    _refreshTimer = setTimeout(function(){
+      var sel = document.getElementById('dateSelect');
+      if(sel) loadCsv(sel.value || 'today');
+    }, 1500);
+  }
+  _sseAtt.addEventListener('scan',  function(){ _scheduleRefresh(); });
+  _sseAtt.addEventListener('stats', function(){ _scheduleRefresh(); });
+  _sseAtt.onerror = function(){ /* silent reconnect */ };
+})();
+
 fetch('/api/attendance/dates').then(r=>r.json()).then(function(d){
   var sel = document.getElementById('dateSelect');
   sel.innerHTML = '';
@@ -1886,54 +1902,190 @@ loadStatus();loadNets();
                                         : SDDatabase::readCSV(fileArg);
 
         // ── SERVER FALLBACK: if SD has no records for today, fetch live ──────
-        // This handles the boot window where syncTodayAttendanceToSD() has not
-        // yet written anything to SD (page loaded before the sync completed).
+        // Handles the boot window where seedTodayAttendanceFromServer() hasn't
+        // finished yet (browser opened the Attendance tab before SD sync completed).
+        //
+        // Strategy:
+        //   1. Try GET /api/attendance?date=… (raw per-row endpoint — always fresh)
+        //   2. Build a temporary CSV in memory to display in the table.
+        //   3. Do NOT write to SD here — that is the job of the background seeder.
+        //
+        // Using the RAW endpoint instead of esp32-sync because:
+        //   • esp32-sync reads daily_attendance_summary which is populated by a
+        //     server-side job that may not have run yet → returns empty data.
+        //   • The raw endpoint reads the live attendance table directly and always
+        //     has the freshest records regardless of the summary job state.
         bool pulledFromServer = false;
         if (fileArg == "today" && csv.length() == 0
             && _attSvc && _serverURL.length() > 0
             && _cfg && _cfg->isConnected()) {
+
             struct tm _fti = {}; getLocalTime(&_fti, 0);
             char _todayDate[12] = "";
             strftime(_todayDate, sizeof(_todayDate), "%Y-%m-%d", &_fti);
+
             if (strlen(_todayDate) == 10) {
-                Serial.printf("[WM] SD empty — fetching live (%s)\n", _todayDate);
-                String _lurl = _serverURL + "/api/attendance/esp32-sync?date="
+                Serial.printf("[WM] SD empty — fetching live from server (%s)\n", _todayDate);
+
+                // ── Try raw attendance endpoint ───────────────────────────────
+                String _lurl = _serverURL + "/api/attendance?date="
                                + String(_todayDate)
                                + "&limit=500&sort_by=clock_time&sort_order=ASC";
-                HTTPClient _lhc; _lhc.setTimeout(8000);
+                Serial.println("[WM] Live-fetch URL: " + _lurl);
+
+                HTTPClient _lhc; _lhc.setTimeout(10000);
                 _lhc.begin(_lurl);
                 _lhc.addHeader("X-Client-Type", "ESP32");
                 int _lcode = _lhc.GET();
-                Serial.printf("[WM] Live fetch HTTP %d\n", _lcode);
+                Serial.printf("[WM] Live-fetch HTTP %d\n", _lcode);
+
                 if (_lcode == 200) {
                     String _lbody = _lhc.getString(); _lhc.end();
+                    Serial.printf("[WM] Live-fetch body: %d bytes\n", (int)_lbody.length());
+
                     DynamicJsonDocument* _lDoc = psramFound()
                         ? new DynamicJsonDocument(131072)
                         : new DynamicJsonDocument(32768);
-                    bool _ldec = _attSvc->decryptBody(_lbody, *_lDoc);
-                    if (!_ldec) _ldec = (deserializeJson(*_lDoc, _lbody) == DeserializationError::Ok);
+
+                    bool _ldec = false;
+                    if (_attSvc) _ldec = _attSvc->decryptBody(_lbody, *_lDoc);
+                    if (!_ldec)  _ldec = (deserializeJson(*_lDoc, _lbody) == DeserializationError::Ok);
+
                     if (_ldec) {
+                        // Unwrap: { success, data: { data: [...] } } or { success, data: [...] }
                         JsonArray _larr;
                         if ((*_lDoc)["data"].is<JsonArray>())
                             _larr = (*_lDoc)["data"].as<JsonArray>();
+                        else if ((*_lDoc)["data"].is<JsonObject>() &&
+                                 (*_lDoc)["data"]["data"].is<JsonArray>())
+                            _larr = (*_lDoc)["data"]["data"].as<JsonArray>();
+
                         if (!_larr.isNull() && _larr.size() > 0) {
+                            Serial.printf("[WM] Live-fetch: building CSV from %d records\n",
+                                          (int)_larr.size());
                             csv = "timestamp,nfc_uid,employee_uid,employee_name,department,clock_type,device_id\n";
                             for (JsonObject _rec : _larr) {
-                                String _ct = _rec["clock_time"] | "";
+                                // clock_time may be "YYYY-MM-DD HH:MM:SS" — strip date
+                                String _ct = String(_rec["clock_time"] | "");
                                 int _sp = _ct.indexOf(' ');
                                 if (_sp >= 0) _ct = _ct.substring(_sp + 1);
-                                String _fn = String(_rec["first_name"] | "") + " " + String(_rec["last_name"] | "");
-                                _fn.trim();
-                                csv += _ct + ",," + String(_rec["employee_uid"] | "") + ","
-                                     + _fn + "," + String(_rec["department"] | "") + ","
-                                     + String(_rec["clock_type"] | "") + ",server\n";
+
+                                // Build full name from employee_name or first+last
+                                String _fn = String(_rec["employee_name"] | "");
+                                if (_fn.length() == 0) {
+                                    String _f = String(_rec["first_name"] | "");
+                                    String _l = String(_rec["last_name"]  | "");
+                                    _fn = (_f + " " + _l); _fn.trim();
+                                }
+
+                                String _uid  = String(_rec["employee_uid"] | "");
+                                String _dept = String(_rec["department"]   | "");
+                                String _type = String(_rec["clock_type"]   | "");
+
+                                csv += _ct + ",," + _uid + "," + _fn + ","
+                                     + _dept + "," + _type + ",server_live\n";
                             }
                             pulledFromServer = true;
-                            Serial.printf("[WM] Live: %d records\n", (int)_larr.size());
+                            Serial.printf("[WM] Live-fetch: %d records loaded for display\n",
+                                          (int)_larr.size());
+                        } else {
+                            Serial.println("[WM] Live-fetch: decoded OK but data array empty/missing");
+                            // Log top-level keys for diagnosis
+                            Serial.print("[WM] Live-fetch keys: ");
+                            for (JsonPair kv : _lDoc->as<JsonObject>())
+                                Serial.print(String(kv.key().c_str()) + " ");
+                            Serial.println();
                         }
+                    } else {
+                        Serial.println("[WM] Live-fetch: decrypt/parse FAILED");
+                        Serial.println("[WM] Body preview: " +
+                                       _lbody.substring(0, min(200, (int)_lbody.length())));
                     }
                     delete _lDoc;
-                } else { _lhc.end(); }
+                } else {
+                    _lhc.end();
+                    Serial.printf("[WM] Live-fetch failed (HTTP %d) — table will be empty\n",
+                                  _lcode);
+                }
+                Serial.flush();
+            }
+        }
+
+        // ── SNAPSHOT FALLBACK: read esp32_YYYY-MM-DD.json when CSV still empty ─
+        // The esp32-sync endpoint saves a per-employee summary JSON even when the
+        // daily_attendance_summary aggregation job has not yet populated session
+        // times (all nulls).  BUT the raw /api/attendance endpoint always has live
+        // per-row data.  If that raw fetch also returned empty (e.g. body=0 after
+        // a reboot, TCP not ready, heap pressure), we fall back to the snapshot
+        // which at minimum shows which employees have ANY attendance today and
+        // what times were recorded once the server aggregation catches up.
+        // This is display-only (read from SD, not written to SD here).
+        if (fileArg == "today" && csv.length() == 0 && !pulledFromServer
+            && SDDatabase::isReady()) {
+
+            struct tm _sti = {}; getLocalTime(&_sti, 0);
+            char _snapDate[12] = "";
+            strftime(_snapDate, sizeof(_snapDate), "%Y-%m-%d", &_sti);
+
+            String snapPath = "/attendance/esp32_" + String(_snapDate) + ".json";
+            if (SD_MMC.exists(snapPath.c_str())) {
+                Serial.printf("[WM] CSV empty — trying snapshot: %s\n", snapPath.c_str());
+                File sf = SD_MMC.open(snapPath.c_str(), FILE_READ);
+                if (sf && sf.size() > 2) {
+                    // The snapshot can be up to ~10KB for 43 employees.
+                    // We read it in a streaming fashion to avoid large heap allocation.
+                    // Build CSV rows directly from the JSON array.
+                    // Format: timestamp,nfc_uid,employee_uid,employee_name,department,clock_type,device_id
+                    String snapCsv = "timestamp,nfc_uid,employee_uid,employee_name,department,clock_type,device_id\n";
+                    bool snapHasRows = false;
+
+                    // Parse in a 16KB doc (snapshot is ~9-10KB for 43 employees)
+                    size_t snapSz = sf.size();
+                    DynamicJsonDocument* snapDoc = nullptr;
+                    if (snapSz < 32768) {
+                        snapDoc = new DynamicJsonDocument(max((size_t)16384, snapSz * 2));
+                    }
+                    if (snapDoc) {
+                        DeserializationError snapErr = deserializeJson(*snapDoc, sf);
+                        if (!snapErr && snapDoc->is<JsonArray>()) {
+                            static const char* SNAP_COLS[] = {
+                                "morning_in", "morning_out",
+                                "afternoon_in", "afternoon_out",
+                                "evening_in", "evening_out",
+                                "overtime_in", "overtime_out", nullptr
+                            };
+                            for (JsonObject emp : snapDoc->as<JsonArray>()) {
+                                String empUid  = emp["uid"]  | "";
+                                String empName = emp["name"] | "";
+                                String dept    = emp["dept"] | "";
+                                if (empUid.length() == 0) continue;
+                                for (int ci = 0; SNAP_COLS[ci]; ci++) {
+                                    const char* col = SNAP_COLS[ci];
+                                    if (emp[col].isNull()) continue;
+                                    String tv = emp[col] | "";
+                                    if (tv.length() == 0 || tv == "null") continue;
+                                    // tv is already time-only (HH:MM:SS) from snapshot writer
+                                    snapCsv += tv + ",," + empUid + "," + empName
+                                             + "," + dept + "," + String(col) + ",snapshot\n";
+                                    snapHasRows = true;
+                                }
+                            }
+                        } else if (snapErr) {
+                            Serial.printf("[WM] Snapshot parse error: %s\n", snapErr.c_str());
+                        }
+                        delete snapDoc;
+                    }
+                    sf.close();
+
+                    if (snapHasRows) {
+                        csv = snapCsv;
+                        pulledFromServer = true;   // marks as non-editable (no SD row IDs)
+                        Serial.println("[WM] Snapshot fallback: loaded for display");
+                    } else {
+                        Serial.println("[WM] Snapshot exists but has no populated session times yet");
+                    }
+                }
+                if (sf) sf.close();
             }
         }
 

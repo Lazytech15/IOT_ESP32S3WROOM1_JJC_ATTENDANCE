@@ -1,23 +1,10 @@
-//current project - HTTP SERVICE FOR ATTENDANCE (WITH AES DECRYPTION)
-//
-// FIX v3:
-// - fetchAllEmployeesEach now uses decryptServerResponse() — the same
-//   battle-tested path as authenticateNFC() — instead of reimplementing
-//   the base64/envelope extraction manually.
-// - Page-level DynamicJsonDocument bumped to 65536 bytes so face_descriptor
-//   and document fields never cause silent NoMemory failures.
-// - Uses _findEmployeesArray() to handle both data.employees and top-level
-//   employees envelope shapes.
-// - ID field pre-check uses "id" (matching PHP formatEmployeeData) and logs
-//   every skipped record so nothing disappears silently.
-
 #pragma once
 #include <Arduino.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include "employee_profile_display.h"
 #include "aes_decryptor.h"
-#include "sd_database.h"   // needed for SDDatabase::savePhoto() in downloadAllPhotosZip
+#include "sd_database.h"
 
 #define AES_KEY_B64 "wSDp34MhW1pp7RJ8V01ovioEMYKI2hJceZ91VzZcA7s="
 
@@ -33,6 +20,192 @@ private:
         http.addHeader("X-Client-Type", "ESP32");
         if (authToken.length() > 0)
             http.addHeader("Authorization", "Bearer " + authToken);
+    }
+
+    // ── readHttpBodyReliable ──────────────────────────────────────────────────
+    // Replaces getString() which silently truncates on ESP32 without PSRAM.
+    //
+    // getString() internally stops when its TCP buffer runs out of contiguous
+    // heap, returning a partial body with no error — this causes "IncompleteInput"
+    // JSON parse failures on responses > ~16KB without PSRAM.
+    //
+    // This helper reads the stream in CHUNK_SZ-byte blocks, appending each to a
+    // pre-reserved String.  It continues until Content-Length is satisfied, the
+    // server closes the connection, or the per-chunk watchdog fires.
+    //
+    // maxBytes: hard cap (caller's practical limit, e.g. 49152 for 48KB).
+    // Returns "" on timeout/error with 0 bytes received.
+    // ──────────────────────────────────────────────────────────────────────────
+    // ── readHttpBodyReliable ──────────────────────────────────────────────────
+    // Reads the HTTP response body correctly for BOTH Content-Length and
+    // Transfer-Encoding: chunked responses (Content-Length = -1).
+    //
+    // ROOT CAUSE of "4000 {..." corruption:
+    //   When the server sends chunked encoding, each chunk is preceded by its
+    //   hex size + CRLF, e.g.:  "4000\r\n{...16384 bytes of JSON...}\r\n"
+    //   A raw stream reader sees "4000\r\n" as part of the body, so the body
+    //   starts with "4000" not "{", making isEncrypted=NO and JSON parse fail
+    //   with EmptyInput (plainJson is "" after the non-JSON prefix is rejected).
+    //
+    // FIX: When Content-Length == -1 (chunked), use dechunked reading which
+    //   parses the hex chunk-size header, reads exactly that many bytes of
+    //   payload, skips the trailing CRLF, and repeats until a zero-size chunk.
+    //   When Content-Length > 0, use the simple length-based reader.
+    //
+    // maxBytes: hard cap on total payload accepted.
+    // Returns the raw JSON body string (no chunk headers), or "" on error.
+    // ──────────────────────────────────────────────────────────────────────────
+    static String readHttpBodyReliable(HTTPClient& client, int maxBytes = 65536) {
+        int contentLen = client.getSize();   // -1 means chunked / unknown
+        Serial.printf("[ReadBody] Content-Length=%d  maxBytes=%d  heap=%u\n",
+                      contentLen, maxBytes, ESP.getFreeHeap());
+        Serial.flush();
+
+        WiFiClient* stream = client.getStreamPtr();
+        if (!stream) {
+            Serial.println("[ReadBody] ERROR: no stream pointer");
+            Serial.flush();
+            return "";
+        }
+
+        if (contentLen < 0) {
+            // ── Chunked transfer encoding path ──────────────────────────────
+            return _readChunked(stream, maxBytes);
+        } else {
+            // ── Content-Length known path ────────────────────────────────────
+            return _readFixed(stream, client, contentLen, maxBytes);
+        }
+    }
+
+    // ── _readChunked ──────────────────────────────────────────────────────────
+    // Parses HTTP/1.1 chunked transfer encoding from the raw TCP stream.
+    // Each chunk:  <hex-size>\r\n<payload>\r\n
+    // Terminator:  0\r\n\r\n
+    // ──────────────────────────────────────────────────────────────────────────
+    static String _readChunked(WiFiClient* stream, int maxBytes) {
+        const uint32_t TIMEOUT_MS  = 12000;  // total patience
+        const uint32_t IDLE_MS     = 5;
+
+        String body;
+        body.reserve(min(maxBytes, 32768));
+
+        uint32_t deadline = millis() + TIMEOUT_MS;
+        int      totalReceived = 0;
+
+        while (millis() < deadline) {
+            // ── Read chunk-size line ─────────────────────────────────────────
+            String sizeLine = "";
+            bool   gotCR    = false;
+            while (millis() < deadline) {
+                if (!stream->available()) { delay(IDLE_MS); yield(); continue; }
+                char c = (char)stream->read();
+                if (c == '\r') { gotCR = true; continue; }
+                if (c == '\n' && gotCR) break;   // end of size line
+                gotCR = false;
+                sizeLine += c;
+            }
+            sizeLine.trim();
+            if (sizeLine.length() == 0) { delay(IDLE_MS); yield(); continue; }
+
+            // Strip chunk extensions (e.g. "1A2B;ext=val" → "1A2B")
+            int semiColon = sizeLine.indexOf(';');
+            if (semiColon >= 0) sizeLine = sizeLine.substring(0, semiColon);
+
+            long chunkSize = strtol(sizeLine.c_str(), nullptr, 16);
+            Serial.printf("[ReadBody] Chunk size: %ld (0x%s)\n",
+                          chunkSize, sizeLine.c_str());
+            Serial.flush();
+
+            if (chunkSize == 0) {
+                // Terminal chunk — consume trailing CRLF and done
+                break;
+            }
+            if (chunkSize < 0 || chunkSize > maxBytes) {
+                Serial.printf("[ReadBody] Chunk too large or invalid: %ld\n", chunkSize);
+                Serial.flush();
+                break;
+            }
+
+            // ── Read exactly chunkSize bytes of payload ──────────────────────
+            int remaining = (int)chunkSize;
+            while (remaining > 0 && millis() < deadline) {
+                int avail = stream->available();
+                if (avail <= 0) { delay(IDLE_MS); yield(); continue; }
+
+                int toRead = min(avail, min(remaining, 1024));
+                char buf[1025];
+                int rd = stream->readBytes((uint8_t*)buf, toRead);
+                if (rd <= 0) { delay(IDLE_MS); yield(); continue; }
+
+                buf[rd] = '\0';
+                if (totalReceived + rd <= maxBytes) {
+                    body       += buf;
+                    totalReceived += rd;
+                }
+                remaining -= rd;
+                yield();
+            }
+
+            // ── Consume trailing CRLF after payload ──────────────────────────
+            bool crSeen = false;
+            while (millis() < deadline) {
+                if (!stream->available()) { delay(IDLE_MS); yield(); continue; }
+                char c = (char)stream->read();
+                if (c == '\r') { crSeen = true; continue; }
+                if (c == '\n' && crSeen) break;
+                // unexpected char — stop consuming
+                break;
+            }
+
+            if (totalReceived >= maxBytes) {
+                Serial.printf("[ReadBody] maxBytes cap hit at %d\n", totalReceived);
+                Serial.flush();
+                break;
+            }
+            yield();
+        }
+
+        Serial.printf("[ReadBody] Chunked done: %d bytes  heap=%u\n",
+                      totalReceived, ESP.getFreeHeap());
+        Serial.flush();
+        return body;
+    }
+
+    // ── _readFixed ────────────────────────────────────────────────────────────
+    // Reads exactly contentLen bytes from a Content-Length response.
+    // ──────────────────────────────────────────────────────────────────────────
+    static String _readFixed(WiFiClient* stream, HTTPClient& client,
+                              int contentLen, int maxBytes) {
+        const uint32_t TIMEOUT_MS = 10000;
+        const uint32_t IDLE_MS    = 5;
+
+        int    toRead  = min(contentLen, maxBytes);
+        String body;
+        body.reserve(toRead + 8);
+
+        int      received = 0;
+        uint32_t deadline = millis() + TIMEOUT_MS;
+
+        while (received < toRead && millis() < deadline) {
+            int avail = stream->available();
+            if (avail <= 0) {
+                if (!client.connected()) break;
+                delay(IDLE_MS); yield(); continue;
+            }
+            int rd_sz = min(avail, min(1024, toRead - received));
+            char buf[1025];
+            int rd = stream->readBytes((uint8_t*)buf, rd_sz);
+            if (rd <= 0) { delay(IDLE_MS); yield(); continue; }
+            buf[rd] = '\0';
+            body      += buf;
+            received  += rd;
+            yield();
+        }
+
+        Serial.printf("[ReadBody] Fixed done: %d/%d bytes  heap=%u\n",
+                      received, toRead, ESP.getFreeHeap());
+        Serial.flush();
+        return body;
     }
 
     void debugPrintDecrypted(const String& rawEncryptedBody,
@@ -113,19 +286,11 @@ private:
         return ok;
     }
 
-    // ── Helper: given a decrypted doc, find the employees JsonArray ────────────
-    // PHP sendSuccessResponse wraps data like:
-    //   {"success":true,"data":{"employees":[...],"pagination":{...}}}
-    // But some endpoints return the array at the top level:
-    //   {"success":true,"employees":[...]}
-    // This helper handles both.
     static JsonArray _findEmployeesArray(DynamicJsonDocument& doc) {
-        // Try top-level "employees" first
         if (doc.containsKey("employees")) {
             JsonArray arr = doc["employees"].as<JsonArray>();
             if (!arr.isNull()) return arr;
         }
-        // Try wrapped "data.employees"
         if (doc.containsKey("data") && doc["data"].is<JsonObject>()) {
             JsonObject data = doc["data"].as<JsonObject>();
             if (data.containsKey("employees")) {
@@ -133,7 +298,7 @@ private:
                 if (!arr.isNull()) return arr;
             }
         }
-        return JsonArray(); // null array
+        return JsonArray();
     }
 
 public:
@@ -182,7 +347,6 @@ public:
             return false;
         }
 
-        // Find employee object — may be at top level or under "data"
         JsonObject e;
         if (respDoc.containsKey("employee")) {
             e = respDoc["employee"].as<JsonObject>();
@@ -228,23 +392,11 @@ public:
 
     // ══════════════════════════════════════════════════════════════════════════
     // downloadProfileImage
-    // ══════════════════════════════════════════════════════════════════════════════
-    // KEY FIX v4: Corrected endpoint from "/api/profile/<uid>/default" (which
-    // does NOT exist in the PHP router) to "/api/profile/<uid>" (GET handler
-    // that streams the most recent profile image directly — see profile.php).
-    //
-    // KEY FIX: Uses a LOCAL HTTPClient instead of the shared class member `http`.
-    // The shared `http` can be mid-session from fetchAllEmployeesEach, which
-    // causes downloadProfileImage to silently get 0 bytes. A fresh local
-    // HTTPClient always starts clean and connects correctly.
-    // ══════════════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════════
     bool downloadProfileImage(const String& uid, uint8_t** outBuffer, int* outSize,
                                const String& overridePath = "") {
         if (uid.length() == 0 || !outBuffer || !outSize) return false;
 
-        // Build URL — GET /api/profile/<uid> streams the most recent photo directly.
-        // This is the correct route (see profile.php GET /api/profile/:uid handler).
-        // "/default" does NOT exist in the PHP router and always returns 404.
         String url;
         if (overridePath.length() > 0) {
             if (overridePath.startsWith("http://") || overridePath.startsWith("https://"))
@@ -254,17 +406,13 @@ public:
             else
                 url = serverURL + "/" + overridePath;
         } else {
-            url = serverURL + "/api/profile/" + uid;   // ← correct endpoint
+            url = serverURL + "/api/profile/" + uid;
         }
 
         Serial.println("[IMG] GET " + url);
         Serial.printf("[IMG] heap=%u psram=%u\n", ESP.getFreeHeap(), ESP.getFreePsram());
         Serial.flush();
 
-        // *** CRITICAL: Use a LOCAL HTTPClient — do NOT use the shared `http` ***
-        // The class-level `http` may still have an open connection from the
-        // paginated fetchAllEmployeesEach loop, making any GET here silently
-        // return 0 bytes. A local instance always starts with a clean state.
         HTTPClient imgHttp;
         imgHttp.setTimeout(15000);
         imgHttp.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
@@ -280,7 +428,6 @@ public:
         Serial.println("[IMG] Code: " + String(code));
         Serial.flush();
 
-        // If overridePath failed, retry with the canonical /api/profile/<uid>
         if (code != 200 && overridePath.length() > 0) {
             Serial.println("[IMG] Retrying with canonical /api/profile/<uid>...");
             Serial.flush();
@@ -303,7 +450,6 @@ public:
             return false;
         }
 
-        // Content-Type — only block clearly non-image responses
         String ct = imgHttp.header("Content-Type");
         Serial.println("[IMG] Content-Type: " + ct);
         if (ct.length() > 0 && ct.indexOf("image") < 0 &&
@@ -332,7 +478,6 @@ public:
             return false;
         }
 
-        // Allocate buffer — PSRAM preferred
         int allocSize = (size > 0) ? (size + 16) : 65536;
         uint8_t* buf = nullptr;
         if (psramFound()) buf = (uint8_t*)ps_malloc(allocSize);
@@ -345,7 +490,6 @@ public:
             return false;
         }
 
-        // Stream read
         int got = 0;
         unsigned long lastData = millis();
         const int CHUNK = 4096;
@@ -386,13 +530,12 @@ public:
             free(buf); return false;
         }
 
-        // Magic-byte validation — JPEG / PNG / GIF / WebP
         bool validImage = false;
         if (got >= 4) {
-            if (buf[0] == 0xFF && buf[1] == 0xD8 && buf[2] == 0xFF)                                        validImage = true; // JPEG
-            else if (buf[0] == 0x89 && buf[1] == 0x50 && buf[2] == 0x4E && buf[3] == 0x47)                 validImage = true; // PNG
-            else if (buf[0] == 0x47 && buf[1] == 0x49 && buf[2] == 0x46)                                    validImage = true; // GIF
-            else if (got >= 12 && buf[0]==0x52 && buf[1]==0x49 && buf[8]==0x57 && buf[9]==0x45)             validImage = true; // WebP
+            if (buf[0] == 0xFF && buf[1] == 0xD8 && buf[2] == 0xFF)                                        validImage = true;
+            else if (buf[0] == 0x89 && buf[1] == 0x50 && buf[2] == 0x4E && buf[3] == 0x47)                 validImage = true;
+            else if (buf[0] == 0x47 && buf[1] == 0x49 && buf[2] == 0x46)                                    validImage = true;
+            else if (got >= 12 && buf[0]==0x52 && buf[1]==0x49 && buf[8]==0x57 && buf[9]==0x45)             validImage = true;
         }
         if (!validImage) {
             Serial.print("[IMG] FAILED: bad magic bytes (hex): ");
@@ -415,11 +558,6 @@ public:
     // ══════════════════════════════════════════════════════════════════════════
     // recordAttendance
     // ══════════════════════════════════════════════════════════════════════════
-    // Records a single attendance tap to the server.
-    // clockType must be the exact column name the server expects:
-    //   morning_in | morning_out | afternoon_in | afternoon_out |
-    //   evening_in | evening_out
-    // clockTimeStr: "HH:MM:SS"   dateStr: "YYYY-MM-DD"
     bool recordAttendance(const String& employeeUid,
                           const String& nfcUid,
                           const String& deviceId,
@@ -429,7 +567,6 @@ public:
         Serial.println("\n[HTTP] 📝 Recording attendance: " + clockType);
         Serial.flush();
 
-        // Build full datetime string: "YYYY-MM-DD HH:MM:SS"
         String clockTimeFull = (dateStr.length() > 0 && clockTimeStr.length() > 0)
                                ? (dateStr + " " + clockTimeStr)
                                : clockTimeStr;
@@ -439,9 +576,8 @@ public:
         doc["nfc_uid"]      = nfcUid;
         doc["nfc_access"]   = nfcUid;
         doc["device_id"]    = deviceId;
-        // ── Fields the server attendance.php createAttendanceRecord() reads ──
-        doc["clock_type"]   = clockType;          // exact column name
-        doc["clock_time"]   = clockTimeFull;      // full datetime for DB
+        doc["clock_type"]   = clockType;
+        doc["clock_time"]   = clockTimeFull;
         doc["date"]         = dateStr.length() > 0 ? dateStr : clockTimeStr.substring(0,10);
         doc["is_synced"]    = 1;
         doc["timestamp"]    = millis();
@@ -461,8 +597,6 @@ public:
         if (!ok && respDoc.containsKey("message"))
             Serial.println("[HTTP] Error: " + String(respDoc["message"] | ""));
 
-        // Capture server record ID and persist to SD map.
-        // Future edits use PUT /{id} instead of POST -> no duplicate rows.
         if (ok) {
             int serverId = 0;
             if (respDoc["data"]["id"].is<int>())      serverId = respDoc["data"]["id"] | 0;
@@ -482,7 +616,7 @@ public:
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // fetchAllEmployees — simple one-shot fetch (small rosters only)
+    // fetchAllEmployees
     // ══════════════════════════════════════════════════════════════════════════
     bool fetchAllEmployees(DynamicJsonDocument& outDoc) {
         String url = serverURL + "/api/employees";
@@ -563,24 +697,9 @@ public:
 
     // ══════════════════════════════════════════════════════════════════════════
     // fetchAllEmployeesEach — paginated streaming fetch
-    //
-    // FIX v3:
-    //   • Uses decryptServerResponse() — same path as authenticateNFC() which
-    //     is known-good — instead of reimplementing envelope extraction.
-    //   • Page DynamicJsonDocument = 65536 bytes: handles face_descriptor /
-    //     document fields that blew past the old 8192-byte budget causing
-    //     silent NoMemory parse failures (= zero employees delivered).
-    //   • Uses _findEmployeesArray() to unwrap data.employees OR top-level.
-    //   • Pre-checks "id" field (PHP formatEmployeeData returns int "id", not
-    //     "uid") and logs every skipped record so nothing disappears silently.
     // ══════════════════════════════════════════════════════════════════════════
     template<typename Callback>
     int fetchAllEmployeesEach(Callback onEmployee) {
-        // PAGE = 5: smaller pages keep encrypted payload small for AES decrypt
-        // AND keep pageDoc within budget. face_descriptor + document fields
-        // can push one employee to 2-4 KB of JSON; 10 × 4 KB = 40 KB which
-        // silently blows the old 24576-byte pageDoc causing NoMemory → 0 results.
-        // 5 × 4 KB = 20 KB fits easily in the 65536-byte pageDoc below.
         const int PAGE = 5;
         int offset = 0, total = 0;
 
@@ -638,16 +757,12 @@ public:
                 break;
             }
 
-            // ── Decrypt via the proven decryptServerResponse() path ────────────
-            // PAGE=10 keeps ciphertext small. aes_decryptor.h now uses
-            // ps_malloc (PSRAM) for decode+plaintext buffers so even tight
-            // heap situations succeed. pageDoc=24576 fits 10 full employees.
             Serial.printf("[HTTP] Pre-decrypt heap: %u  psram: %u\n",
                           ESP.getFreeHeap(), ESP.getFreePsram());
             Serial.flush();
             DynamicJsonDocument pageDoc(65536);
             bool ok = decryptServerResponse(decryptor, raw, pageDoc);
-            raw = "";   // free raw immediately — no longer needed
+            raw = "";
             yield();
 
             if (!ok) {
@@ -660,7 +775,6 @@ public:
                           (unsigned)pageDoc.memoryUsage());
             Serial.flush();
 
-            // ── Unwrap envelope: data.employees OR top-level employees ─────────
             JsonArray arr = _findEmployeesArray(pageDoc);
             if (arr.isNull()) {
                 Serial.println("[HTTP] 'employees' array not found — diagnosing:");
@@ -682,14 +796,12 @@ public:
             Serial.printf("[HTTP] Page has %d employees\n", pageCount);
             Serial.flush();
 
-            if (pageCount == 0) break;  // empty page = all done
+            if (pageCount == 0) break;
 
-            // ── Walk array, fire callback per employee ────────────────────────
             int pageIdx = 0;
             for (JsonObject emp : arr) {
                 pageIdx++;
 
-                // Print first 3 to verify field names coming from server
                 if (total + pageIdx <= 3) {
                     String dbg;
                     serializeJson(emp, dbg);
@@ -699,8 +811,6 @@ public:
                     Serial.flush();
                 }
 
-                // PHP formatEmployeeData returns integer key "id" (not "uid").
-                // Verify it exists and is non-zero before firing the callback.
                 String empId = "";
                 if (emp.containsKey("id") && !emp["id"].isNull()) {
                     JsonVariantConst v = emp["id"];
@@ -728,8 +838,8 @@ public:
             Serial.flush();
 
             offset += pageCount;
-            if (pageCount < PAGE) break;   // last (partial) page
-            if (offset >= 5000)  break;    // safety cap
+            if (pageCount < PAGE) break;
+            if (offset >= 5000)  break;
 
             delay(100);
         }
@@ -741,322 +851,1616 @@ public:
 
     // ══════════════════════════════════════════════════════════════════════════
     // fetchTodayAttendance
+    // MEMORY FIX v4: Two-phase approach that avoids OOM on no-PSRAM devices.
+    //
+    // Problem: 28KB encrypted body + 192KB doc = ~220KB needed, only ~104KB free.
+    //
+    // Solution:
+    //   PHASE A (encrypted path): decrypt the body string first (frees raw body),
+    //     then parse the plaintext using a FILTER doc that keeps only the 6 fields
+    //     we need per row — reducing doc size from 192KB to ~12KB for 50 records.
+    //   PHASE B (plain JSON path): same filter applied directly to raw body string,
+    //     then free the string before touching the doc.
+    //
+    // The filter document itself is tiny (< 512 bytes).
     // ══════════════════════════════════════════════════════════════════════════
-    // Fetches ALL attendance records for a given date from the server and
-    // seeds them into the local SD CSV so resolveClockType() is accurate
-    // even after a reboot or when the device was offline at boot time.
+    // ══════════════════════════════════════════════════════════════════════════
+    // fetchTodayAttendance  — PAGINATED v2
     //
-    // Server endpoint: GET /api/attendance?date=YYYY-MM-DD&limit=500
-    // Response shape (after AES decrypt):
-    //   { "success": true, "data": { "data": [ {attendance rows...} ] } }
-    //   OR { "success": true, "data": [ {attendance rows...} ] }
+    // Root cause of OOM / "Cannot find closing quote" errors:
+    //   The original version fetched ALL attendance rows for the day in a single
+    //   HTTP call.  With 105+ rows the encrypted body grew to 49 KB which:
+    //     a) Exceeded readHttpBodyReliable's cap → truncated mid-JSON.
+    //     b) Consumed all available heap after decryption (~50 KB plain).
     //
-    // Each row we care about:
-    //   employee_uid, clock_type, clock_time, date
+    // Fix: request BATCH_SIZE rows per HTTP call and process each page
+    //   immediately before fetching the next.  Each page is ~5–8 KB encrypted
+    //   (~3–5 KB decrypted) — well within the ESP32's heap budget.
     //
-    // What this writes to SD:
-    //   One CSV row per server record using the SAME format as logAttendance():
-    //     timestamp,nfc_uid,employee_uid,employee_name,department,event_type,device_id
-    //   so loadAttendanceToday() and resolveClockType() read it identically.
-    //
-    // IDEMPOTENT: If the CSV already contains a matching (employee_uid, clock_type)
-    // pair it will NOT write a duplicate row — safe to call on every startup.
-    //
-    // Returns number of new rows seeded into SD.
+    // The outer seen-cache persists across pages so we never write duplicate
+    // CSV rows even when the same employee appears on multiple pages.
     // ══════════════════════════════════════════════════════════════════════════
     int fetchTodayAttendance(const String& dateStr) {
         if (dateStr.length() < 10) {
-            Serial.println("[TodaySync] Skipped — no valid date");
+            SDLogger::log("TodaySync", SDLogger::WARN, "Skipped — no valid date");
             return 0;
         }
 
-        String url = serverURL + "/api/attendance?date=" + dateStr + "&limit=500";
-        Serial.println("[TodaySync] GET " + url);
-        Serial.flush();
+        // ── Per-page batch size ───────────────────────────────────────────────
+        // 20 rows × ~460 bytes/row (encrypted) ≈ 9 KB per page.
+        // Decrypted + parsed with filter ≈ 3–4 KB doc.  Safe on 160 KB heap.
+        const int BATCH_SIZE = 20;
 
-        // Use a local HTTPClient — never the shared `http` member —
-        // to avoid interfering with any other in-flight request.
-        HTTPClient todayHttp;
-        todayHttp.setTimeout(12000);
-        todayHttp.begin(url);
-        todayHttp.addHeader("X-Client-Type", "ESP32");
-        if (authToken.length() > 0)
-            todayHttp.addHeader("Authorization", "Bearer " + authToken);
+        SDLogger::log("TodaySync", SDLogger::INFO,
+                      "=== fetchTodayAttendance PAGED START date=" + dateStr + " ===");
 
-        int code = todayHttp.GET();
-        Serial.printf("[TodaySync] HTTP %d\n", code);
-        Serial.flush();
-
-        if (code <= 0) {
-            Serial.println("[TodaySync] Connection error: " + todayHttp.errorToString(code));
-            todayHttp.end();
+        // ── SD seen-cache: persists across pages ─────────────────────────────
+        const int MAX_EMP_SEEN = 128;
+        String* seenEmpUid   = new String[MAX_EMP_SEEN];
+        String* seenCsvTypes = new String[MAX_EMP_SEEN];
+        if (!seenEmpUid || !seenCsvTypes) {
+            SDLogger::log("TodaySync", SDLogger::ERROR, "OOM seenEmpUid alloc");
+            delete[] seenEmpUid; delete[] seenCsvTypes;
             return 0;
         }
+        int seenCount = 0;
 
-        // Stream body into PSRAM to avoid getString() heap fragmentation crash
-        int contentLen = todayHttp.getSize();
-        const int MAX_BODY = 131072;
-        int allocSz = (contentLen > 0 && contentLen <= MAX_BODY)
-                      ? contentLen + 8 : 65536;
-
-        uint8_t* bodyBuf = nullptr;
-        if (psramFound()) bodyBuf = (uint8_t*)ps_malloc(allocSz);
-        if (!bodyBuf)     bodyBuf = (uint8_t*)malloc(allocSz);
-        if (!bodyBuf) {
-            Serial.printf("[TodaySync] Alloc failed (%d B) heap=%u\n",
-                          allocSz, ESP.getFreeHeap());
-            todayHttp.end();
-            return 0;
-        }
-
-        WiFiClient* bodyStream = todayHttp.getStreamPtr();
-        int bodyGot = 0;
-        unsigned long bodyT0 = millis();
-        while (bodyStream && millis() - bodyT0 < 12000) {
-            int av = bodyStream->available();
-            if (av > 0) {
-                int canRead = min(av, allocSz - bodyGot - 1);
-                if (canRead <= 0) break;
-                int rd = bodyStream->readBytes(bodyBuf + bodyGot, canRead);
-                if (rd > 0) { bodyGot += rd; bodyT0 = millis(); }
-            } else {
-                if (!todayHttp.connected()) break;
-                delay(5);
-            }
-            yield();
-        }
-        bodyBuf[bodyGot] = 0;
-        todayHttp.end();
-
-        Serial.printf("[TodaySync] Body: %d bytes\n", bodyGot);
-        if (bodyGot == 0 || (code != 200 && code != 403)) {
-            free(bodyBuf);
-            Serial.println("[TodaySync] Bad response — aborting");
-            return 0;
-        }
-
-        String raw((char*)bodyBuf);
-        free(bodyBuf);
-        bodyBuf = nullptr;
-        yield();
-
-        // Decrypt using the proven decryptServerResponse() path
-        DynamicJsonDocument doc(65536);   // bumped: 500 records need more room
-        bool ok = decryptServerResponse(decryptor, raw, doc);
-        raw = "";   // free immediately
-        yield();
-
-        if (!ok) {
-            Serial.println("[TodaySync] Decrypt failed");
-            return 0;
-        }
-
-        // ── Unwrap the attendance array ─────────────────────────────────────
-        // attendance.php returns: { success, data: { data: [...], pagination: {...} } }
-        // but we also handle flat: { success, data: [...] }
-        JsonArray records;
-        if (doc.containsKey("data")) {
-            if (doc["data"].is<JsonArray>()) {
-                records = doc["data"].as<JsonArray>();
-            } else if (doc["data"].is<JsonObject>()) {
-                JsonObject dataObj = doc["data"].as<JsonObject>();
-                if (dataObj.containsKey("data")) {
-                    records = dataObj["data"].as<JsonArray>();
-                }
-            }
-        }
-
-        if (records.isNull()) {
-            Serial.println("[TodaySync] No 'data' array found in response");
-            // Debug: print top-level keys
-            Serial.print("[TodaySync] Keys: ");
-            for (JsonPair kv : doc.as<JsonObject>())
-                Serial.print(String(kv.key().c_str()) + " ");
-            Serial.println();
-            Serial.flush();
-            return 0;
-        }
-
-        int total = records.size();
-        Serial.printf("[TodaySync] %d records from server for %s\n", total, dateStr.c_str());
-        Serial.flush();
-
-        if (total == 0) return 0;
-        if (!SDDatabase::isReady()) {
-            Serial.println("[TodaySync] SD not ready — cannot seed");
-            return 0;
-        }
-
-        // ── PASS 1: Deduplicate server records by (empUid, clockType) ─────────
-        // The server can have multiple rows for the same session when:
-        //   • A tap was uploaded twice (fast-tap queue + retry).
-        //   • The web portal recorded the same event manually.
-        // We only want ONE row per (employee, clock_type) — the latest clock_time.
-        // Use a flat String array as a lightweight map keyed "empUid|clockType".
-        // Max 500 records means at most 500 entries; each key ≤ 60 chars — fine.
-        const int MAX_DEDUP = 128;
-        String dedupKey[MAX_DEDUP];
-        String dedupTime[MAX_DEDUP];
-        String dedupName[MAX_DEDUP];
-        String dedupDept[MAX_DEDUP];
-        int    dedupCount = 0;
-
-        for (JsonObject row : records) {
-            String empUid = "";
-            JsonVariantConst uidVar = row["employee_uid"];
-            if (uidVar.is<int>())       empUid = String(uidVar.as<int>());
-            else if (uidVar.is<long>()) empUid = String(uidVar.as<long>());
-            else                        empUid = uidVar | "";
-
-            String clockType = row["clock_type"] | "";
-            String clockTime = row["clock_time"] | "";
-
-            if (empUid.length() == 0 || clockType.length() == 0) continue;
-            if (clockType == "absent") continue;
-
-            String empName = row["employee_name"] | "";
-            if (empName.length() == 0) {
-                String fn = row["first_name"] | "";
-                String ln = row["last_name"]  | "";
-                if (fn.length() || ln.length()) empName = (fn + " " + ln);
-                empName.trim();
-            }
-            String dept = row["department"] | "";
-
-            // Time-only portion
-            String timeOnly = clockTime;
-            int spPos = timeOnly.indexOf(' ');
-            if (spPos >= 0) timeOnly = timeOnly.substring(spPos + 1);
-
-            // Key for this (employee, session slot)
-            String key = empUid + "|" + clockType;
-
-            // Search existing dedup table for this key
-            bool found = false;
-            for (int d = 0; d < dedupCount; d++) {
-                if (dedupKey[d] == key) {
-                    // Keep the latest clock_time (lexicographic compare is fine for HH:MM:SS)
-                    if (timeOnly > dedupTime[d]) dedupTime[d] = timeOnly;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found && dedupCount < MAX_DEDUP) {
-                dedupKey[dedupCount]  = key;
-                dedupTime[dedupCount] = timeOnly;
-                dedupName[dedupCount] = empName.length() ? empName : empUid;
-                dedupDept[dedupCount] = dept;
-                dedupCount++;
-            }
-            yield();
-        }
-
-        Serial.printf("[TodaySync] After dedup: %d unique (empUid, clockType) slots\n", dedupCount);
-        Serial.flush();
-
-        // ── PASS 2: Load what is ALREADY in the SD CSV once per employee ─────
-        // We build a small seen-set from SD so we can skip any slot already there.
-        // Calling loadAttendanceToday() once per unique employee (not per record)
-        // keeps SD reads minimal.
-        const int MAX_EMP_SEEN = 64;
-        String seenEmpUid[MAX_EMP_SEEN];
-        String seenCsvTypes[MAX_EMP_SEEN]; // comma-separated clock_types from SD
-        int    seenCount = 0;
-
-        auto getCsvTypes = [&](const String& empUid) -> String {
+        auto getCsvTypes = [&](const String& empUid) -> String& {
             for (int i = 0; i < seenCount; i++)
                 if (seenEmpUid[i] == empUid) return seenCsvTypes[i];
-            // Not cached yet — load from SD
-            String types = SDDatabase::loadAttendanceToday(empUid);
             if (seenCount < MAX_EMP_SEEN) {
                 seenEmpUid[seenCount]   = empUid;
-                seenCsvTypes[seenCount] = types;
-                seenCount++;
+                seenCsvTypes[seenCount] = SDDatabase::isReady()
+                                          ? SDDatabase::loadAttendanceToday(empUid)
+                                          : "";
+                return seenCsvTypes[seenCount++];
             }
-            return types;
+            seenCsvTypes[MAX_EMP_SEEN - 1] = SDDatabase::isReady()
+                                              ? SDDatabase::loadAttendanceToday(empUid)
+                                              : "";
+            return seenCsvTypes[MAX_EMP_SEEN - 1];
         };
 
-        // ── PASS 3: Write only genuinely missing entries ──────────────────────
-        int seeded = 0;
+        // ── ArduinoJson filter — only fields needed per raw attendance row ────
+        // The /api/attendance endpoint returns a DOUBLE envelope:
+        //   { "data": { "data": [...rows...], "pagination":{} } }
+        // Filter must mirror this shape so ArduinoJson reaches the inner array.
+        StaticJsonDocument<768> filter;
+        JsonObject rowFilter = filter["data"]["data"].createNestedObject();
+        rowFilter["employee_uid"] = true;
+        rowFilter["clock_type"]   = true;
+        rowFilter["clock_time"]   = true;
+        rowFilter["id"]           = true;
+        rowFilter["first_name"]   = true;
+        rowFilter["last_name"]    = true;
+        rowFilter["employee_name"]= true;
+        rowFilter["department"]   = true;
 
-        for (int d = 0; d < dedupCount; d++) {
-            // Split key back into empUid|clockType
-            int pipe = dedupKey[d].indexOf('|');
-            if (pipe < 0) continue;
-            String empUid    = dedupKey[d].substring(0, pipe);
-            String clockType = dedupKey[d].substring(pipe + 1);
-            String timeOnly  = dedupTime[d];
+        int totalSeeded  = 0;
+        int totalSkipped = 0;
+        int totalSrvIds  = 0;
+        int totalRows    = 0;
+        int offset       = 0;
+        int pageNum      = 0;
 
-            // Check SD CSV for this (employee, clock_type)
-            String existing = getCsvTypes(empUid);
-            // Exact token match: wrap in commas to avoid partial matches
-            String check = "," + existing + ",";
-            if (check.indexOf("," + clockType + ",") >= 0) {
-                Serial.printf("[TodaySync] SKIP (on SD): %s %s\n",
-                              empUid.c_str(), clockType.c_str());
+        while (true) {
+            pageNum++;
+            String url = serverURL + "/api/attendance?date=" + dateStr
+                         + "&limit=" + String(BATCH_SIZE)
+                         + "&offset=" + String(offset)
+                         + "&sort_by=clock_time&sort_order=ASC";
+
+            SDLogger::logf("TodaySync", SDLogger::INFO,
+                           "Page %d: GET offset=%d  heap=%u",
+                           pageNum, offset, ESP.getFreeHeap());
+
+            HTTPClient todayHttp;
+            todayHttp.setTimeout(12000);
+            todayHttp.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+            todayHttp.begin(url);
+            todayHttp.addHeader("X-Client-Type", "ESP32");
+            if (authToken.length() > 0)
+                todayHttp.addHeader("Authorization", "Bearer " + authToken);
+
+            int code = todayHttp.GET();
+            SDLogger::logf("TodaySync", SDLogger::INFO,
+                           "Page %d HTTP code: %d", pageNum, code);
+
+            if (code <= 0) {
+                SDLogger::logf("TodaySync", SDLogger::ERROR,
+                               "Page %d: connection error %d — aborting", pageNum, code);
+                todayHttp.end();
+                break;
+            }
+            if (code != 200 && code != 403) {
+                SDLogger::logf("TodaySync", SDLogger::ERROR,
+                               "Page %d: bad HTTP %d — aborting", pageNum, code);
+                todayHttp.end();
+                break;
+            }
+
+            // 12 KB cap: 20 rows × ~460 bytes encrypted + JSON overhead
+            String raw = readHttpBodyReliable(todayHttp, 12288);
+            todayHttp.end();
+            yield();
+
+            int bodyLen = raw.length();
+            SDLogger::logf("TodaySync", SDLogger::INFO,
+                           "Page %d: body=%d bytes  heap=%u",
+                           pageNum, bodyLen, ESP.getFreeHeap());
+
+            if (bodyLen == 0) {
+                SDLogger::logf("TodaySync", SDLogger::ERROR,
+                               "Page %d: empty body — aborting", pageNum);
+                break;
+            }
+
+            SDLogger::logf("TodaySync", SDLogger::INFO,
+                           "Page %d body[0..80]: %.80s", pageNum, raw.c_str());
+
+            // ── Detect encryption ────────────────────────────────────────────
+            bool isEncrypted = (raw.indexOf("\"encrypted\":true") >= 0) &&
+                               (raw.indexOf("\"data\":\"") >= 0);
+
+            String plainJson = "";
+            if (isEncrypted) {
+                int dataKeyIdx = raw.indexOf("\"data\":\"");
+                int dataStart  = dataKeyIdx + 8;
+                int dataEnd    = raw.indexOf("\"", dataStart);
+                if (dataEnd <= dataStart) {
+                    SDLogger::logf("TodaySync", SDLogger::ERROR,
+                                   "Page %d: cannot find closing quote — aborting", pageNum);
+                    break;
+                }
+                String encPayload = raw.substring(dataStart, dataEnd);
+                encPayload.replace("\\/", "/");
+                raw = ""; yield();
+                SDLogger::logf("TodaySync", SDLogger::INFO,
+                               "Page %d: decrypting len=%d  heap=%u",
+                               pageNum, (int)encPayload.length(), ESP.getFreeHeap());
+                plainJson = decryptor.decrypt(encPayload);
+                if (plainJson.length() == 0) {
+                    SDLogger::logf("TodaySync", SDLogger::ERROR,
+                                   "Page %d: decrypt failed", pageNum);
+                    break;
+                }
+                SDLogger::logf("TodaySync", SDLogger::INFO,
+                               "Page %d: decrypted len=%d  heap=%u",
+                               pageNum, (int)plainJson.length(), ESP.getFreeHeap());
+            } else {
+                plainJson = raw;
+                raw = ""; yield();
+            }
+
+            // ── Parse with filter ────────────────────────────────────────────
+            // 20 filtered rows × ~180 bytes each ≈ 3.6 KB + overhead → 8 KB doc
+            DynamicJsonDocument* docPtr = new DynamicJsonDocument(12288);
+            if (!docPtr) {
+                SDLogger::logf("TodaySync", SDLogger::ERROR,
+                               "Page %d: OOM doc alloc  heap=%u",
+                               pageNum, ESP.getFreeHeap());
+                break;
+            }
+
+            DeserializationError parseErr = deserializeJson(*docPtr, plainJson,
+                                                            DeserializationOption::Filter(filter));
+            plainJson = ""; yield();
+
+            if (parseErr) {
+                SDLogger::logf("TodaySync", SDLogger::ERROR,
+                               "Page %d: parse error: %s  doc=%u  heap=%u",
+                               pageNum, parseErr.c_str(),
+                               (unsigned)docPtr->memoryUsage(), ESP.getFreeHeap());
+                delete docPtr;
+                break;
+            }
+
+            SDLogger::logf("TodaySync", SDLogger::INFO,
+                           "Page %d: parse OK  doc=%u  heap=%u",
+                           pageNum, (unsigned)docPtr->memoryUsage(), ESP.getFreeHeap());
+
+            // ── Unwrap data array (double envelope: data.data[]) ─────────────
+            JsonArray records;
+            if (docPtr->containsKey("data")) {
+                auto dataVal = (*docPtr)["data"];
+                if (dataVal.is<JsonArray>()) {
+                    records = dataVal.as<JsonArray>();
+                } else if (dataVal.is<JsonObject>()) {
+                    JsonObject dataObj = dataVal.as<JsonObject>();
+                    if (dataObj.containsKey("data"))
+                        records = dataObj["data"].as<JsonArray>();
+                }
+            }
+
+            if (records.isNull()) {
+                SDLogger::logf("TodaySync", SDLogger::ERROR,
+                               "Page %d: no 'data' array found", pageNum);
+                delete docPtr;
+                break;
+            }
+
+            int pageCount = records.size();
+            SDLogger::logf("TodaySync", SDLogger::INFO,
+                           "Page %d: %d rows  total_so_far=%d",
+                           pageNum, pageCount, totalRows + pageCount);
+
+            if (pageCount == 0) {
+                delete docPtr;
+                break;  // no more data
+            }
+
+            totalRows += pageCount;
+
+            // ── Process rows: dedup then write to SD ─────────────────────────
+            if (SDDatabase::isReady()) {
+                for (JsonObject row : records) {
+                    String empUid = "";
+                    JsonVariantConst uv = row["employee_uid"];
+                    if (uv.is<int>())       empUid = String(uv.as<int>());
+                    else if (uv.is<long>()) empUid = String(uv.as<long>());
+                    else                    empUid = uv | "";
+
+                    String clockType = row["clock_type"] | "";
+                    String clockTime = row["clock_time"] | "";
+                    int    srvId     = row["id"]         | 0;
+
+                    if (empUid.length() == 0 || clockType.length() == 0) continue;
+                    if (clockType == "absent") continue;
+
+                    // time-only portion for SD key
+                    String timeOnly = clockTime;
+                    int sp = timeOnly.indexOf(' ');
+                    if (sp >= 0) timeOnly = timeOnly.substring(sp + 1);
+
+                    // ── Dedup: skip if already in SD CSV ─────────────────────
+                    String& existing = getCsvTypes(empUid);
+                    if (("," + existing + ",").indexOf("," + clockType + ",") >= 0) {
+                        // Still save server_id mapping if missing
+                        if (srvId > 0) {
+                            int eid = SDDatabase::getServerIdForRecord(
+                                          dateStr, empUid, clockType, timeOnly);
+                            if (eid == 0) {
+                                SDDatabase::saveServerIdMapping(
+                                    dateStr, empUid, clockType, timeOnly, srvId);
+                                totalSrvIds++;
+                            }
+                        }
+                        totalSkipped++;
+                        yield(); continue;
+                    }
+
+                    // ── Build minimal employee profile for CSV row ────────────
+                    EmployeeProfile seedEmp;
+                    seedEmp.uid  = empUid;
+                    seedEmp.hasData = true;
+                    String fn = row["first_name"] | "";
+                    String ln = row["last_name"]  | "";
+                    String en = row["employee_name"] | "";
+                    if (en.length() > 0) seedEmp.fullName = en;
+                    else if (fn.length() || ln.length()) {
+                        seedEmp.fullName = fn + " " + ln;
+                        seedEmp.fullName.trim();
+                    } else seedEmp.fullName = empUid;
+                    seedEmp.department = row["department"] | "";
+
+                    bool wrote = SDDatabase::logAttendance(
+                        timeOnly, "", seedEmp, clockType, "SERVER_SEED");
+
+                    if (wrote) {
+                        totalSeeded++;
+                        // Update seen-cache so later rows in this page are deduped
+                        existing = SDDatabase::loadAttendanceToday(empUid);
+
+                        if (srvId > 0) {
+                            bool mapped = SDDatabase::saveServerIdMapping(
+                                              dateStr, empUid, clockType, timeOnly, srvId);
+                            if (mapped) totalSrvIds++;
+                        }
+                    } else {
+                        SDLogger::logf("TodaySync", SDLogger::ERROR,
+                                       "CSV WRITE FAILED uid=%s %s @ %s",
+                                       empUid.c_str(), clockType.c_str(), timeOnly.c_str());
+                    }
+                    yield();
+                }
+            }
+
+            delete docPtr;
+            docPtr = nullptr;
+
+            // ── Check pagination ─────────────────────────────────────────────
+            offset += pageCount;
+            if (pageCount < BATCH_SIZE) break;  // last page
+            if (offset >= 2000) {
+                SDLogger::log("TodaySync", SDLogger::WARN,
+                              "Safety cap: 2000 rows reached — stopping");
+                break;
+            }
+
+            delay(80);  // brief pause between pages to let TCP close cleanly
+            yield();
+        }
+
+        delete[] seenEmpUid;
+        delete[] seenCsvTypes;
+
+        SDLogger::logf("TodaySync", SDLogger::INFO,
+                       "=== DONE: pages=%d seeded=%d skipped=%d srvIds=%d"
+                       " (server_rows=%d) heap=%u ===",
+                       pageNum, totalSeeded, totalSkipped, totalSrvIds,
+                       totalRows, ESP.getFreeHeap());
+        Serial.printf("[TodaySync] Done: pages=%d seeded=%d skipped=%d"
+                      " (total_rows=%d) heap=%u\n",
+                      pageNum, totalSeeded, totalSkipped, totalRows,
+                      ESP.getFreeHeap());
+        Serial.flush();
+        return totalSeeded;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // fetchTodayAttendanceEsp32  — PAGINATED v5
+    //
+    // Root causes fixed:
+    //   1. Chunked encoding corruption ("4000 {...}" body prefix):
+    //      readHttpBodyReliable() now detects Content-Length=-1 and calls
+    //      _readChunked() which parses hex chunk-size headers properly.
+    //   2. Response too large for heap (41KB, no PSRAM):
+    //      Requests PAGE_SIZE=10 employees per HTTP call (~3-5KB each).
+    //      Iterates pages until total == 0 or page < PAGE_SIZE.
+    //
+    // Each page is parsed, SD-seeded, and freed before the next page is fetched
+    // — peak heap usage is ~20KB instead of 104KB+ for the full batch.
+    // ══════════════════════════════════════════════════════════════════════════
+    int fetchTodayAttendanceEsp32(const String& date) {
+    if (date.length() < 10) {
+        SDLogger::log("Esp32Sync", SDLogger::WARN, "Skipped — no valid date (clock not synced yet)");
+        return 0;
+    }
+
+    SDLogger::log("Esp32Sync", SDLogger::INFO,
+                  "=== fetchTodayAttendanceEsp32 PAGED START date=" + date + " ===");
+
+    static const char* SESSION_COLS[] = {
+        "morning_in",   "morning_out",
+        "afternoon_in", "afternoon_out",
+        "evening_in",   "evening_out",
+        "overtime_in",  "overtime_out",
+        nullptr
+    };
+
+    const int MAX_EMP_SEEN = 128;
+    String* seenEmpUid   = new String[MAX_EMP_SEEN];
+    String* seenCsvTypes = new String[MAX_EMP_SEEN];
+    if (!seenEmpUid || !seenCsvTypes) {
+        SDLogger::log("Esp32Sync", SDLogger::ERROR, "OOM seenEmpUid");
+        delete[] seenEmpUid; delete[] seenCsvTypes;
+        return -1;
+    }
+    int seenCount = 0;
+
+    auto getCsvTypes = [&](const String& empUid) -> String& {
+        for (int i = 0; i < seenCount; i++)
+            if (seenEmpUid[i] == empUid) return seenCsvTypes[i];
+        if (seenCount < MAX_EMP_SEEN) {
+            seenEmpUid[seenCount]   = empUid;
+            seenCsvTypes[seenCount] = SDDatabase::loadAttendanceToday(empUid);
+            return seenCsvTypes[seenCount++];
+        }
+        seenCsvTypes[MAX_EMP_SEEN - 1] = SDDatabase::loadAttendanceToday(empUid);
+        return seenCsvTypes[MAX_EMP_SEEN - 1];
+    };
+
+    const int PAGE_SIZE  = 10;
+    const int MAX_SEED   = 128;
+
+    struct SeedEntry { String empUid, col, timeOnly, empName, dept; };
+    SeedEntry* seedQueue = new SeedEntry[MAX_SEED];
+    if (!seedQueue) {
+        SDLogger::log("Esp32Sync", SDLogger::ERROR, "OOM seedQueue");
+        delete[] seenEmpUid; delete[] seenCsvTypes;
+        return -1;
+    }
+
+    // ── JSON filter ───────────────────────────────────────────────────────────
+    StaticJsonDocument<768> filter;
+    JsonObject rowF = filter["data"].createNestedObject();
+    rowF["employee_uid"]  = true;
+    rowF["employee_name"] = true;
+    rowF["first_name"]    = true;
+    rowF["last_name"]     = true;
+    rowF["department"]    = true;
+    rowF["morning_in"]    = true;
+    rowF["morning_out"]   = true;
+    rowF["afternoon_in"]  = true;
+    rowF["afternoon_out"] = true;
+    rowF["evening_in"]    = true;
+    rowF["evening_out"]   = true;
+    rowF["overtime_in"]   = true;
+    rowF["overtime_out"]  = true;
+    rowF["regular_hours"] = true;
+    rowF["overtime_hours"]= true;
+    rowF["total_hours"]   = true;
+
+    // ── DEBUG: Print filter structure ─────────────────────────────────────────
+    {
+        String filterDbg;
+        serializeJson(filter, filterDbg);
+        SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                       "Filter: %.250s", filterDbg.c_str());
+    }
+
+    // ── Snapshot file ─────────────────────────────────────────────────────────
+    String snapPath = "/attendance/esp32_" + date + ".json";
+    File snapFile = SD_MMC.open(snapPath.c_str(), FILE_WRITE);
+    if (snapFile) { snapFile.print("["); }
+    bool snapFirst = true;
+
+    int totalSeeded   = 0;
+    int totalReceived = 0;
+    int offset        = 0;
+    int pageNum       = 0;
+    bool sdReady      = SDDatabase::isReady();
+
+    SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                   "sdReady=%d  snapFileOpen=%d",
+                   (int)sdReady, (int)(bool)snapFile);
+
+    while (true) {
+        pageNum++;
+        String url = serverURL + "/api/attendance/esp32-sync?date=" + date
+                     + "&limit=" + String(PAGE_SIZE)
+                     + "&offset=" + String(offset);
+
+        SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                       "Page %d: GET offset=%d  heap=%u",
+                       pageNum, offset, ESP.getFreeHeap());
+
+        HTTPClient esp32Http;
+        esp32Http.setTimeout(12000);
+        esp32Http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        esp32Http.begin(url);
+        esp32Http.addHeader("X-Client-Type", "ESP32");
+        if (authToken.length() > 0)
+            esp32Http.addHeader("Authorization", "Bearer " + authToken);
+
+        int code = esp32Http.GET();
+        SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                       "Page %d HTTP code: %d", pageNum, code);
+
+        if (code <= 0) {
+            SDLogger::logf("Esp32Sync", SDLogger::ERROR,
+                           "Page %d: connection error %d — aborting", pageNum, code);
+            esp32Http.end();
+            break;
+        }
+        if (code != 200 && code != 403) {
+            SDLogger::logf("Esp32Sync", SDLogger::ERROR,
+                           "Page %d: bad HTTP code %d — aborting", pageNum, code);
+            esp32Http.end();
+            break;
+        }
+
+        String raw = readHttpBodyReliable(esp32Http, 16384);
+        esp32Http.end();
+        yield();
+
+        int bodyLen = raw.length();
+        SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                       "Page %d: body=%d bytes  heap=%u",
+                       pageNum, bodyLen, ESP.getFreeHeap());
+
+        if (bodyLen == 0) {
+            SDLogger::logf("Esp32Sync", SDLogger::ERROR,
+                           "Page %d: empty body — aborting", pageNum);
+            break;
+        }
+
+        // ── DEBUG 1: Full raw body preview (first 300 chars) ─────────────────
+        SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                       "Page %d raw[0..300]: %.300s", pageNum, raw.c_str());
+
+        // ── DEBUG 2: Encryption detection details ─────────────────────────────
+        bool hasEncFlag   = (raw.indexOf("\"encrypted\":true") >= 0);
+        bool hasBase64    = (raw.indexOf("\"data\":\"") >= 0);
+        bool isEncrypted  = hasEncFlag && hasBase64;
+        char firstChar    = raw.length() > 0 ? raw[0] : '?';
+        int  encFlagPos   = raw.indexOf("\"encrypted\":true");
+        int  dataQuotePos = raw.indexOf("\"data\":\"");
+        int  dataArrPos   = raw.indexOf("\"data\":[");
+        int  dataObjPos   = raw.indexOf("\"data\":{");
+
+        SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                       "Page %d detect: isEnc=%d encFlag=%d base64=%d firstChar='%c'",
+                       pageNum, (int)isEncrypted, (int)hasEncFlag, (int)hasBase64, firstChar);
+        SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                       "Page %d positions: encFlagPos=%d dataQuotePos=%d dataArrPos=%d dataObjPos=%d",
+                       pageNum, encFlagPos, dataQuotePos, dataArrPos, dataObjPos);
+
+        String plainJson = "";
+
+        if (isEncrypted) {
+            int dataKeyIdx = raw.indexOf("\"data\":\"");
+            int dataStart  = dataKeyIdx + 8;
+            int dataEnd    = raw.indexOf("\"", dataStart);
+
+            SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                           "Page %d enc: dataKeyIdx=%d dataStart=%d dataEnd=%d",
+                           pageNum, dataKeyIdx, dataStart, dataEnd);
+
+            if (dataEnd <= dataStart) {
+                SDLogger::logf("Esp32Sync", SDLogger::ERROR,
+                               "Page %d: cannot find closing quote — aborting", pageNum);
+                break;
+            }
+
+            String encPayload = raw.substring(dataStart, dataEnd);
+            SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                           "Page %d: encPayload len=%d  first40=%.40s",
+                           pageNum, (int)encPayload.length(), encPayload.c_str());
+
+            encPayload.replace("\\/", "/");
+            raw = "";  yield();
+
+            SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                           "Page %d: decrypting  heap=%u", pageNum, ESP.getFreeHeap());
+            plainJson = decryptor.decrypt(encPayload);
+
+            if (plainJson.length() == 0) {
+                SDLogger::logf("Esp32Sync", SDLogger::ERROR,
+                               "Page %d: decrypt failed", pageNum);
+                break;
+            }
+
+            SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                           "Page %d: decrypted len=%d  heap=%u  first100=%.100s",
+                           pageNum, (int)plainJson.length(),
+                           ESP.getFreeHeap(), plainJson.c_str());
+        } else {
+            // ── DEBUG 3: Plain JSON path — show what we got ───────────────────
+            SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                           "Page %d: plain JSON path  len=%d  first100=%.100s",
+                           pageNum, bodyLen, raw.c_str());
+            plainJson = raw;
+            raw = "";
+            yield();
+        }
+
+        // ── DEBUG 4: plainJson preview before parse ───────────────────────────
+        SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                       "Page %d: plainJson len=%d  first200=%.200s",
+                       pageNum, (int)plainJson.length(), plainJson.c_str());
+
+        // ── Parse WITHOUT filter first to see what's actually there ───────────
+        {
+            DynamicJsonDocument* probeDoc = new DynamicJsonDocument(16384);
+            if (probeDoc) {
+                DeserializationError probeErr = deserializeJson(*probeDoc, plainJson);
+                SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                               "Page %d PROBE (no filter): err=%s  docUsed=%u  heap=%u",
+                               pageNum,
+                               probeErr ? probeErr.c_str() : "OK",
+                               (unsigned)probeDoc->memoryUsage(),
+                               ESP.getFreeHeap());
+
+                if (!probeErr) {
+                    // Show top-level keys
+                    String topKeys = "";
+                    for (JsonPair kv : probeDoc->as<JsonObject>())
+                        topKeys += String(kv.key().c_str()) + "(" +
+                                   String(kv.value().is<JsonArray>()  ? "arr" :
+                                          kv.value().is<JsonObject>() ? "obj" :
+                                          kv.value().is<bool>()       ? "bool" :
+                                          kv.value().is<int>()        ? "int" :
+                                          kv.value().is<float>()      ? "float" : "str") + ") ";
+                    SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                                   "Page %d PROBE top keys: %s", pageNum, topKeys.c_str());
+
+                    // Show data array info
+                    if (probeDoc->containsKey("data") && (*probeDoc)["data"].is<JsonArray>()) {
+                        JsonArray probeArr = (*probeDoc)["data"].as<JsonArray>();
+                        SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                                       "Page %d PROBE data[]: size=%d",
+                                       pageNum, (int)probeArr.size());
+
+                        // Show first row's keys and values
+                        if (probeArr.size() > 0) {
+                            JsonObject firstRow = probeArr[0];
+                            String rowKeys = "";
+                            for (JsonPair kv : firstRow)
+                                rowKeys += String(kv.key().c_str()) + " ";
+                            SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                                           "Page %d PROBE row[0] keys: %s",
+                                           pageNum, rowKeys.c_str());
+
+                            // Show full first row serialized
+                            String firstRowStr;
+                            serializeJson(firstRow, firstRowStr);
+                            SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                                           "Page %d PROBE row[0] data: %.300s",
+                                           pageNum, firstRowStr.c_str());
+                        }
+                    } else if (probeDoc->containsKey("data")) {
+                        SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                                       "Page %d PROBE: 'data' is NOT an array — type check needed",
+                                       pageNum);
+                    } else {
+                        SDLogger::logf("Esp32Sync", SDLogger::ERROR,
+                                       "Page %d PROBE: no 'data' key found at all", pageNum);
+                    }
+                }
+                delete probeDoc;
+                yield();
+            }
+        }
+
+        // ── Parse WITH filter ─────────────────────────────────────────────────
+        DynamicJsonDocument* docPtr = new DynamicJsonDocument(12288);
+        if (!docPtr) {
+            SDLogger::logf("Esp32Sync", SDLogger::ERROR,
+                           "Page %d: OOM doc alloc  heap=%u",
+                           pageNum, ESP.getFreeHeap());
+            break;
+        }
+
+        DeserializationError parseErr = deserializeJson(*docPtr, plainJson,
+                                                        DeserializationOption::Filter(filter));
+        plainJson = "";  yield();
+
+        SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                       "Page %d FILTERED: err=%s  docUsed=%u / %u  heap=%u",
+                       pageNum,
+                       parseErr ? parseErr.c_str() : "OK",
+                       (unsigned)docPtr->memoryUsage(),
+                       (unsigned)docPtr->capacity(),
+                       ESP.getFreeHeap());
+
+        if (parseErr) {
+            SDLogger::logf("Esp32Sync", SDLogger::ERROR,
+                           "Page %d: parse error: %s", pageNum, parseErr.c_str());
+            delete docPtr;
+            break;
+        }
+
+        // ── DEBUG 5: Show filtered result ─────────────────────────────────────
+        {
+            String filtKeys = "";
+            for (JsonPair kv : docPtr->as<JsonObject>())
+                filtKeys += String(kv.key().c_str()) + " ";
+            SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                           "Page %d FILTERED top keys: %s", pageNum, filtKeys.c_str());
+
+            if (docPtr->containsKey("data") && (*docPtr)["data"].is<JsonArray>()) {
+                JsonArray filtArr = (*docPtr)["data"].as<JsonArray>();
+                SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                               "Page %d FILTERED data[]: size=%d", pageNum, (int)filtArr.size());
+
+                if (filtArr.size() > 0) {
+                    String filtRowStr;
+                    serializeJson(filtArr[0], filtRowStr);
+                    SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                                   "Page %d FILTERED row[0]: %.300s",
+                                   pageNum, filtRowStr.c_str());
+                }
+            } else {
+                SDLogger::logf("Esp32Sync", SDLogger::ERROR,
+                               "Page %d FILTERED: no 'data' array after filter", pageNum);
+            }
+        }
+
+        // ── Unwrap data array ─────────────────────────────────────────────────
+        JsonArray rows;
+        if (docPtr->containsKey("data")) {
+            if ((*docPtr)["data"].is<JsonArray>()) {
+                rows = (*docPtr)["data"].as<JsonArray>();
+                SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                               "Page %d: unwrap OK — flat array rows=%d", pageNum, (int)rows.size());
+            } else if ((*docPtr)["data"].is<JsonObject>()) {
+                JsonObject d = (*docPtr)["data"].as<JsonObject>();
+                if (d.containsKey("data") && d["data"].is<JsonArray>()) {
+                    rows = d["data"].as<JsonArray>();
+                    SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                                   "Page %d: unwrap OK — double envelope rows=%d",
+                                   pageNum, (int)rows.size());
+                } else {
+                    SDLogger::logf("Esp32Sync", SDLogger::ERROR,
+                                   "Page %d: data is object but no inner data[] array", pageNum);
+                }
+            } else {
+                SDLogger::logf("Esp32Sync", SDLogger::ERROR,
+                               "Page %d: data key exists but is neither array nor object", pageNum);
+            }
+        } else {
+            SDLogger::logf("Esp32Sync", SDLogger::ERROR,
+                           "Page %d: no 'data' key in filtered doc", pageNum);
+        }
+
+        if (rows.isNull()) {
+            SDLogger::logf("Esp32Sync", SDLogger::ERROR,
+                           "Page %d: rows is null — stopping", pageNum);
+            delete docPtr;
+            break;
+        }
+
+        int pageCount = rows.size();
+        SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                       "Page %d: %d rows  total_so_far=%d",
+                       pageNum, pageCount, totalReceived + pageCount);
+
+        if (pageCount == 0) {
+            delete docPtr;
+            break;
+        }
+
+        totalReceived += pageCount;
+
+        // ── Append to snapshot file ───────────────────────────────────────────
+        if (snapFile) {
+            for (JsonObject row : rows) {
+                if (!snapFirst) snapFile.print(",");
+                snapFirst = false;
+
+                String empUid = "";
+                JsonVariantConst uv = row["employee_uid"];
+                if (uv.is<int>())       empUid = String(uv.as<int>());
+                else if (uv.is<long>()) empUid = String(uv.as<long>());
+                else                    empUid = uv | "";
+
+                // ── DEBUG 6: Show what we're writing to snapshot ──────────────
+                if (totalReceived <= 3) {
+                    SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                                   "SnapWrite uid='%s' morning_in='%s' morning_out='%s'",
+                                   empUid.c_str(),
+                                   (row["morning_in"] | "NULL"),
+                                   (row["morning_out"] | "NULL"));
+                }
+
+                String empName = row["employee_name"] | "";
+                if (empName.length() == 0) {
+                    String fn = row["first_name"] | "";
+                    String ln = row["last_name"]  | "";
+                    if (fn.length() || ln.length()) {
+                        empName = fn + " " + ln;
+                        empName.trim();
+                    }
+                }
+                String dept = row["department"] | "";
+
+                auto ts = [&](const char* col) -> String {
+                    if (row[col].isNull()) return "null";
+                    String v = row[col] | "";
+                    if (v.length() == 0 || v == "null") return "null";
+                    int sp = v.indexOf(' ');
+                    if (sp >= 0) v = v.substring(sp + 1);
+                    return "\"" + v + "\"";
+                };
+
+                snapFile.print("{");
+                snapFile.print("\"uid\":\"");        snapFile.print(empUid);  snapFile.print("\",");
+                snapFile.print("\"name\":\"");        snapFile.print(empName); snapFile.print("\",");
+                snapFile.print("\"dept\":\"");        snapFile.print(dept);    snapFile.print("\",");
+                snapFile.print("\"morning_in\":");    snapFile.print(ts("morning_in"));    snapFile.print(",");
+                snapFile.print("\"morning_out\":");   snapFile.print(ts("morning_out"));   snapFile.print(",");
+                snapFile.print("\"afternoon_in\":");  snapFile.print(ts("afternoon_in"));  snapFile.print(",");
+                snapFile.print("\"afternoon_out\":"); snapFile.print(ts("afternoon_out")); snapFile.print(",");
+                snapFile.print("\"evening_in\":");    snapFile.print(ts("evening_in"));    snapFile.print(",");
+                snapFile.print("\"evening_out\":");   snapFile.print(ts("evening_out"));   snapFile.print(",");
+                snapFile.print("\"overtime_in\":");   snapFile.print(ts("overtime_in"));   snapFile.print(",");
+                snapFile.print("\"overtime_out\":");  snapFile.print(ts("overtime_out"));  snapFile.print(",");
+                snapFile.print("\"reg_h\":");         snapFile.print(row["regular_hours"]  | 0.0f); snapFile.print(",");
+                snapFile.print("\"ot_h\":");          snapFile.print(row["overtime_hours"] | 0.0f); snapFile.print(",");
+                snapFile.print("\"total_h\":");       snapFile.print(row["total_hours"]    | 0.0f);
+                snapFile.print("}");
+                yield();
+            }
+        }
+
+        // ── Collect seed entries ──────────────────────────────────────────────
+        if (sdReady) {
+            int seedQueueLen = 0;
+
+            for (JsonObject row : rows) {
+                String empUid = "";
+                JsonVariantConst uv = row["employee_uid"];
+                if (uv.is<int>())       empUid = String(uv.as<int>());
+                else if (uv.is<long>()) empUid = String(uv.as<long>());
+                else                    empUid = uv | "";
+
+                if (empUid.length() == 0) {
+                    SDLogger::log("Esp32Sync", SDLogger::WARN, "Skipping row — empty empUid");
+                    yield(); continue;
+                }
+
+                String empName = row["employee_name"] | "";
+                if (empName.length() == 0) {
+                    String fn = row["first_name"] | "";
+                    String ln = row["last_name"]  | "";
+                    if (fn.length() || ln.length()) {
+                        empName = fn + " " + ln;
+                        empName.trim();
+                    }
+                }
+                if (empName.length() == 0) empName = empUid;
+                String dept = row["department"] | "";
+
+                // ── DEBUG 7: Show each employee being processed ───────────────
+                SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                               "SeedCheck uid=%s name='%s' dept='%s'",
+                               empUid.c_str(), empName.c_str(), dept.c_str());
+
+                for (int ci = 0; SESSION_COLS[ci] != nullptr; ci++) {
+                    const char* col = SESSION_COLS[ci];
+
+                    // ── DEBUG 8: Show each session column value ───────────────
+                    bool colIsNull = row[col].isNull();
+                    String colVal  = colIsNull ? "(null)" : (row[col] | "(empty)");
+                    SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                                   "  col=%s  isNull=%d  val='%s'",
+                                   col, (int)colIsNull, colVal.c_str());
+
+                    if (colIsNull) { yield(); continue; }
+
+                    String rawTime = row[col] | "";
+                    if (rawTime.length() == 0 || rawTime == "null" ||
+                        rawTime == "0000-00-00 00:00:00") {
+                        SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                                       "  col=%s SKIP — empty/null rawTime", col);
+                        yield(); continue;
+                    }
+
+                    String timeOnly = rawTime;
+                    int sp = timeOnly.indexOf(' ');
+                    if (sp >= 0) timeOnly = timeOnly.substring(sp + 1);
+
+                    SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                                   "  col=%s rawTime='%s' timeOnly='%s'",
+                                   col, rawTime.c_str(), timeOnly.c_str());
+
+                    if (timeOnly.length() == 0) {
+                        SDLogger::logf("Esp32Sync", SDLogger::WARN,
+                                       "  col=%s SKIP — timeOnly empty after strip", col);
+                        yield(); continue;
+                    }
+
+                    String& existingTypes = getCsvTypes(empUid);
+                    bool alreadyInCsv = (("," + existingTypes + ",").indexOf("," + String(col) + ",") >= 0);
+
+                    SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                                   "  col=%s existingCSV='%s' alreadyIn=%d",
+                                   col, existingTypes.c_str(), (int)alreadyInCsv);
+
+                    if (alreadyInCsv) { yield(); continue; }
+
+                    if (seedQueueLen < MAX_SEED) {
+                        seedQueue[seedQueueLen++] = {empUid, String(col), timeOnly, empName, dept};
+                        SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                                       "  col=%s QUEUED for seed @ %s",
+                                       col, timeOnly.c_str());
+                    }
+                    yield();
+                }
+                yield();
+            }
+
+            SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                           "Page %d: seedQueueLen=%d", pageNum, seedQueueLen);
+
+            // ── Sort seed queue by time ───────────────────────────────────────
+            for (int i = 1; i < seedQueueLen; i++) {
+                SeedEntry e = seedQueue[i];
+                int j = i - 1;
+                while (j >= 0 && seedQueue[j].timeOnly > e.timeOnly) {
+                    seedQueue[j + 1] = seedQueue[j]; j--;
+                }
+                seedQueue[j + 1] = e;
+            }
+
+            // ── Write seed entries to SD ──────────────────────────────────────
+            for (int qi = 0; qi < seedQueueLen; qi++) {
+                const SeedEntry& e = seedQueue[qi];
+                String& existingTypes = getCsvTypes(e.empUid);
+                if (("," + existingTypes + ",").indexOf("," + e.col + ",") >= 0) {
+                    yield(); continue;
+                }
+
+                EmployeeProfile seedEmp;
+                seedEmp.uid        = e.empUid;
+                seedEmp.fullName   = e.empName;
+                seedEmp.department = e.dept;
+                seedEmp.hasData    = true;
+
+                SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                               "WRITING uid=%s col=%s time=%s name='%s'",
+                               e.empUid.c_str(), e.col.c_str(),
+                               e.timeOnly.c_str(), e.empName.c_str());
+
+                bool wrote = SDDatabase::logAttendance(e.timeOnly, "", seedEmp, e.col, "SERVER_SEED");
+
+                SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                               "WRITE result=%s uid=%s col=%s",
+                               wrote ? "OK" : "FAIL",
+                               e.empUid.c_str(), e.col.c_str());
+
+                if (wrote) {
+                    totalSeeded++;
+                    existingTypes = SDDatabase::loadAttendanceToday(e.empUid);
+                } else {
+                    SDLogger::logf("Esp32Sync", SDLogger::ERROR,
+                                   "SEED FAIL uid=%s col=%s sdReady=%d",
+                                   e.empUid.c_str(), e.col.c_str(),
+                                   (int)SDDatabase::isReady());
+                }
+                yield();
+            }
+        } else {
+            SDLogger::log("Esp32Sync", SDLogger::ERROR,
+                          "SD not ready — skipping all seed writes this page");
+        }
+
+        delete docPtr;
+        docPtr = nullptr;
+
+        SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                       "Page %d done: seeded=%d so far  heap=%u",
+                       pageNum, totalSeeded, ESP.getFreeHeap());
+
+        offset += pageCount;
+        if (pageCount < PAGE_SIZE) break;
+        if (pageNum >= 50) break;
+
+        delay(50);
+        yield();
+    }
+
+    // ── Finalise snapshot ─────────────────────────────────────────────────────
+    if (snapFile) {
+        snapFile.print("]");
+        snapFile.close();
+        SDLogger::log("Esp32Sync", SDLogger::INFO,
+                      "Snapshot saved: " + snapPath);
+    }
+
+    delete[] seedQueue;
+    delete[] seenEmpUid;
+    delete[] seenCsvTypes;
+
+    SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                   "=== DONE: pages=%d received=%d seeded=%d heap=%u ===",
+                   pageNum, totalReceived, totalSeeded, ESP.getFreeHeap());
+    Serial.printf("[Esp32Sync] Done: %d pages, %d rows received, %d seeded, heap=%u\n",
+                  pageNum, totalReceived, totalSeeded, ESP.getFreeHeap());
+    Serial.flush();
+
+    if (totalReceived == 0 && pageNum <= 1) return -1;
+    return totalSeeded;
+}
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // fetchAndSeedByEmployeeList  — SD employee-walk seeder
+    //
+    // PURPOSE:
+    //   The esp32-sync endpoint reads from daily_attendance_summary which is
+    //   populated by a server-side aggregation job.  When that job hasn't run
+    //   (or runs with stale data), all session columns are NULL → seeded=0.
+    //   This function bypasses that table entirely by:
+    //     1. Scanning /employees/*.json on SD to get all known numeric UIDs
+    //     2. For each UID, GET /api/attendance?date=X&employee_uid=Y (raw table)
+    //     3. Seeding any missing clock_type rows into the CSV
+    //
+    // CALL CONDITION:
+    //   Call this when fetchTodayAttendanceEsp32() returns 0 seeded rows AND
+    //   fetchTodayAttendance() also returned 0 (i.e. both failed to produce CSV
+    //   rows despite valid HTTP 200 responses).
+    //
+    // RETURNS: number of new CSV rows written, or -1 on fatal error.
+    // ══════════════════════════════════════════════════════════════════════════
+    int fetchAndSeedByEmployeeList(const String& date) {
+        if (date.length() < 10) {
+            SDLogger::log("EmpWalk", SDLogger::WARN, "Skipped — no valid date");
+            return 0;
+        }
+        if (!SDDatabase::isReady()) {
+            SDLogger::log("EmpWalk", SDLogger::WARN, "SD not ready");
+            return 0;
+        }
+
+        SDLogger::log("EmpWalk", SDLogger::INFO,
+                      "=== fetchAndSeedByEmployeeList START date=" + date + " ===");
+
+        // ── Step 1: Collect numeric employee UIDs from /employees/*.json ──────
+        // Employee profiles are stored as /employees/<numeric_uid>.json
+        // NFC mappings are stored as /employees/nfc_*.json — skip those.
+        // sync_meta.json is also there — skip non-numeric filenames.
+        const int MAX_UIDS = 256;
+        String* uidList = new String[MAX_UIDS];
+        if (!uidList) {
+            SDLogger::log("EmpWalk", SDLogger::ERROR, "OOM uidList");
+            return -1;
+        }
+        int uidCount = 0;
+
+        File empDir = SD_MMC.open("/employees");
+        if (empDir && empDir.isDirectory()) {
+            File entry = empDir.openNextFile();
+            while (entry && uidCount < MAX_UIDS) {
+                if (!entry.isDirectory()) {
+                    String fname = String(entry.name());
+                    // entry.name() on ESP32 SD_MMC returns just the filename, not full path
+                    // Strip path prefix if present
+                    int lastSlash = fname.lastIndexOf('/');
+                    if (lastSlash >= 0) fname = fname.substring(lastSlash + 1);
+
+                    // Must end in .json, must not start with "nfc_", must be numeric
+                    if (fname.endsWith(".json") &&
+                        !fname.startsWith("nfc_") &&
+                        fname != "sync_meta.json") {
+                        String uid = fname.substring(0, fname.length() - 5); // strip .json
+                        // Validate: all digits
+                        bool allDigits = (uid.length() > 0);
+                        for (int c = 0; c < (int)uid.length(); c++) {
+                            if (!isDigit(uid[c])) { allDigits = false; break; }
+                        }
+                        if (allDigits) {
+                            uidList[uidCount++] = uid;
+                        }
+                    }
+                }
+                entry.close();
+                entry = empDir.openNextFile();
+                yield();
+            }
+            empDir.close();
+        } else {
+            SDLogger::log("EmpWalk", SDLogger::ERROR, "Cannot open /employees dir");
+            delete[] uidList;
+            return -1;
+        }
+
+        SDLogger::logf("EmpWalk", SDLogger::INFO,
+                       "Found %d employee UIDs in SD cache", uidCount);
+        if (uidCount == 0) {
+            delete[] uidList;
+            return 0;
+        }
+
+        // ── Step 2: Per-employee seen-cache (same pattern as fetchTodayAttendance) ──
+        String* seenEmpUid   = new String[uidCount + 1];
+        String* seenCsvTypes = new String[uidCount + 1];
+        if (!seenEmpUid || !seenCsvTypes) {
+            SDLogger::log("EmpWalk", SDLogger::ERROR, "OOM seen arrays");
+            delete[] uidList;
+            delete[] seenEmpUid;
+            delete[] seenCsvTypes;
+            return -1;
+        }
+        int seenCount = 0;
+
+        auto getCsvTypes = [&](const String& empUid) -> String& {
+            for (int i = 0; i < seenCount; i++)
+                if (seenEmpUid[i] == empUid) return seenCsvTypes[i];
+            if (seenCount < uidCount) {
+                seenEmpUid[seenCount]   = empUid;
+                seenCsvTypes[seenCount] = SDDatabase::loadAttendanceToday(empUid);
+                return seenCsvTypes[seenCount++];
+            }
+            // fallback: reuse last slot
+            seenCsvTypes[uidCount] = SDDatabase::loadAttendanceToday(empUid);
+            return seenCsvTypes[uidCount];
+        };
+
+        // ── JSON filter for the per-employee attendance response ───────────────
+        // /api/attendance?date=X&employee_uid=Y returns:
+        //   { "data": { "data": [...rows...] } }  or  { "data": [...rows...] }
+        StaticJsonDocument<512> filter;
+        JsonObject rowFilter = filter["data"]["data"].createNestedArray().createNestedObject();
+        rowFilter["employee_uid"] = true;
+        rowFilter["clock_type"]   = true;
+        rowFilter["clock_time"]   = true;
+        rowFilter["id"]           = true;
+        rowFilter["first_name"]   = true;
+        rowFilter["last_name"]    = true;
+        rowFilter["employee_name"]= true;
+        rowFilter["department"]   = true;
+
+        // Also handle flat { "data": [...] } envelope
+        StaticJsonDocument<512> filterFlat;
+        JsonObject rowFilterFlat = filterFlat["data"].createNestedArray().createNestedObject();
+        rowFilterFlat["employee_uid"] = true;
+        rowFilterFlat["clock_type"]   = true;
+        rowFilterFlat["clock_time"]   = true;
+        rowFilterFlat["id"]           = true;
+        rowFilterFlat["first_name"]   = true;
+        rowFilterFlat["last_name"]    = true;
+        rowFilterFlat["employee_name"]= true;
+        rowFilterFlat["department"]   = true;
+
+        int totalSeeded  = 0;
+        int totalSkipped = 0;
+        int empProcessed = 0;
+
+        // ── Step 3: Fetch each employee's attendance ──────────────────────────
+        for (int ui = 0; ui < uidCount; ui++) {
+            const String& empUid = uidList[ui];
+
+            // Check SD first — if already fully clocked (has at least morning_in),
+            // we can skip the HTTP call for employees who've clearly tapped today.
+            // But we don't skip if they might have more records on the server.
+            // So we always check, but skip if BOTH morning_in AND morning_out exist
+            // plus afternoon pairs (i.e. a complete day). For simplicity, only skip
+            // if the server HTTP call would be redundant: check if *any* type is
+            // already in CSV — we still need to check for more.
+            // Strategy: fetch all, deduplicate on write.
+
+            String url = serverURL + "/api/attendance?date=" + date
+                         + "&employee_uid=" + empUid
+                         + "&limit=20&sort_by=clock_time&sort_order=ASC";
+
+            HTTPClient http;
+            http.setTimeout(8000);
+            http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+            http.begin(url);
+            http.addHeader("X-Client-Type", "ESP32");
+            if (authToken.length() > 0)
+                http.addHeader("Authorization", "Bearer " + authToken);
+
+            int code = http.GET();
+            if (code != 200) {
+                http.end();
+                if (code > 0) {
+                    SDLogger::logf("EmpWalk", SDLogger::WARN,
+                                   "uid=%s HTTP %d — skip", empUid.c_str(), code);
+                }
                 yield();
                 continue;
             }
 
-            // Not on SD — write it
-            EmployeeProfile seedEmp;
-            seedEmp.uid        = empUid;
-            seedEmp.fullName   = dedupName[d];
-            seedEmp.department = dedupDept[d];
-            seedEmp.hasData    = true;
+            // 6KB cap per employee: 20 rows × ~250 bytes + overhead
+            String raw = readHttpBodyReliable(http, 6144);
+            http.end();
+            yield();
 
-            bool wrote = SDDatabase::logAttendance(
-                timeOnly,       // timestamp HH:MM:SS
-                "",             // nfc_uid — not available from server records
-                seedEmp,
-                clockType,      // event_type
-                "SERVER_SEED"   // device_id — marks row as server-sourced
-            );
-
-            if (wrote) {
-                seeded++;
-                // Invalidate the SD cache entry for this employee so the next
-                // record for the same employee re-reads the updated CSV.
-                for (int i = 0; i < seenCount; i++) {
-                    if (seenEmpUid[i] == empUid) {
-                        seenCsvTypes[i] = SDDatabase::loadAttendanceToday(empUid);
-                        break;
-                    }
-                }
-                Serial.printf("[TodaySync] Seeded: %s %s @ %s\n",
-                              empUid.c_str(), clockType.c_str(), timeOnly.c_str());
+            if (raw.length() == 0) {
+                yield(); continue;
             }
 
+            // Detect & decrypt
+            bool isEncrypted = (raw.indexOf("\"encrypted\":true") >= 0) &&
+                               (raw.indexOf("\"data\":\"") >= 0);
+            String plainJson = "";
+            if (isEncrypted) {
+                int dataKeyIdx = raw.indexOf("\"data\":\"");
+                int dataStart  = dataKeyIdx + 8;
+                int dataEnd    = raw.indexOf("\"", dataStart);
+                if (dataEnd <= dataStart) { yield(); continue; }
+                String encPayload = raw.substring(dataStart, dataEnd);
+                encPayload.replace("\\/", "/");
+                raw = ""; yield();
+                plainJson = decryptor.decrypt(encPayload);
+                if (plainJson.length() == 0) { yield(); continue; }
+            } else {
+                plainJson = raw; raw = ""; yield();
+            }
+
+            // Parse — try nested envelope first, fall back to flat
+            DynamicJsonDocument* docPtr = new DynamicJsonDocument(12288);
+            if (!docPtr) { yield(); continue; }
+
+            DeserializationError err = deserializeJson(*docPtr, plainJson,
+                                                       DeserializationOption::Filter(filter));
+            JsonArray records;
+            if (!err) {
+                if ((*docPtr)["data"].is<JsonObject>() &&
+                    (*docPtr)["data"]["data"].is<JsonArray>()) {
+                    records = (*docPtr)["data"]["data"].as<JsonArray>();
+                }
+            }
+
+            // If nested parse didn't yield records, try flat envelope
+            if (records.isNull() || records.size() == 0) {
+                delete docPtr;
+                docPtr = new DynamicJsonDocument(4096);
+                if (!docPtr) { yield(); continue; }
+                err = deserializeJson(*docPtr, plainJson,
+                                      DeserializationOption::Filter(filterFlat));
+                if (!err && (*docPtr)["data"].is<JsonArray>()) {
+                    records = (*docPtr)["data"].as<JsonArray>();
+                }
+            }
+            plainJson = ""; yield();
+
+            if (records.isNull()) { delete docPtr; yield(); continue; }
+
+            int pageCount = records.size();
+            if (pageCount == 0) { delete docPtr; yield(); continue; }
+
+            empProcessed++;
+
+            // ── Write new rows to CSV ─────────────────────────────────────────
+            for (JsonObject row : records) {
+                String clockType = row["clock_type"] | "";
+                String clockTime = row["clock_time"] | "";
+                int    srvId     = row["id"]         | 0;
+
+                if (clockType.length() == 0 || clockType == "absent") {
+                    yield(); continue;
+                }
+
+                // Time-only portion
+                String timeOnly = clockTime;
+                int sp = timeOnly.indexOf(' ');
+                if (sp >= 0) timeOnly = timeOnly.substring(sp + 1);
+                if (timeOnly.length() == 0) { yield(); continue; }
+
+                // Dedup
+                String& existing = getCsvTypes(empUid);
+                if (("," + existing + ",").indexOf("," + clockType + ",") >= 0) {
+                    // Already on SD — just save server ID if missing
+                    if (srvId > 0 && SDDatabase::getServerIdForRecord(date, empUid, clockType, timeOnly) == 0) {
+                        SDDatabase::saveServerIdMapping(date, empUid, clockType, timeOnly, srvId);
+                    }
+                    totalSkipped++;
+                    yield(); continue;
+                }
+
+                // Build minimal employee profile for CSV row
+                EmployeeProfile seedEmp;
+                seedEmp.uid     = empUid;
+                seedEmp.hasData = true;
+                String fn = row["first_name"]    | "";
+                String ln = row["last_name"]     | "";
+                String en = row["employee_name"] | "";
+                if      (en.length() > 0)           seedEmp.fullName = en;
+                else if (fn.length() || ln.length()) {
+                    seedEmp.fullName = fn + " " + ln;
+                    seedEmp.fullName.trim();
+                } else {
+                    // Fall back to SD-cached name
+                    EmployeeProfile cached;
+                    if (SDDatabase::loadEmployeeProfile(empUid, cached))
+                        seedEmp.fullName   = cached.fullName;
+                    seedEmp.fullName = seedEmp.fullName.length() > 0 ? seedEmp.fullName : empUid;
+                }
+                seedEmp.department = row["department"] | "";
+                if (seedEmp.department.length() == 0) {
+                    EmployeeProfile cached;
+                    if (SDDatabase::loadEmployeeProfile(empUid, cached))
+                        seedEmp.department = cached.department;
+                }
+
+                bool wrote = SDDatabase::logAttendance(timeOnly, "", seedEmp, clockType, "SERVER_SEED");
+                if (wrote) {
+                    totalSeeded++;
+                    existing = SDDatabase::loadAttendanceToday(empUid);
+                    if (srvId > 0) {
+                        SDDatabase::saveServerIdMapping(date, empUid, clockType, timeOnly, srvId);
+                    }
+                    SDLogger::logf("EmpWalk", SDLogger::INFO,
+                                   "SEEDED uid=%s %s @ %s",
+                                   empUid.c_str(), clockType.c_str(), timeOnly.c_str());
+                } else {
+                    SDLogger::logf("EmpWalk", SDLogger::ERROR,
+                                   "WRITE FAIL uid=%s %s", empUid.c_str(), clockType.c_str());
+                }
+                yield();
+            }
+
+            delete docPtr; docPtr = nullptr;
+
+            // Brief pause every 10 employees to let TCP stack breathe
+            if ((ui % 10) == 9) { delay(100); }
             yield();
         }
 
-        Serial.printf("[TodaySync] Done: %d new rows seeded (from %d server records, %d unique slots)\n",
-                      seeded, total, dedupCount);
+        delete[] uidList;
+        delete[] seenEmpUid;
+        delete[] seenCsvTypes;
+
+        SDLogger::logf("EmpWalk", SDLogger::INFO,
+                       "=== DONE: emps_checked=%d emps_with_data=%d seeded=%d skipped=%d ===",
+                       uidCount, empProcessed, totalSeeded, totalSkipped);
+        Serial.printf("[EmpWalk] Done: %d UIDs checked, %d had data, %d seeded, %d skipped\n",
+                      uidCount, empProcessed, totalSeeded, totalSkipped);
         Serial.flush();
-        return seeded;
+        return totalSeeded;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // seedCsvFromRawAttendance
+    //
+    // PURPOSE:
+    //   Reads the snapshot JSON written by fetchTodayAttendanceEsp32()
+    //   (/attendance/esp32_YYYY-MM-DD.json) and seeds any missing clock-type
+    //   rows into the daily CSV (/attendance/YYYY-MM-DD.csv).
+    //
+    // WHY THIS EXISTS:
+    //   fetchTodayAttendanceEsp32() saves a per-employee summary JSON that holds
+    //   every session column (morning_in … overtime_out) in one object per
+    //   employee.  That JSON is the most complete attendance picture available
+    //   from the server, but it is ONLY written to the JSON snapshot — it does
+    //   NOT automatically produce CSV rows.
+    //
+    //   The CSV is what the rest of the firmware (check-in/out logic, WiFiManager
+    //   Attendance tab, hasCheckedInToday, countTodayCheckIns) reads.  If the
+    //   CSV is empty while the snapshot is populated (e.g. after a reboot, or
+    //   when the raw /api/attendance endpoint returned 0 rows but the esp32-sync
+    //   endpoint returned populated summary rows), the live display shows nothing.
+    //
+    //   seedCsvFromRawAttendance() bridges that gap by:
+    //     1. Opening the snapshot JSON for the given date.
+    //     2. Iterating every employee object {uid, name, dept, morning_in, ...}.
+    //     3. For each non-null session column, calling SDDatabase::logAttendance()
+    //        with the same dedup logic used by all other seeders (seen-cache).
+    //     4. Updating the server-ID map if the snapshot contained an "id" field.
+    //
+    // WHEN TO CALL:
+    //   After fetchTodayAttendanceEsp32() and fetchTodayAttendance() have both
+    //   been attempted and SDDatabase::countTodayCheckIns() == 0 but the snapshot
+    //   file exists.  Example from main.cpp:
+    //
+    //     int seeded = httpService.fetchTodayAttendanceEsp32(dateStr);
+    //     if (seeded <= 0)
+    //         seeded = httpService.fetchTodayAttendance(dateStr);
+    //     if (seeded <= 0)
+    //         httpService.seedCsvFromRawAttendance(dateStr);
+    //
+    // SNAPSHOT FORMAT (written by fetchTodayAttendanceEsp32):
+    //   [
+    //     {
+    //       "uid":"17", "name":"Llovelyn B. Medina", "dept":"Finance",
+    //       "morning_in":"10:43:55",  "morning_out":null,
+    //       "afternoon_in":null,      "afternoon_out":null,
+    //       "evening_in":null,        "evening_out":null,
+    //       "overtime_in":null,       "overtime_out":null,
+    //       "reg_h":0.0, "ot_h":0.0, "total_h":0.0
+    //     }, ...
+    //   ]
+    //
+    // RETURNS: number of new CSV rows written, or -1 on fatal error.
+    // ══════════════════════════════════════════════════════════════════════════
+    int seedCsvFromRawAttendance(const String& date) {
+        if (date.length() < 10) {
+            SDLogger::log("SnapSeed", SDLogger::WARN, "Skipped — no valid date");
+            return 0;
+        }
+        if (!SDDatabase::isReady()) {
+            SDLogger::log("SnapSeed", SDLogger::WARN, "SD not ready");
+            return 0;
+        }
+
+        String snapPath = "/attendance/esp32_" + date + ".json";
+        if (!SD_MMC.exists(snapPath.c_str())) {
+            SDLogger::log("SnapSeed", SDLogger::WARN,
+                          "Snapshot not found: " + snapPath);
+            return 0;
+        }
+
+        SDLogger::log("SnapSeed", SDLogger::INFO,
+                      "=== seedCsvFromRawAttendance START date=" + date
+                      + "  snap=" + snapPath + " ===");
+
+        File sf = SD_MMC.open(snapPath.c_str(), FILE_READ);
+        if (!sf || sf.size() < 3) {
+            SDLogger::log("SnapSeed", SDLogger::ERROR,
+                          "Cannot open snapshot (size=" +
+                          String(sf ? (int)sf.size() : -1) + ")");
+            if (sf) sf.close();
+            return -1;
+        }
+
+        size_t snapSz = sf.size();
+        SDLogger::logf("SnapSeed", SDLogger::INFO,
+                       "Snapshot size=%u bytes  heap=%u", (unsigned)snapSz,
+                       ESP.getFreeHeap());
+
+        // ── Parse the snapshot JSON ───────────────────────────────────────────
+        // Each employee object is ~200-250 bytes; 50 employees ≈ 12 KB raw.
+        // Allocate 2× the file size (minimum 16 KB) for the parsed doc.
+        size_t docCap = max((size_t)16384, snapSz * 2);
+       DynamicJsonDocument* snapDoc = new DynamicJsonDocument(docCap);
+        if (!snapDoc) {
+            SDLogger::logf("SnapSeed", SDLogger::ERROR,
+                        "OOM: cannot allocate %u-byte doc  heap=%u",
+                        (unsigned)docCap, ESP.getFreeHeap());
+            sf.close();
+            return -1;
+        }
+        if (!snapDoc) {
+            snapDoc = new DynamicJsonDocument(docCap);
+        }
+        if (!snapDoc) {
+            SDLogger::logf("SnapSeed", SDLogger::ERROR,
+                           "OOM: cannot allocate %u-byte doc  heap=%u",
+                           (unsigned)docCap, ESP.getFreeHeap());
+            sf.close();
+            return -1;
+        }
+
+        DeserializationError parseErr = deserializeJson(*snapDoc, sf);
+        sf.close();
+        yield();
+
+        if (parseErr) {
+            SDLogger::logf("SnapSeed", SDLogger::ERROR,
+                           "JSON parse error: %s", parseErr.c_str());
+            delete snapDoc;
+            return -1;
+        }
+
+        if (!snapDoc->is<JsonArray>()) {
+            SDLogger::log("SnapSeed", SDLogger::ERROR,
+                          "Snapshot root is not an array");
+            delete snapDoc;
+            return -1;
+        }
+
+        JsonArray empArray = snapDoc->as<JsonArray>();
+        int empCount = empArray.size();
+        SDLogger::logf("SnapSeed", SDLogger::INFO,
+                       "Snapshot has %d employee objects  doc=%u bytes",
+                       empCount, (unsigned)snapDoc->memoryUsage());
+
+        if (empCount == 0) {
+            delete snapDoc;
+            SDLogger::log("SnapSeed", SDLogger::WARN,
+                          "Snapshot array is empty — nothing to seed");
+            return 0;
+        }
+
+        // ── Columns to expand into individual CSV clock-type rows ─────────────
+        static const char* SESSION_COLS[] = {
+            "morning_in",   "morning_out",
+            "afternoon_in", "afternoon_out",
+            "evening_in",   "evening_out",
+            "overtime_in",  "overtime_out",
+            nullptr
+        };
+
+        // ── Per-employee seen-cache: avoids re-reading SD for every row ────────
+        const int MAX_SEEN = 128;
+        String* seenUid   = new String[MAX_SEEN];
+        String* seenTypes = new String[MAX_SEEN];
+        if (!seenUid || !seenTypes) {
+            SDLogger::log("SnapSeed", SDLogger::ERROR, "OOM seen arrays");
+            delete[] seenUid; delete[] seenTypes;
+            delete snapDoc;
+            return -1;
+        }
+        int seenCount = 0;
+
+        // Returns (by reference) the comma-separated clock_types already in
+        // today's CSV for empUid.  Populated lazily from SD on first access.
+        auto getCsvTypes = [&](const String& empUid) -> String& {
+            for (int i = 0; i < seenCount; i++)
+                if (seenUid[i] == empUid) return seenTypes[i];
+            if (seenCount < MAX_SEEN) {
+                seenUid[seenCount]   = empUid;
+                seenTypes[seenCount] = SDDatabase::loadAttendanceToday(empUid);
+                return seenTypes[seenCount++];
+            }
+            // Cache full — reuse the last slot
+            seenTypes[MAX_SEEN - 1] = SDDatabase::loadAttendanceToday(empUid);
+            return seenTypes[MAX_SEEN - 1];
+        };
+
+        int totalSeeded  = 0;
+        int totalSkipped = 0;
+        int totalNoTime  = 0;
+
+        // ── Iterate every employee object in the snapshot ─────────────────────
+        for (JsonObject emp : empArray) {
+            // ── Extract employee identity ─────────────────────────────────────
+            String empUid = "";
+            JsonVariantConst uv = emp["uid"];
+            if      (uv.is<int>())  empUid = String(uv.as<int>());
+            else if (uv.is<long>()) empUid = String(uv.as<long>());
+            else                    empUid = uv | "";
+            if (empUid.length() == 0) { yield(); continue; }
+
+            String empName = emp["name"] | "";
+            String dept    = emp["dept"] | "";
+
+            // Fall back to SD-cached profile if snapshot name/dept is blank
+            if (empName.length() == 0 || dept.length() == 0) {
+                EmployeeProfile cached;
+                if (SDDatabase::loadEmployeeProfile(empUid, cached)) {
+                    if (empName.length() == 0) empName = cached.fullName;
+                    if (dept.length() == 0)    dept    = cached.department;
+                }
+            }
+            if (empName.length() == 0) empName = empUid;
+
+            SDLogger::logf("SnapSeed", SDLogger::INFO,
+                           "Processing uid=%s name='%s' dept='%s'",
+                           empUid.c_str(), empName.c_str(), dept.c_str());
+
+            // ── Iterate session columns ───────────────────────────────────────
+            for (int ci = 0; SESSION_COLS[ci] != nullptr; ci++) {
+                const char* col = SESSION_COLS[ci];
+
+                // Skip nulls
+                if (emp[col].isNull()) { totalNoTime++; yield(); continue; }
+
+                String timeVal = emp[col] | "";
+                if (timeVal.length() == 0 || timeVal == "null" ||
+                    timeVal == "0000-00-00 00:00:00") {
+                    totalNoTime++;
+                    yield(); continue;
+                }
+
+                // Snapshot writer strips the date prefix so values are already
+                // "HH:MM:SS".  Handle the case where it wasn't stripped yet.
+                int spIdx = timeVal.indexOf(' ');
+                if (spIdx >= 0) timeVal = timeVal.substring(spIdx + 1);
+                if (timeVal.length() == 0) { totalNoTime++; yield(); continue; }
+
+                // ── Dedup: skip if this clock_type already exists in today's CSV
+                String& existingTypes = getCsvTypes(empUid);
+                String  needle        = "," + String(col) + ",";
+                if (("," + existingTypes + ",").indexOf(needle) >= 0) {
+                    SDLogger::logf("SnapSeed", SDLogger::INFO,
+                                   "SKIP  uid=%s %s (already in CSV)",
+                                   empUid.c_str(), col);
+                    totalSkipped++;
+                    yield(); continue;
+                }
+
+                // ── Write the row to the daily CSV ────────────────────────────
+                EmployeeProfile seedEmp;
+                seedEmp.uid        = empUid;
+                seedEmp.fullName   = empName;
+                seedEmp.department = dept;
+                seedEmp.hasData    = true;
+
+                bool wrote = SDDatabase::logAttendance(
+                    timeVal,          // timestamp  (HH:MM:SS)
+                    "",               // nfcUid     (unknown from snapshot)
+                    seedEmp,
+                    String(col),      // eventType  e.g. "morning_in"
+                    "SNAP_SEED"       // deviceId sentinel
+                );
+
+                if (wrote) {
+                    totalSeeded++;
+                    // Refresh seen-cache so subsequent columns in the same
+                    // employee object are correctly deduped without an SD read.
+                    existingTypes = SDDatabase::loadAttendanceToday(empUid);
+
+                    SDLogger::logf("SnapSeed", SDLogger::INFO,
+                                   "SEEDED uid=%s %s @ %s",
+                                   empUid.c_str(), col, timeVal.c_str());
+                } else {
+                    SDLogger::logf("SnapSeed", SDLogger::ERROR,
+                                   "WRITE FAIL uid=%s %s @ %s",
+                                   empUid.c_str(), col, timeVal.c_str());
+                }
+                yield();
+            } // end session columns
+
+            yield();
+        } // end employee loop
+
+        delete[] seenUid;
+        delete[] seenTypes;
+        delete snapDoc;
+
+        SDLogger::logf("SnapSeed", SDLogger::INFO,
+                       "=== DONE: emps=%d seeded=%d skipped=%d noTime=%d heap=%u ===",
+                       empCount, totalSeeded, totalSkipped, totalNoTime,
+                       ESP.getFreeHeap());
+        Serial.printf("[SnapSeed] Done: %d employees, %d rows seeded,"
+                      " %d skipped, %d null, heap=%u\n",
+                      empCount, totalSeeded, totalSkipped, totalNoTime,
+                      ESP.getFreeHeap());
+        Serial.flush();
+        return totalSeeded;
     }
 
     // ══════════════════════════════════════════════════════════════════════════
     // downloadAllPhotosZip
     // ══════════════════════════════════════════════════════════════════════════
-    // Downloads ALL employee profile photos in a single HTTP request as a ZIP
-    // archive from POST /api/profile/bulk/download, then extracts each JPEG
-    // directly to /photos/<uid>.jpg on the SD card.
-    //
-    // This replaces the 1-per-employee HTTP loop used previously and cuts total
-    // download time from minutes to seconds for a typical 50-employee roster.
-    //
-    // ZIP format assumed: flat archive where each entry filename is
-    //   <uid>_<FirstName>_<LastName>.jpg   (as the PHP bulk/download produces)
-    //
-    // Returns number of photos successfully saved to SD.
-    // ══════════════════════════════════════════════════════════════════════════
     int downloadAllPhotosZip(const String* uidArray, int uidCount,
                               void (*progressCb)(int cur, int total, const String& uid) = nullptr) {
         if (uidCount == 0) return 0;
 
-        // ── Build POST body: { "uids": [1, 2, ...] } ──────────────────────────
-        // Use a char buffer to avoid ArduinoJson overhead for a plain int array.
         String body = "{\"uids\":[";
         for (int i = 0; i < uidCount; i++) {
             body += uidArray[i];
@@ -1071,7 +2475,7 @@ public:
         Serial.flush();
 
         HTTPClient zipHttp;
-        zipHttp.setTimeout(60000);   // bulk download can take a while
+        zipHttp.setTimeout(60000);
         zipHttp.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
         zipHttp.begin(url);
         zipHttp.addHeader("Content-Type", "application/json");
@@ -1096,15 +2500,14 @@ public:
         Serial.printf("[ZIP] Content-Length: %d\n", zipSize);
         Serial.flush();
 
-        // ── Allocate buffer for the entire ZIP (PSRAM preferred) ──────────────
-        const int MAX_ZIP = 10 * 1024 * 1024;  // 10 MB cap
+        const int MAX_ZIP = 10 * 1024 * 1024;
         if (zipSize > MAX_ZIP) {
             Serial.printf("[ZIP] FAILED: ZIP too large (%d B)\n", zipSize);
             zipHttp.end();
             return 0;
         }
 
-        int allocSize = (zipSize > 0) ? (zipSize + 256) : 524288;  // default 512 KB
+        int allocSize = (zipSize > 0) ? (zipSize + 256) : 524288;
         uint8_t* zipBuf = nullptr;
         if (psramFound()) zipBuf = (uint8_t*)ps_malloc(allocSize);
         if (!zipBuf)      zipBuf = (uint8_t*)malloc(allocSize);
@@ -1116,7 +2519,6 @@ public:
             return 0;
         }
 
-        // ── Stream entire ZIP into buffer ─────────────────────────────────────
         WiFiClient* stream = zipHttp.getStreamPtr();
         int got = 0;
         unsigned long lastData = millis();
@@ -1153,13 +2555,12 @@ public:
         Serial.printf("[ZIP] Stream done: got=%d expected=%d\n", got, zipSize);
         Serial.flush();
 
-        if (got < 22) {  // ZIP local file header minimum
+        if (got < 22) {
             Serial.println("[ZIP] FAILED: data too short to be a ZIP");
             free(zipBuf);
             return 0;
         }
 
-        // ── Validate PK magic bytes ────────────────────────────────────────────
         if (zipBuf[0] != 0x50 || zipBuf[1] != 0x4B) {
             Serial.printf("[ZIP] FAILED: not a ZIP (magic %02X %02X). Preview: ", zipBuf[0], zipBuf[1]);
             char preview[201]; int plen = min(got, 200);
@@ -1169,34 +2570,6 @@ public:
             free(zipBuf);
             return 0;
         }
-
-        // ── Parse ZIP local file headers and extract each image ───────────────
-        // ZIP local file header layout (APPNOTE §4.3.7):
-        //   Offset  Len  Field
-        //      0     4   Signature  0x04034B50
-        //      4     2   Version needed
-        //      6     2   General purpose bit flag
-        //      8     2   Compression method  (0=stored, 8=deflate)
-        //     10     2   Last mod time
-        //     12     2   Last mod date
-        //     14     4   CRC-32
-        //     18     4   Compressed size
-        //     22     4   Uncompressed size
-        //     26     2   File name length
-        //     28     2   Extra field length
-        //     30     n   File name
-        //    30+n    m   Extra field
-        //  30+n+m   cs   File data
-        //
-        // We only support method 0 (stored) because ESP32 has no zlib decompressor
-        // in Arduino-land without an extra library.  The PHP bulk/download handler
-        // uses ZipArchive::CREATE which defaults to DEFLATE.  We therefore request
-        // the server send stored files by adding "compression_level":0 in the body.
-
-        // Re-issue the request with compression_level:0 if the first entry is compressed
-        // (i.e. method byte at offset 8 is non-zero).
-        // Actually let's re-request with level 0 upfront for reliability:
-        // (We already have the data — just check if stored; if compressed, re-fetch.)
 
         bool needRedownload = false;
         if (got >= 10) {
@@ -1209,7 +2582,6 @@ public:
         }
 
         if (needRedownload) {
-            // Re-request with explicit compression_level:0 so files are STORED
             body = "{\"uids\":[";
             for (int i = 0; i < uidCount; i++) {
                 body += uidArray[i];
@@ -1261,20 +2633,18 @@ public:
             }
         }
 
-        // ── Walk local file headers ────────────────────────────────────────────
         int saved = 0;
         int pos   = 0;
         int entry = 0;
 
         while (pos + 30 <= got) {
-            // Check local file header signature
             uint32_t sig = (uint32_t)zipBuf[pos]        |
                            ((uint32_t)zipBuf[pos + 1] << 8)  |
                            ((uint32_t)zipBuf[pos + 2] << 16) |
                            ((uint32_t)zipBuf[pos + 3] << 24);
 
-            if (sig == 0x02014B50 || sig == 0x06054B50) break;  // central dir / EOCD
-            if (sig != 0x04034B50) { pos++; continue; }          // skip non-header bytes
+            if (sig == 0x02014B50 || sig == 0x06054B50) break;
+            if (sig != 0x04034B50) { pos++; continue; }
 
             uint16_t method      = (uint16_t)zipBuf[pos +  8] | ((uint16_t)zipBuf[pos +  9] << 8);
             uint32_t compSize    = (uint32_t)zipBuf[pos + 18] | ((uint32_t)zipBuf[pos + 19] << 8)
@@ -1286,7 +2656,6 @@ public:
 
             int dataOffset = pos + 30 + fnLen + extraLen;
 
-            // Extract filename
             char fname[256] = {0};
             int  fnCopy = min((int)fnLen, 255);
             memcpy(fname, zipBuf + pos + 30, fnCopy);
@@ -1304,7 +2673,6 @@ public:
                 break;
             }
 
-            // Skip non-image files (e.g. download_summary.json)
             String fnLower = filename; fnLower.toLowerCase();
             bool isImg = fnLower.endsWith(".jpg") || fnLower.endsWith(".jpeg") ||
                          fnLower.endsWith(".png") || fnLower.endsWith(".webp") ||
@@ -1316,8 +2684,6 @@ public:
                 continue;
             }
 
-            // Extract UID: PHP names files "<uid>_FirstName_LastName.ext"
-            // So UID is everything before the first '_'.
             String uid = "";
             int underscore = filename.indexOf('_');
             if (underscore > 0) {
@@ -1335,7 +2701,6 @@ public:
 
             if (progressCb) progressCb(entry, uidCount, uid);
 
-            // Validate image magic bytes
             bool validImg = false;
             if (imgLen >= 4) {
                 if (imgData[0] == 0xFF && imgData[1] == 0xD8 && imgData[2] == 0xFF)             validImg = true;
@@ -1352,7 +2717,6 @@ public:
                 continue;
             }
 
-            // Save to SD
             if (SDDatabase::savePhoto(uid, imgData, (size_t)imgLen)) {
                 saved++;
                 Serial.printf("[ZIP] ✅ Saved uid=%s (%u bytes)\n", uid.c_str(), imgLen);
