@@ -22,7 +22,7 @@ An ESP32-S3-based NFC attendance terminal that records employee time-in/time-out
 - **Periodic Re-Seed** — Re-fetches today's attendance from the server every 5 minutes so the local CSV stays in sync with records entered elsewhere.
 - **Employee Photo Cache** — Profile photos are downloaded once and cached on the SD card for offline display on subsequent taps.
 - **NTP Time Sync** — Syncs time from `pool.ntp.org` on boot and every hour. Timezone is set to UTC+8 (Philippine Standard Time).
-- **Wi-Fi Captive Portal** — If no saved Wi-Fi credentials are found, the device broadcasts an AP (`JJC_Attendance_Config`) so credentials can be configured via browser.
+- **Wi-Fi Captive Portal** — If no saved Wi-Fi credentials are found, the device broadcasts an AP (`Attendance_Config`) so credentials can be configured via browser.
 
 ---
 
@@ -169,9 +169,6 @@ All run-time constants are defined at the top of `main.cpp`:
 
 | Constant | Default | Description |
 |---|---|---|
-| `SERVER_URL` | `https://jjcenggworks.com` | Base URL of the attendance server |
-| `AP_SSID` | `JJC_Attendance_Config` | Wi-Fi AP name for config portal |
-| `AP_PASSWORD` | `ilovejjcenggworks` | Wi-Fi AP password |
 | `NFC_POLL_INTERVAL_MS` | 150 | PN532 poll cadence (ms) |
 | `SCAN_COOLDOWN_MS` | 3500 | Same-card lockout after accepted scan |
 | `CARD_CONFIRM_NEEDED` | 2 | Consecutive matching reads before accepting |
@@ -219,19 +216,6 @@ pio device monitor
 └── attendance/
     └── YYYY-MM-DD.csv      # Daily attendance log (one row per clock event)
 ```
-
----
-
-## Server API Endpoints Used
-
-| Method | Path | Purpose |
-|---|---|---|
-| POST | `/api/attendance/nfc-auth` | Authenticate an NFC card and fetch employee profile |
-| POST | `/api/attendance/record` | Submit an attendance record |
-| GET | `/api/attendance?date=` | Fetch raw attendance rows for today |
-| GET | `/api/attendance/esp32-sync?date=` | Fetch daily summary snapshot (fast path) |
-| GET | `/api/employees` | Full or incremental employee list sync |
-| GET | `/api/socket?action=poll&since=` | Long-poll for real-time events |
 
 All responses are AES-256-CBC encrypted by the server's encryption middleware. The device handles both encrypted and plain-JSON responses transparently.
 
