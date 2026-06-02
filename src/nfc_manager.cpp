@@ -11,6 +11,25 @@ String        nfcData        = "";
 String        nfcUID         = "";
 
 // ══════════════════════════════════════════════════════════════════════════════
+// sanitizeNfcString
+// Strip ALL control characters (including \r \n \0 and other non-printables)
+// from anywhere in the string, then trim leading/trailing whitespace.
+// This is the key fix: raw NDEF bytes can include embedded nulls or CRLF that
+// survive a plain .trim() and cause server-side comparison mismatches.
+// ══════════════════════════════════════════════════════════════════════════════
+static String sanitizeNfcString(const String& s) {
+    String out = "";
+    out.reserve(s.length());
+    for (unsigned int i = 0; i < s.length(); i++) {
+        char c = s.charAt(i);
+        // Keep only printable ASCII (0x20–0x7E)
+        if (c >= 0x20 && c <= 0x7E) out += c;
+    }
+    out.trim();  // strip leading/trailing spaces that passed the above
+    return out;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // nfcInit
 // ══════════════════════════════════════════════════════════════════════════════
 bool nfcInit() {
@@ -186,11 +205,21 @@ void nfcProcessCard(uint8_t* uid, uint8_t uidLength) {
     else if (uidLength == 4) nfcData = parseMifareClassic(nfc, uid, uidLength);
     else                     nfcData = "";
 
-    nfcData.trim();
+    // FIX: sanitize strips ALL non-printable bytes (including embedded \0, \r, \n)
+    // that survive a plain .trim() and cause server-side comparison mismatches.
+    nfcData = sanitizeNfcString(nfcData);
 
     if (nfcData.length() == 0) {
         Serial.println("[NFC] No NDEF text found");
     } else {
-        Serial.println("[NFC] NDEF payload: " + nfcData);
+        Serial.println("[NFC] NDEF payload: '" + nfcData + "'");
+        // Print hex dump for debugging hidden characters
+        Serial.print("[NFC] Hex: ");
+        for (unsigned int i = 0; i < nfcData.length(); i++) {
+            char buf[4];
+            snprintf(buf, sizeof(buf), "%02X ", (uint8_t)nfcData.charAt(i));
+            Serial.print(buf);
+        }
+        Serial.println();
     }
 }

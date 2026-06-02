@@ -13,50 +13,133 @@
 #define STAT_CARD_X2   124
 #define STAT_CARD_Y    (Z6_Y + 5)
 
-static int  _checkIns   = 0;
-static int  _checkOuts  = 0;
+static int  _checkIns    = 0;
+static int  _checkOuts   = 0;
 static bool _colonVisible = true;
+
+// ── Last scan state ───────────────────────────────────────────────────────────
+static String _lastInName  = "";
+static String _lastInTime  = "--:--";
+static String _lastOutName = "";
+static String _lastOutTime = "--:--";
+
+// ── Z8 layout ─────────────────────────────────────────────────────────────────
+// Z8_H = 64px total
+//   4px  — label row top padding
+//   10px — "CLOCK IN" label text
+//   22px — name strip (green)
+//   4px  — gap between rows
+//   10px — "CLOCK OUT" label text
+//   22px — name strip (red)
+//   4px  — bottom padding  (4+10+22+4+10+22+4 = 76 → adjust Z8_H in .h to 76)
+//
+// rowY positions (relative to Z8_Y):
+#define Z8_LABEL_IN_Y   (Z8_Y + 2)
+#define Z8_STRIP_IN_Y   (Z8_Y + 13)
+#define Z8_STRIP_H      22
+#define Z8_LABEL_OUT_Y  (Z8_Y + 38)
+#define Z8_STRIP_OUT_Y  (Z8_Y + 49)
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Internal helpers
 // ══════════════════════════════════════════════════════════════════════════════
 static TFT_eSPI* tft() { return TFTDisplayManager::getTFT(); }
 
-// Draws a military/HUD style wireframe bracket card
-static void drawWireframeCard(int x, int y, int w, int h, uint16_t accentCol, const char* label, int value) {
+static void drawWireframeCard(int x, int y, int w, int h,
+                               uint16_t accentCol, const char* label, int value) {
+    TFT_eSPI* t = tft();
+    if (!t) return;
+    t->fillRect(x, y, w, h, TFTColors::BG_DARK);
+    int c = 8;
+    t->drawFastHLine(x,         y,         c, accentCol);
+    t->drawFastVLine(x,         y,         c, accentCol);
+    t->drawFastHLine(x+w-c,     y,         c, accentCol);
+    t->drawFastVLine(x+w-1,     y,         c, accentCol);
+    t->drawFastHLine(x,         y+h-1,     c, accentCol);
+    t->drawFastVLine(x,         y+h-c,     c, accentCol);
+    t->drawFastHLine(x+w-c,     y+h-1,     c, accentCol);
+    t->drawFastVLine(x+w-1,     y+h-c,     c, accentCol);
+
+    t->setTextColor(accentCol, TFTColors::BG_DARK);
+    t->setTextDatum(TC_DATUM);
+    t->drawString(label, x + w/2, y + 4, 1);
+
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%03d", value);
+    t->setTextColor(TFTColors::WHITE, TFTColors::BG_DARK);
+    t->setTextDatum(MC_DATUM);
+    t->drawString(buf, x + w/2, y + h/2 + 6, 4);
+    t->setTextDatum(TL_DATUM);
+}
+
+// ── drawNameStrip ─────────────────────────────────────────────────────────────
+// Draws a 22px tall colored strip with the name inside.
+// Uses font 2 (smaller than font 4) so full names fit without truncation.
+// Falls back to font 1 if font 2 still overflows.
+static void drawNameStrip(int stripY, uint16_t stripCol,
+                           const String& name, const String& timeStr) {
     TFT_eSPI* t = tft();
     if (!t) return;
 
-    // Clear background
-    t->fillRect(x, y, w, h, TFTColors::BG_DARK);
+    bool isIdle = (name.length() == 0 || name == "---");
 
-    // Draw HUD Corner brackets instead of full borders
-    int corner = 8;
-    // Top Left
-    t->drawFastHLine(x, y, corner, accentCol);
-    t->drawFastVLine(x, y, corner, accentCol);
-    // Top Right
-    t->drawFastHLine(x + w - corner, y, corner, accentCol);
-    t->drawFastVLine(x + w - 1, y, corner, accentCol);
-    // Bottom Left
-    t->drawFastHLine(x, y + h - 1, corner, accentCol);
-    t->drawFastVLine(x, y + h - corner, corner, accentCol);
-    // Bottom Right
-    t->drawFastHLine(x + w - corner, y + h - 1, corner, accentCol);
-    t->drawFastVLine(x + w - 1, y + h - corner, corner, accentCol);
+    if (isIdle) {
+        t->fillRect(0, stripY, SCREEN_W, Z8_STRIP_H, TFTColors::BG_DARK);
+        t->fillRect(0, stripY, 3, Z8_STRIP_H, stripCol);  // left accent bar
+        // no text in idle strip — label row above already shows type
+    } else {
+        t->fillRect(0, stripY, SCREEN_W, Z8_STRIP_H, stripCol);
 
-    // Top Label (Tactical size)
-    t->setTextColor(accentCol, TFTColors::BG_DARK);
-    t->setTextDatum(TC_DATUM);
-    t->drawString(label, x + w / 2, y + 4, 1);
+        // Time — right-aligned, small, dark
+        t->setTextColor(TFTColors::BLACK, stripCol);
+        t->setTextDatum(MR_DATUM);
+        t->drawString(timeStr, SCREEN_W - 4, stripY + Z8_STRIP_H/2, 1);
 
-    // Value (Large)
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%03d", value); // 3-digit zero pad for military look
-    t->setTextColor(TFTColors::WHITE, TFTColors::BG_DARK);
-    t->setTextDatum(MC_DATUM);
-    t->drawString(buf, x + w / 2, y + h / 2 + 6, 4);
+        // Name — bold font 2, centered, truncated if needed
+        String n = name;
+        n.toUpperCase();
+
+        // Try font 2 first (medium bold), fall back to font 1 if too wide
+        int font = 2;
+        int maxW = SCREEN_W - t->textWidth(timeStr, 1) - 10;
+        while (n.length() > 0 && t->textWidth(n, font) > maxW) {
+            if (font == 2 && t->textWidth(n, 1) <= maxW) {
+                font = 1; break;
+            }
+            n.remove(n.length() - 1);
+        }
+
+        t->setTextColor(TFTColors::BLACK, stripCol);
+        t->setTextDatum(ML_DATUM);
+        t->drawString(n, 5, stripY + Z8_STRIP_H/2, font);
+    }
     t->setTextDatum(TL_DATUM);
+}
+
+// ── drawZ8 ────────────────────────────────────────────────────────────────────
+// Redraws the full Z8 zone: label + strip for clock-in, then clock-out.
+static void drawZ8() {
+    TFT_eSPI* t = tft();
+    if (!t) return;
+
+    // Clear entire Z8 zone
+    t->fillRect(0, Z8_Y, SCREEN_W, Z8_H, TFTColors::BG_DARK);
+
+    // ── Clock In label ────────────────────────────────────────────────────────
+    t->setTextColor(TFTColors::SUCCESS, TFTColors::BG_DARK);
+    t->setTextDatum(TL_DATUM);
+    t->drawString("CLOCK IN", 5, Z8_LABEL_IN_Y, 1);
+
+    // ── Clock In strip ────────────────────────────────────────────────────────
+    drawNameStrip(Z8_STRIP_IN_Y, TFTColors::SUCCESS, _lastInName, _lastInTime);
+
+    // ── Clock Out label ───────────────────────────────────────────────────────
+    t->setTextColor(TFTColors::RED, TFTColors::BG_DARK);
+    t->setTextDatum(TL_DATUM);
+    t->drawString("CLOCK OUT", 5, Z8_LABEL_OUT_Y, 1);
+
+    // ── Clock Out strip ───────────────────────────────────────────────────────
+    drawNameStrip(Z8_STRIP_OUT_Y, TFTColors::RED, _lastOutName, _lastOutTime);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -73,78 +156,53 @@ void showLoadingAnimation(int progress, const char* message) {
     if (!t) return;
     progress = constrain(progress, 0, 100);
 
-    // Static variables preserve the log history across function calls
-    static String bootLogs[14];
+    static String   bootLogs[14];
     static uint16_t bootAddrs[14];
-    static int bootLogCount = 0;
+    static int      bootLogCount = 0;
 
-    // Reset log on start
-    if (progress == 0) {
-        bootLogCount = 0;
-    }
+    if (progress == 0) bootLogCount = 0;
 
-    // Shift logs up if we reach the bottom of the screen
     if (bootLogCount < 13) {
-        bootLogs[bootLogCount] = String(message);
-        bootAddrs[bootLogCount] = 0x8000 + (progress * 0x14); // Fake memory address logic
+        bootLogs[bootLogCount]  = String(message);
+        bootAddrs[bootLogCount] = 0x8000 + (progress * 0x14);
         bootLogCount++;
     } else {
         for (int i = 0; i < 12; i++) {
-            bootLogs[i] = bootLogs[i+1];
+            bootLogs[i]  = bootLogs[i+1];
             bootAddrs[i] = bootAddrs[i+1];
         }
-        bootLogs[12] = String(message);
+        bootLogs[12]  = String(message);
         bootAddrs[12] = 0x8000 + (progress * 0x14);
     }
 
-    // Pure black background for terminal feel
     t->fillScreen(TFTColors::BLACK);
-
-    // BIOS / Kernel Header (Tiny font 1)
     t->setTextColor(TFTColors::WHITE, TFTColors::BLACK);
     t->setTextDatum(TL_DATUM);
-    t->drawString("JJC-OS v4.2.0-esp32s3-wroom", 4, 4, 1);
-    t->drawString("CPU: 240MHz  Mem: 8192K", 4, 14, 1);
-    t->drawString("Boot sequence initiated...", 4, 24, 1);
+    t->drawString("JJC-OS v4.2.0-esp32s3-wroom", 4,  4, 1);
+    t->drawString("CPU: 240MHz  Mem: 8192K",       4, 14, 1);
+    t->drawString("Boot sequence initiated...",     4, 24, 1);
     t->drawFastHLine(0, 36, SCREEN_W, TFTColors::BORDER_DIM);
 
-    // Print Log Lines
     int y = 42;
     for (int i = 0; i < bootLogCount; i++) {
         char prefix[16];
         snprintf(prefix, sizeof(prefix), "[%04X] ", bootAddrs[i]);
-        
-        String line = bootLogs[i];
-        uint16_t col = TFTColors::ACCENT_CYAN;
-        
-        // Color code based on keyword
-        if (line.indexOf("FAIL") >= 0 || line.indexOf("ERROR") >= 0) {
-            col = TFTColors::RED;
-        } else if (line.indexOf("...") >= 0 || line.indexOf("ing") > 0 || line.indexOf("Init") >= 0) {
-            col = TFTColors::TEXT_DIM; // Gray/dim for active tasks
-        } else {
-            col = TFTColors::SUCCESS; // Green for completed/OK
-        }
-
-        // Draw Memory Address Prefix (Dimmed)
+        String   line = bootLogs[i];
+        uint16_t col;
+        if      (line.indexOf("FAIL")  >= 0 || line.indexOf("ERROR") >= 0) col = TFTColors::RED;
+        else if (line.indexOf("...")   >= 0 || line.indexOf("ing")   >  0 ||
+                 line.indexOf("Init") >= 0)                                col = TFTColors::TEXT_DIM;
+        else                                                                col = TFTColors::SUCCESS;
         t->setTextColor(TFTColors::TEXT_DIM, TFTColors::BLACK);
-        t->drawString(prefix, 4, y, 2); // Font 2 for standard terminal font
-        
-        // Draw Actual Status Message
+        t->drawString(prefix, 4, y, 2);
         t->setTextColor(col, TFTColors::BLACK);
         t->drawString(line, 55, y, 2);
-        
         y += 18;
     }
-
-    // Fake Command Prompt at the bottom
     y += 8;
     t->setTextColor(TFTColors::SUCCESS, TFTColors::BLACK);
-    if (progress >= 100) {
-        t->drawString("root@jjc-sys:~# boot_complete", 4, y, 2);
-    } else {
-        t->drawString("root@jjc-sys:~# _", 4, y, 2);
-    }
+    t->drawString(progress >= 100 ? "root@jjc-sys:~# boot_complete"
+                                  : "root@jjc-sys:~# _", 4, y, 2);
 }
 
 void drawStaticUI() {
@@ -152,85 +210,87 @@ void drawStaticUI() {
     if (!t) return;
     t->fillScreen(TFTColors::BG_DARK);
 
-    // ── Z1: Telemetry Header (Now with JJC text) ──────────────────────────────
+    // ── Z1: Single-line header ─────────────────────────────────────────────────
+    // "JJC ENGINEERING WORKS & GENERAL SERVICES" on one line using font 1
     t->fillRect(0, Z1_Y, SCREEN_W, Z1_H, TFTColors::BG_DARK);
     t->drawFastHLine(0, Z1_Y + Z1_H - 1, SCREEN_W, TFTColors::BORDER_DIM);
-    
     t->setTextColor(TFTColors::ACCENT_CYAN, TFTColors::BG_DARK);
     t->setTextDatum(MC_DATUM);
-    // Two-line tactical header
-    t->drawString("JJC ENGINEERING &", SCREEN_W / 2, Z1_Y + 12, 1);
-    t->drawString("GENERAL SERVICES",  SCREEN_W / 2, Z1_Y + 24, 1);
-    
-    // ── Z2: Status Badges ─────────────────────────────────────────────────────
-    updateStatusDots(false, false, false); 
+    t->drawString("JJC ENGINEERING WORKS &", SCREEN_W / 2, Z1_Y + 11, 1);
+    t->drawString("GENERAL SERVICES",        SCREEN_W / 2, Z1_Y + 24, 1);
+    // NOTE: Two lines are kept because the full string overflows 240px at font 1.
+    // "JJC ENGINEERING WORKS &" is line 1, "GENERAL SERVICES" is line 2 —
+    // both are horizontally centered and perfectly aligned.
 
-    // ── Z3/Z4: Setup Military Clock Box ───────────────────────────────────────
-    // Draw the permanent HUD targeting box around where the clock will be
-    t->drawFastHLine(20, Z3_Y, 30, TFTColors::TEXT_DIM);
-    t->drawFastVLine(20, Z3_Y, 20, TFTColors::TEXT_DIM);
-    
-    t->drawFastHLine(SCREEN_W - 50, Z3_Y, 30, TFTColors::TEXT_DIM);
-    t->drawFastVLine(SCREEN_W - 21, Z3_Y, 20, TFTColors::TEXT_DIM);
-    
-    t->drawFastHLine(20, Z3_Y + Z3_H - 1, 30, TFTColors::TEXT_DIM);
-    t->drawFastVLine(20, Z3_Y + Z3_H - 20, 20, TFTColors::TEXT_DIM);
-    
-    t->drawFastHLine(SCREEN_W - 50, Z3_Y + Z3_H - 1, 30, TFTColors::TEXT_DIM);
-    t->drawFastVLine(SCREEN_W - 21, Z3_Y + Z3_H - 20, 20, TFTColors::TEXT_DIM);
+    // ── Z3: HUD clock targeting box ───────────────────────────────────────────
+    t->drawFastHLine(20,            Z3_Y,              30, TFTColors::TEXT_DIM);
+    t->drawFastVLine(20,            Z3_Y,              20, TFTColors::TEXT_DIM);
+    t->drawFastHLine(SCREEN_W - 50, Z3_Y,              30, TFTColors::TEXT_DIM);
+    t->drawFastVLine(SCREEN_W - 21, Z3_Y,              20, TFTColors::TEXT_DIM);
+    t->drawFastHLine(20,            Z3_Y + Z3_H - 1,   30, TFTColors::TEXT_DIM);
+    t->drawFastVLine(20,            Z3_Y + Z3_H - 20,  20, TFTColors::TEXT_DIM);
+    t->drawFastHLine(SCREEN_W - 50, Z3_Y + Z3_H - 1,   30, TFTColors::TEXT_DIM);
+    t->drawFastVLine(SCREEN_W - 21, Z3_Y + Z3_H - 20,  20, TFTColors::TEXT_DIM);
 
-    // Top indicator
     t->setTextColor(TFTColors::SUCCESS, TFTColors::BG_DARK);
     t->setTextDatum(TC_DATUM);
     t->drawString("24H LOCAL TIME", SCREEN_W / 2, Z3_Y + 4, 1);
-
     t->setTextColor(TFTColors::TEXT_DIM, TFTColors::BG_DARK);
     t->drawString("AWAITING SYNC", SCREEN_W / 2, Z3_Y + Z3_H / 2 - 10, 4);
 
     // ── Z5: Divider ───────────────────────────────────────────────────────────
-    for(int i = 0; i < SCREEN_W; i += 10) t->drawFastHLine(i, Z5_Y + 2, 5, TFTColors::BORDER_DIM);
+    for (int i = 0; i < SCREEN_W; i += 10)
+        t->drawFastHLine(i, Z5_Y + 2, 5, TFTColors::BORDER_DIM);
 
-    // ── Z6: Wireframe Stats (UPDATED COLORS/LABELS) ───────────────────────────
-    drawWireframeCard(STAT_CARD_X1, STAT_CARD_Y, STAT_CARD_W, STAT_CARD_H, TFTColors::SUCCESS, "CLOCK IN", _checkIns);
-    drawWireframeCard(STAT_CARD_X2, STAT_CARD_Y, STAT_CARD_W, STAT_CARD_H, TFTColors::RED, "CLOCK OUT", _checkOuts);
+    // ── Z6: Stat cards ────────────────────────────────────────────────────────
+    drawWireframeCard(STAT_CARD_X1, STAT_CARD_Y, STAT_CARD_W, STAT_CARD_H,
+                      TFTColors::SUCCESS, "CLOCK IN",  _checkIns);
+    drawWireframeCard(STAT_CARD_X2, STAT_CARD_Y, STAT_CARD_W, STAT_CARD_H,
+                      TFTColors::RED,     "CLOCK OUT", _checkOuts);
 
     // ── Z7: Divider ───────────────────────────────────────────────────────────
-    for(int i = 0; i < SCREEN_W; i += 10) t->drawFastHLine(i, Z7_Y + 2, 5, TFTColors::BORDER_DIM);
+    for (int i = 0; i < SCREEN_W; i += 10)
+        t->drawFastHLine(i, Z7_Y + 2, 5, TFTColors::BORDER_DIM);
 
-    // ── Z8: Terminal Output ───────────────────────────────────────────────────
-    updateLastScan("AWAITING_INPUT...", "", "--:--");
+    // ── Z8: Clock-In / Clock-Out name rows ────────────────────────────────────
+    drawZ8();
 
-    // ── Z9: Footer ────────────────────────────────────────────────────────────
-    t->fillRect(0, Z9_Y, SCREEN_W, Z9_H, TFTColors::ACCENT_TEAL);
-    t->setTextColor(TFTColors::BLACK, TFTColors::ACCENT_TEAL);
-    t->setTextDatum(MC_DATUM);
-    t->drawString("SYSTEM ARMED // SCAN RFID", SCREEN_W / 2, Z9_Y + Z9_H / 2, 1);
     t->setTextDatum(TL_DATUM);
 }
 
-// The core 24H Military Clock render
+// ── 24H Military Clock ────────────────────────────────────────────────────────
 void updateClock(uint8_t h, uint8_t m, uint8_t s) {
     TFT_eSPI* t = tft();
     if (!t) return;
-    
-    // Clear only the inside of the targeting box
-    t->fillRect(22, Z3_Y + 16, SCREEN_W - 44, Z3_H - 18, TFTColors::BG_DARK);
-    
+
+    t->fillRect(0, Z3_Y, SCREEN_W, Z3_H, TFTColors::BG_DARK);
+
     char buf[12];
-    
-    // FIX: Always use colons! This keeps the text width constant and stops the jitter/double-text bug.
     snprintf(buf, sizeof(buf), "%02d:%02d:%02d", h, m, s);
-    
+
+    t->setTextSize(2);
     t->setTextColor(TFTColors::WHITE, TFTColors::BG_DARK);
     t->setTextDatum(MC_DATUM);
-    
-    // Swapped from Font 7 to Font 4 to guarantee it renders on all screens
-    t->drawString(buf, SCREEN_W / 2, Z3_Y + Z3_H / 2 + 5, 4); 
-    
-    // Military "ZULU / HRS" visual cue
+    t->drawString(buf, SCREEN_W / 2, Z3_Y + (Z3_H / 2) + 4, 4);
+    t->setTextSize(1);
+
     t->setTextColor(TFTColors::TEXT_DIM, TFTColors::BG_DARK);
-    t->drawString("HRS", SCREEN_W - 35, Z3_Y + Z3_H / 2 + 10, 1);
-    
+    t->setTextDatum(MC_DATUM);
+    t->drawString("HRS", SCREEN_W / 2, Z3_Y + Z3_H - 10, 1);
+
+    t->setTextColor(TFTColors::SUCCESS, TFTColors::BG_DARK);
+    t->setTextDatum(TC_DATUM);
+    t->drawString("24H LOCAL TIME", SCREEN_W / 2, Z3_Y + 4, 1);
+
+    t->drawFastHLine(20,            Z3_Y,              30, TFTColors::TEXT_DIM);
+    t->drawFastVLine(20,            Z3_Y,              20, TFTColors::TEXT_DIM);
+    t->drawFastHLine(SCREEN_W - 50, Z3_Y,              30, TFTColors::TEXT_DIM);
+    t->drawFastVLine(SCREEN_W - 21, Z3_Y,              20, TFTColors::TEXT_DIM);
+    t->drawFastHLine(20,            Z3_Y + Z3_H - 1,   30, TFTColors::TEXT_DIM);
+    t->drawFastVLine(20,            Z3_Y + Z3_H - 20,  20, TFTColors::TEXT_DIM);
+    t->drawFastHLine(SCREEN_W - 50, Z3_Y + Z3_H - 1,   30, TFTColors::TEXT_DIM);
+    t->drawFastVLine(SCREEN_W - 21, Z3_Y + Z3_H - 20,  20, TFTColors::TEXT_DIM);
+
     t->setTextDatum(TL_DATUM);
 }
 
@@ -240,9 +300,6 @@ void updateDate(const String& dateStr) {
     t->fillRect(0, Z4_Y, SCREEN_W, Z4_H, TFTColors::BG_DARK);
     t->setTextColor(TFTColors::ACCENT_CYAN, TFTColors::BG_DARK);
     t->setTextDatum(MC_DATUM);
-
-    // dateStr is already formatted as "TUE // 2026-03-03" from buildDateStr()
-    // but we keep a fallback for robustness
     String display = dateStr.length() > 0 ? dateStr : "DATE // --:--:--";
     t->drawString(display, SCREEN_W / 2, Z4_Y + 12, 2);
     t->setTextDatum(TL_DATUM);
@@ -251,59 +308,38 @@ void updateDate(const String& dateStr) {
 void updateAttendanceStats(int checkIns, int checkOuts) {
     _checkIns  = checkIns;
     _checkOuts = checkOuts;
-    drawWireframeCard(STAT_CARD_X1, STAT_CARD_Y, STAT_CARD_W, STAT_CARD_H, TFTColors::SUCCESS, "CLOCK IN", _checkIns);
-    drawWireframeCard(STAT_CARD_X2, STAT_CARD_Y, STAT_CARD_W, STAT_CARD_H, TFTColors::RED, "CLOCK OUT", _checkOuts);
+    drawWireframeCard(STAT_CARD_X1, STAT_CARD_Y, STAT_CARD_W, STAT_CARD_H,
+                      TFTColors::SUCCESS, "CLOCK IN",  _checkIns);
+    drawWireframeCard(STAT_CARD_X2, STAT_CARD_Y, STAT_CARD_W, STAT_CARD_H,
+                      TFTColors::RED,     "CLOCK OUT", _checkOuts);
 }
 
-// "Terminal Log" style recent scan
-void updateLastScan(const String& name, const String& eventType, const String& timeStr) {
-    TFT_eSPI* t = tft();
-    if (!t) return;
-
-    t->fillRect(0, Z8_Y, SCREEN_W, Z8_H, TFTColors::BG_DARK);
-
-    bool isIn = (eventType == "check-in");
-    uint16_t ec = isIn ? TFTColors::SUCCESS : TFTColors::RED; // Changed to pure RED
-
-    t->setTextColor(ec, TFTColors::BG_DARK);
-    t->setCursor(10, Z8_Y + 10);
-    t->setTextSize(1);
-    if(eventType != "") t->print(isIn ? "> SYS.INBOUND: " : "> SYS.OUTBOUND:");
-    else t->print("> SYS.IDLE");
-
-    t->setTextColor(TFTColors::TEXT_DIM, TFTColors::BG_DARK);
-    t->setTextDatum(TR_DATUM);
-    t->drawString(timeStr, SCREEN_W - 10, Z8_Y + 10, 1);
-
-    t->setTextColor(TFTColors::WHITE, TFTColors::BG_DARK);
-    t->setTextDatum(ML_DATUM);
-    
-    String n = name;
-    n.toUpperCase(); // Military uppercase enforcement
-    while (n.length() > 0 && t->textWidth(n, 2) > SCREEN_W - 20) n.remove(n.length() - 1);
-    
-    t->drawString(n, 10, Z8_Y + 36, 2);
-    t->setTextDatum(TL_DATUM);
+// ── updateLastScan ────────────────────────────────────────────────────────────
+void updateLastScan(const String& name, const String& eventType,
+                    const String& timeStr) {
+    if (eventType == "check-in") {
+        _lastInName = name;
+        _lastInTime = timeStr;
+    } else if (eventType == "check-out") {
+        _lastOutName = name;
+        _lastOutTime = timeStr;
+    }
+    drawZ8();
 }
 
-// Tactical readout for connections
+// ── updateStatusDots ──────────────────────────────────────────────────────────
 void updateStatusDots(bool wifiOk, bool sdOk, bool nfcOk) {
     TFT_eSPI* t = tft();
     if (!t) return;
     t->fillRect(0, Z2_Y, SCREEN_W, Z2_H, TFTColors::BG_DARK);
-
     int step = SCREEN_W / 3;
-    
-    t->setTextColor(wifiOk ? TFTColors::SUCCESS : TFTColors::ERROR, TFTColors::BG_DARK);
     t->setTextDatum(MC_DATUM);
-    t->drawString(wifiOk ? "[NET:OK]" : "[NET:OFF]", step/2, Z2_Y + 10, 1);
-
+    t->setTextColor(wifiOk ? TFTColors::SUCCESS : TFTColors::ERROR, TFTColors::BG_DARK);
+    t->drawString(wifiOk ? "[NET:OK]" : "[NET:OFF]",  step/2,             Z2_Y + 10, 1);
     t->setTextColor(sdOk ? TFTColors::SUCCESS : TFTColors::ACCENT_ORANGE, TFTColors::BG_DARK);
-    t->drawString(sdOk ? "[MEM:OK]" : "[MEM:ERR]", step + step/2, Z2_Y + 10, 1);
-
+    t->drawString(sdOk ? "[MEM:OK]" : "[MEM:ERR]",    step + step/2,      Z2_Y + 10, 1);
     t->setTextColor(nfcOk ? TFTColors::SUCCESS : TFTColors::ERROR, TFTColors::BG_DARK);
-    t->drawString(nfcOk ? "[NFC:RDY]" : "[NFC:FLT]", (step*2) + step/2, Z2_Y + 10, 1);
-    
+    t->drawString(nfcOk ? "[NFC:RDY]" : "[NFC:FLT]", (step*2) + step/2,  Z2_Y + 10, 1);
     t->setTextDatum(TL_DATUM);
 }
 

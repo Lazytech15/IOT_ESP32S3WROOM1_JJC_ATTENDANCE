@@ -23,7 +23,9 @@
 #include <Arduino.h>
 #include <WebServer.h>
 #include <WiFi.h>
-#include <SD_MMC.h>
+#include <SD_MMC.h> 
+#include <SPI.h>
+#include <SD.h>
 #include <ArduinoJson.h>
 #include "WiFiConfig.h"
 #include "sd_database.h"
@@ -528,12 +530,12 @@ browseDir();
     // TAB 2 — ATTENDANCE LOG  (Rich row editor + server sync)
     // ════════════════════════════════════════════════════════════════════════
     void _handleAttendance() {
-        struct tm ti = {}; getLocalTime(&ti, 0);
-        char todayLabel[32];
-        strftime(todayLabel, sizeof(todayLabel), "Today (%a %b %d, %Y)", &ti);
-
-        String html = _head("Attendance", 2);
-        html += R"HTML(
+    struct tm ti = {}; getLocalTime(&ti, 0);
+    char todayLabel[32];
+    strftime(todayLabel, sizeof(todayLabel), "Today (%a %b %d, %Y)", &ti);
+ 
+    String html = _head("Attendance", 2);
+    html += R"HTML(
 <div class="card">
   <div class="card-title">Attendance Log</div>
   <div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:center">
@@ -541,10 +543,23 @@ browseDir();
     <a id="dlCsvBtn" href="#" class="btn btn-primary btn-sm" download="attendance.csv">Download CSV</a>
     <button class="btn btn-ghost btn-sm" onclick="openEditor()">&#9998; Edit Raw Log</button>
   </div>
+ 
+  <!-- Search + result count row -->
+  <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+    <div style="position:relative;flex:1;min-width:180px">
+      <span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:#64748b;font-size:.85rem;pointer-events:none">&#128269;</span>
+      <input id="searchInput" type="text" placeholder="Search name, dept, time, type…"
+        style="padding-left:32px;width:100%"
+        oninput="applyFilters()">
+    </div>
+    <span id="recordCount" style="font-size:.75rem;color:#64748b;white-space:nowrap"></span>
+    <button class="btn btn-ghost btn-sm" onclick="clearSearch()" title="Clear search">&#10005;</button>
+  </div>
+ 
   <div id="dateLabel" style="font-size:.78rem;color:#64748b;margin-bottom:10px"></div>
   <div id="tableArea"><p style="color:#64748b;font-size:.82rem">Loading...</p></div>
 </div>
-
+ 
 <!-- ── Row Editor Modal ── -->
 <div id="editorModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:999;overflow-y:auto;padding:20px">
   <div style="max-width:800px;margin:0 auto;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px">
@@ -566,8 +581,13 @@ browseDir();
     </div>
   </div>
 </div>
-
+ 
 <style>
+/* Sort header */
+.th-sort{cursor:pointer;user-select:none;white-space:nowrap}
+.th-sort:hover{color:var(--text)}
+.sort-arrow{margin-left:4px;font-size:.65rem;color:var(--teal)}
+ 
 .erow{background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:8px;
   padding:12px;margin-bottom:10px;position:relative}
 .erow:hover{border-color:var(--teal)}
@@ -588,14 +608,34 @@ browseDir();
 .badge-morning_in,.badge-afternoon_in,.badge-evening_in{background:rgba(34,211,238,.15);color:#22d3ee}
 .badge-morning_out,.badge-afternoon_out,.badge-evening_out{background:rgba(249,115,22,.15);color:#f97316}
 </style>
-
+ 
 <script>
 var currentFile = '';
 var currentDate = '';
 var _editorRows = [];
-var _serverIds  = [];  // parallel to _editorRows: server DB id for each row, 0 if unknown
-
-// ── SSE live-refresh: auto-reload when a scan or reseed arrives ──
+var _serverIds  = [];
+ 
+// ── Sort state ────────────────────────────────────────────────────────────────
+// Columns (indices into the rendered display row):
+//   0=Date  1=timestamp  2=nfc_uid  3=employee_uid  4=employee_name(last,first)
+//   5=department  6=event_type  7=device_id
+var _sortCol = 4;   // default: sort by name (last, first)
+var _sortAsc = true;
+ 
+// ── Parsed rows cache (set after loadCsv succeeds) ────────────────────────────
+var _allDisplayRows = [];  // [{origIdx, date, cells:[...], nameSortKey}]
+ 
+// ── Helper: "John David Andrade" → "Andrade, John David" ─────────────────────
+function toLastFirst(fullName) {
+  if (!fullName) return '';
+  var parts = fullName.trim().split(/\s+/);
+  if (parts.length === 1) return parts[0];
+  var last  = parts[parts.length - 1];
+  var first = parts.slice(0, parts.length - 1).join(' ');
+  return last + ', ' + first;
+}
+ 
+// ── SSE live-refresh ──────────────────────────────────────────────────────────
 (function(){
   var _sseAtt = new EventSource('/api/events');
   var _refreshTimer = null;
@@ -610,7 +650,7 @@ var _serverIds  = [];  // parallel to _editorRows: server DB id for each row, 0 
   _sseAtt.addEventListener('stats', function(){ _scheduleRefresh(); });
   _sseAtt.onerror = function(){ /* silent reconnect */ };
 })();
-
+ 
 fetch('/api/attendance/dates').then(r=>r.json()).then(function(d){
   var sel = document.getElementById('dateSelect');
   sel.innerHTML = '';
@@ -626,9 +666,9 @@ fetch('/api/attendance/dates').then(r=>r.json()).then(function(d){
   });
   loadCsv('today');
 });
-
+ 
 var _autoRetryTimer = null;
-
+ 
 function loadCsv(val){
   currentFile = (val==='today') ? '__today__' : '/attendance/'+val;
   var url = '/api/attendance?f='+encodeURIComponent(val);
@@ -636,8 +676,7 @@ function loadCsv(val){
   var sel = document.getElementById('dateSelect');
   var selText = sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].textContent : '';
   document.getElementById('dateLabel').textContent = selText ? ('Showing records for: '+selText) : '';
-
-  // Show spinner while fetching
+ 
   document.getElementById('tableArea').innerHTML =
     '<div style="display:flex;align-items:center;gap:10px;padding:12px 0;color:#64748b;font-size:.82rem">'
     +'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#22d3ee" stroke-width="2"'
@@ -645,21 +684,17 @@ function loadCsv(val){
     +'<path d="M12 2a10 10 0 0 1 10 10"/></svg>'
     +'Fetching attendance data...</div>'
     +'<style>@keyframes spin{to{transform:rotate(360deg)}}</style>';
-
+ 
   fetch(url).then(r=>r.json()).then(function(d){
-    // Cancel any pending auto-retry (previous empty-state timer)
     if(_autoRetryTimer){ clearTimeout(_autoRetryTimer); _autoRetryTimer=null; }
-
-    // If ESP32 cleaned up server-deleted rows, reload transparently
+ 
     if(d.rows_removed && d.rows_removed > 0){
       console.log('[SD] '+d.rows_removed+' server-deleted row(s) purged — reloading');
       loadCsv(val);
       return;
     }
-
+ 
     if(!d.rows || d.rows.length===0){
-      // If this is today's view, schedule one auto-retry in 5s.
-      // The SD sync may still be running in the background at boot time.
       if(val==='today'){
         document.getElementById('tableArea').innerHTML=
           '<div style="display:flex;align-items:center;gap:10px;padding:12px 0;color:#64748b;font-size:.82rem">'
@@ -672,10 +707,11 @@ function loadCsv(val){
         document.getElementById('tableArea').innerHTML=
           '<p style="color:#64748b;font-size:.82rem">No records for this date.</p>';
       }
+      _allDisplayRows = [];
+      document.getElementById('recordCount').textContent = '';
       return;
     }
-
-    // ── Source badge (shown in dateLabel when data came live from server) ──
+ 
     var srcBadge = '';
     if(d.pulled_from_server){
       srcBadge = ' <span style="display:inline-block;padding:2px 8px;border-radius:4px;'
@@ -685,54 +721,182 @@ function loadCsv(val){
     }
     var lbl = document.getElementById('dateLabel');
     lbl.innerHTML = (selText ? ('Showing records for: '+selText) : '') + srcBadge;
-
-    var h='<div style="overflow-x:auto"><table><thead><tr>';
-    h+='<th style="color:#22d3ee">Date</th>';
-    (d.headers||[]).forEach(function(hd){h+='<th>'+hd+'</th>';});
-    h+='<th></th>';  // edit button column
-    h+='</tr></thead><tbody>';
-    d.rows.forEach(function(row, idx){
-      h+='<tr>';
-      h+='<td style="color:#22d3ee;white-space:nowrap;font-size:.78rem">'+(d.date||'')+'</td>';
-      row.forEach(function(cell,i){
-        if(i===5){
-          // event_type badge — handles morning_in, afternoon_out, etc.
-          var et = cell.trim();
-          var isIn = et.endsWith('_in') || et==='check-in';
-          var cls = isIn ? 'badge-in' : (et.endsWith('_out')||et==='check-out') ? 'badge-out' : 'badge-denied';
-          h+='<td><span class="badge '+cls+'">'+et+'</span></td>';
-        } else {
-          h+='<td>'+cell+'</td>';
-        }
-      });
-      // Only show edit button for SD-backed rows (server-live rows have no local ID to edit)
-      if(!d.pulled_from_server){
-        h+='<td><button class="btn btn-ghost btn-sm" onclick="editRow('+idx+')">&#9998;</button></td>';
-      } else {
-        h+='<td><span style="font-size:.7rem;color:#64748b" title="Save SD sync first">—</span></td>';
-      }
-      h+='</tr>';
+ 
+    // ── Build _allDisplayRows from parsed CSV rows ───────────────────────────
+    _allDisplayRows = d.rows.map(function(row, idx){
+      var rawName = (row[3]||'').trim();
+      var lastFirst = toLastFirst(rawName);
+      return {
+        origIdx: idx,
+        date: d.date || '',
+        cells: row,
+        nameSortKey: lastFirst.toLowerCase(),
+        rawName: rawName,
+        lastFirst: lastFirst
+      };
     });
-    h+='</tbody></table></div>';
+ 
+    window._csvData = d;
+    applyFilters();
+ 
     if(d.pulled_from_server){
-      h+='<p style="font-size:.75rem;color:#64748b;margin-top:8px;padding:0 4px">'
+      var extra = '<p style="font-size:.75rem;color:#64748b;margin-top:8px;padding:0 4px">'
         +'&#9432; Showing live server data. SD sync is still running — '
         +'<a href="#" onclick="loadCsv(\'today\');return false;" '
         +'style="color:#22d3ee">refresh</a> in a moment to edit records.</p>';
+      document.getElementById('tableArea').innerHTML += extra;
     }
-    document.getElementById('tableArea').innerHTML = h;
-    // Store rows for editor
-    window._csvData = d;
+ 
   }).catch(function(e){
     document.getElementById('tableArea').innerHTML=
       '<p style="color:#ef4444;font-size:.82rem">Fetch error: '+e+'</p>';
   });
 }
-
-function editRow(idx){
-  openEditor(idx);
+ 
+// ── Search + sort filter ──────────────────────────────────────────────────────
+function applyFilters(){
+  var q = (document.getElementById('searchInput').value || '').toLowerCase().trim();
+  var rows = _allDisplayRows;
+ 
+  // 1. Filter
+  var filtered = q ? rows.filter(function(r){
+    // Search across: lastFirst name, timestamp, dept, event_type, device_id, emp_uid
+    var cells = r.cells;
+    var haystack = [
+      r.lastFirst,
+      (cells[0]||''),   // timestamp
+      (cells[2]||''),   // emp_uid
+      (cells[4]||''),   // dept
+      (cells[5]||''),   // event_type
+      (cells[6]||''),   // device_id
+    ].join(' ').toLowerCase();
+    return haystack.indexOf(q) >= 0;
+  }) : rows;
+ 
+  // 2. Sort
+  var col = _sortCol;
+  var asc = _sortAsc;
+  filtered = filtered.slice().sort(function(a,b){
+    var va, vb;
+    if(col === 4){
+      // Name column → sort by lastFirst
+      va = a.nameSortKey; vb = b.nameSortKey;
+    } else {
+      // Map display col index to cells[] index
+      // Display: 0=Date(static) 1=timestamp 2=nfc_uid 3=emp_uid 4=name 5=dept 6=event_type 7=device_id
+      var cellIdx = [null,0,1,2,3,4,5,6][col];
+      va = cellIdx !== null ? (a.cells[cellIdx]||'').toLowerCase() : '';
+      vb = cellIdx !== null ? (b.cells[cellIdx]||'').toLowerCase() : '';
+    }
+    if(va < vb) return asc ? -1 : 1;
+    if(va > vb) return asc ? 1 : -1;
+    return 0;
+  });
+ 
+  // 3. Render
+  renderTable(filtered);
 }
-
+ 
+function clearSearch(){
+  document.getElementById('searchInput').value='';
+  applyFilters();
+}
+ 
+// ── Sortable header helper ────────────────────────────────────────────────────
+function sortBy(col){
+  if(_sortCol === col){ _sortAsc = !_sortAsc; }
+  else { _sortCol = col; _sortAsc = true; }
+  applyFilters();
+}
+ 
+function _thArrow(col){
+  if(_sortCol !== col) return '<span class="sort-arrow">&#8645;</span>';
+  return _sortAsc
+    ? '<span class="sort-arrow" style="color:#22d3ee">&#8593;</span>'
+    : '<span class="sort-arrow" style="color:#f97316">&#8595;</span>';
+}
+ 
+// ── Table renderer ────────────────────────────────────────────────────────────
+function renderTable(filtered){
+  var d = window._csvData || {};
+  var total = _allDisplayRows.length;
+  var shown = filtered.length;
+  var q = (document.getElementById('searchInput').value||'').trim();
+ 
+  // Update count badge
+  var countEl = document.getElementById('recordCount');
+  if(q && total !== shown){
+    countEl.textContent = shown + ' of ' + total + ' record' + (total!==1?'s':'');
+    countEl.style.color = shown===0 ? '#ef4444' : '#22d3ee';
+  } else {
+    countEl.textContent = total + ' record' + (total!==1?'s':'');
+    countEl.style.color = '#64748b';
+  }
+ 
+  if(filtered.length === 0){
+    document.getElementById('tableArea').innerHTML =
+      '<p style="color:#64748b;font-size:.82rem;padding:8px 0">No matching records.</p>';
+    return;
+  }
+ 
+  // Column defs: [label, sortColIdx]
+  var cols = [
+    ['Date',          0],
+    ['Time',          1],
+    ['NFC UID',       2],
+    ['Emp UID',       3],
+    ['Name (Last, First)', 4],
+    ['Department',    5],
+    ['Clock Type',    6],
+    ['Device',        7],
+  ];
+ 
+  var h = '<div style="overflow-x:auto"><table><thead><tr>';
+  cols.forEach(function(c){
+    var ci = c[1];
+    h += '<th class="th-sort" onclick="sortBy('+ci+')" style="cursor:pointer">'
+       + c[0] + _thArrow(ci) + '</th>';
+  });
+  // Edit button column (no sort)
+  if(!d.pulled_from_server) h += '<th></th>';
+  h += '</tr></thead><tbody>';
+ 
+  filtered.forEach(function(r){
+    var row  = r.cells;
+    var idx  = r.origIdx;
+    h += '<tr>';
+    // Date
+    h += '<td style="color:#22d3ee;white-space:nowrap;font-size:.78rem">'+r.date+'</td>';
+    // Timestamp (col 0)
+    h += '<td>'+(row[0]||'')+'</td>';
+    // nfc_uid (col 1)
+    h += '<td>'+(row[1]||'')+'</td>';
+    // emp_uid (col 2)
+    h += '<td>'+(row[2]||'')+'</td>';
+    // Name — Last, First (col 3)
+    h += '<td style="font-weight:600;color:#e2e8f0">'+r.lastFirst+'</td>';
+    // Department (col 4)
+    h += '<td>'+(row[4]||'')+'</td>';
+    // event_type badge (col 5)
+    var et  = (row[5]||'').trim();
+    var isIn = et.endsWith('_in') || et==='check-in';
+    var cls  = isIn ? 'badge-in' : (et.endsWith('_out')||et==='check-out') ? 'badge-out' : 'badge-denied';
+    h += '<td><span class="badge '+cls+'">'+et+'</span></td>';
+    // device_id (col 6)
+    h += '<td style="font-size:.75rem;color:#64748b">'+(row[6]||'')+'</td>';
+    // Edit button
+    if(!d.pulled_from_server){
+      h += '<td><button class="btn btn-ghost btn-sm" onclick="editRow('+idx+')">&#9998;</button></td>';
+    }
+    h += '</tr>';
+  });
+  h += '</tbody></table></div>';
+  document.getElementById('tableArea').innerHTML = h;
+}
+ 
+// ── Editor (unchanged logic, works with origIdx) ──────────────────────────────
+function editRow(idx){ openEditor(idx); }
+ 
 function openEditor(focusIdx){
   if(!window._csvData || !window._csvData.rows){
     alert('Load attendance data first.');
@@ -741,42 +905,36 @@ function openEditor(focusIdx){
   var d = window._csvData;
   _editorRows = d.rows.map(function(r){ return r.slice(); });
   _serverIds  = (d.serverIds||[]).map(function(id){ return id||0; });
-  // Pad to same length in case serverIds is shorter (e.g. offline)
   while (_serverIds.length < _editorRows.length) _serverIds.push(0);
-
+ 
   var html = '';
   _editorRows.forEach(function(row, i){
     var et      = (row[5]||'').trim();
     var isIn    = et.endsWith('_in') || et==='check-in';
     var badgeCls= isIn ? 'badge-in' : (et.endsWith('_out')||et==='check-out') ? 'badge-out' : 'badge-denied';
-
-    // Parse timestamp → HH:MM:SS for the time input
+ 
     var rawTs  = (row[0]||'').replace(/"/g,'').trim();
-    // If stored as "HH:MM:SS" already; if "YYYY-MM-DD HH:MM:SS" extract time part
     var timePart = rawTs;
     if(rawTs.indexOf(' ') >= 0) timePart = rawTs.split(' ')[1] || rawTs;
-    // <input type="time" step="1"> expects HH:MM:SS
     if(timePart.split(':').length === 2) timePart += ':00';
-
+ 
+    // Show Last, First in editor header too
+    var displayName = toLastFirst((row[3]||'').replace(/"/g,''));
+ 
     html += '<div class="erow" id="erow_'+i+'">';
     html += '<div class="erow-header">';
     html += '<span class="erow-num">#'+(i+1)+'</span>';
     html += '<span class="badge '+badgeCls+'" id="badge_'+i+'">'+et+'</span>';
-    html += '<span style="font-size:.72rem;color:var(--dim);margin-left:8px">'+
-            (row[3]||'').replace(/"/g,'')+'</span>';
+    html += '<span style="font-size:.72rem;color:var(--dim);margin-left:8px">'+displayName+'</span>';
     html += '</div>';
-
-    // ── Two-column grid: ONLY editable fields ──────────────────────────────
+ 
     html += '<div class="erow-grid">';
-
-    // EDITABLE: Timestamp — time picker
     html += '<div class="erow-field">';
     html += '<label>&#128336; Time</label>';
     html += '<input type="time" step="1" id="f_'+i+'_0" value="'+timePart+'" '+
             'style="color-scheme:dark" onchange="updateBadge('+i+')">';
     html += '</div>';
-
-    // EDITABLE: Clock Type — dropdown
+ 
     html += '<div class="erow-field"><label>&#128203; Clock Type</label>';
     html += '<select id="f_'+i+'_5" onchange="updateBadge('+i+')">';
     var types=['morning_in','morning_out','afternoon_in','afternoon_out','evening_in','evening_out'];
@@ -785,27 +943,23 @@ function openEditor(focusIdx){
       html += '<option value="'+t+'"'+(et===t?' selected':'')+'>'+lbl+'</option>';
     });
     html += '</select></div>';
-
-    html += '</div>'; // erow-grid
-
-    // ── Read-only info strip ───────────────────────────────────────────────
+    html += '</div>';
+ 
     html += '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:8px;'+
             'background:rgba(0,0,0,.2);border-radius:6px;padding:8px 10px">';
-
-    html += _roField('Employee', (row[3]||'').replace(/"/g,''));
+    html += _roField('Employee', displayName);
     html += _roField('Department', (row[4]||'').replace(/"/g,''));
     html += _roField('Emp UID', (row[2]||'').replace(/"/g,''));
-
-    html += '</div>'; // read-only strip
-
+    html += '</div>';
+ 
     html += '<button class="del-row-btn" onclick="deleteRow('+i+')">&#128465; Delete</button>';
-    html += '</div>'; // erow
+    html += '</div>';
   });
-
+ 
   document.getElementById('editorRows').innerHTML = html;
   document.getElementById('editorModal').style.display = 'block';
   document.body.style.overflow = 'hidden';
-
+ 
   if(focusIdx !== undefined){
     setTimeout(function(){
       var el = document.getElementById('erow_'+focusIdx);
@@ -813,15 +967,13 @@ function openEditor(focusIdx){
     },100);
   }
 }
-
-// Helper: read-only label+value cell
+ 
 function _roField(label, val){
   return '<div><div style="font-size:.68rem;color:var(--dim);margin-bottom:2px">'+label+'</div>'+
          '<div style="font-size:.78rem;color:var(--text);font-weight:500">'+
          (val||'—')+'</div></div>';
 }
-
-// Live-update the badge when clock type or time changes
+ 
 function updateBadge(i){
   var sel = document.getElementById('f_'+i+'_5');
   if(!sel) return;
@@ -829,18 +981,15 @@ function updateBadge(i){
   var isIn = et.endsWith('_in');
   var badgeCls = isIn ? 'badge-in' : 'badge-out';
   var badge = document.getElementById('badge_'+i);
-  if(badge){
-    badge.className = 'badge '+badgeCls;
-    badge.textContent = et;
-  }
+  if(badge){ badge.className='badge '+badgeCls; badge.textContent=et; }
 }
-
+ 
 function closeEditor(){
-  document.getElementById('editorModal').style.display = 'none';
-  document.body.style.overflow = '';
+  document.getElementById('editorModal').style.display='none';
+  document.body.style.overflow='';
   hideSyncStatus();
 }
-
+ 
 function deleteRow(idx){
   if(!confirm('Delete row #'+(idx+1)+'? This will remove it from SD and the server.')) return;
   var row = _editorRows[idx];
@@ -850,7 +999,7 @@ function deleteRow(idx){
     empUid: (row[2]||'').replace(/"/g,''),
     timestamp: (row[0]||'').replace(/"/g,''),
     eventType: (row[5]||'').replace(/"/g,''),
-    serverId: _serverIds[idx]||0        // pass server DB id directly — no range-query needed
+    serverId: _serverIds[idx]||0
   };
   fetch('/api/attendance/deleterow', {
     method:'POST',
@@ -868,47 +1017,38 @@ function deleteRow(idx){
     }
   }).catch(function(e){ showSyncStatus('Network error: '+e, false); });
 }
-
+ 
 function saveAllRows(){
   var rows = [];
   var serverIdsOut = [];
   for(var i=0; i<_editorRows.length; i++){
     var el = document.getElementById('erow_'+i);
     if(!el) continue;
-
     var orig = _editorRows[i];
-
-    // Reconstruct timestamp: keep date prefix if original had one
     var timePicker = document.getElementById('f_'+i+'_0');
-    var newTime    = timePicker ? timePicker.value : '';   // "HH:MM" or "HH:MM:SS"
-    // Ensure seconds are included
+    var newTime    = timePicker ? timePicker.value : '';
     if(newTime && newTime.split(':').length === 2) newTime += ':00';
     var origTs = (orig[0]||'').replace(/"/g,'').trim();
     var finalTs = newTime;
-    if(origTs.indexOf(' ') >= 0){
-      // Original was "YYYY-MM-DD HH:MM:SS" — preserve the date portion
-      finalTs = origTs.split(' ')[0] + ' ' + newTime;
-    }
-
+    if(origTs.indexOf(' ') >= 0){ finalTs = origTs.split(' ')[0] + ' ' + newTime; }
     var clockSel = document.getElementById('f_'+i+'_5');
     var newClock = clockSel ? clockSel.value : (orig[5]||'');
-
     var row = [
-      finalTs,                              // 0 timestamp  (edited)
-      (orig[1]||'').replace(/"/g,''),       // 1 nfc_uid    (locked)
-      (orig[2]||'').replace(/"/g,''),       // 2 emp_uid    (locked)
-      (orig[3]||'').replace(/"/g,''),       // 3 emp_name   (locked)
-      (orig[4]||'').replace(/"/g,''),       // 4 dept       (locked)
-      newClock,                             // 5 clock_type (edited)
-      (orig[6]||'').replace(/"/g,'')        // 6 device_id  (locked)
+      finalTs,
+      (orig[1]||'').replace(/"/g,''),
+      (orig[2]||'').replace(/"/g,''),
+      (orig[3]||'').replace(/"/g,''),
+      (orig[4]||'').replace(/"/g,''),
+      newClock,
+      (orig[6]||'').replace(/"/g,'')
     ];
     rows.push(row);
     serverIdsOut.push(_serverIds[i]||0);
   }
-
+ 
   var payload = { file: currentFile, rows: rows, serverIds: serverIdsOut };
   showSyncStatus('Saving to SD and syncing to server...', null);
-
+ 
   fetch('/api/attendance/update', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
@@ -927,11 +1067,11 @@ function saveAllRows(){
     }
   }).catch(function(e){ showSyncStatus('Network error: '+e, false); });
 }
-
+ 
 function showSyncStatus(msg, ok){
   var el = document.getElementById('syncStatus');
   el.textContent = msg;
-  if(ok === null){
+  if(ok===null){
     el.style.cssText='display:block;background:rgba(249,115,22,.1);color:#f97316;border:1px solid rgba(249,115,22,.3);padding:8px 12px;border-radius:6px;font-size:.82rem;margin-bottom:12px';
   } else if(ok){
     el.style.cssText='display:block;background:rgba(16,185,129,.1);color:#10b981;border:1px solid rgba(16,185,129,.3);padding:8px 12px;border-radius:6px;font-size:.82rem;margin-bottom:12px';
@@ -940,13 +1080,13 @@ function showSyncStatus(msg, ok){
   }
 }
 function hideSyncStatus(){ document.getElementById('syncStatus').style.display='none'; }
-
+ 
 loadCsv('today');
 </script>
 )HTML";
-        html += _foot();
-        _srv.send(200, "text/html", html);
-    }
+    html += _foot();
+    _srv.send(200, "text/html", html);
+}
 
     // ════════════════════════════════════════════════════════════════════════
     // TAB 3 — ACTIONS

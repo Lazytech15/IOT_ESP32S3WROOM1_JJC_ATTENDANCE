@@ -24,7 +24,8 @@
 #include <Arduino.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <SD_MMC.h>
+#include <SPI.h>
+#include <SD.h>
 #include <new>
 #include "TFTDisplayManager.h"
 #include "attendance_http_service.h"

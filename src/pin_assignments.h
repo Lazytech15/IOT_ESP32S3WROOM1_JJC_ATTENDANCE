@@ -36,10 +36,10 @@
 // SD CARD — SPI (Software or HSPI)
 // Using GPIO 38-41 which are safe on WROOM-1 and away from camera/USB
 // ══════════════════════════════════════════════════════════════════════════════
-#define SD_MOSI         35   // SD Data In
-#define SD_SCK          36   // SD Clock
-#define SD_MISO         37   // SD Data Out
-#define SD_CS           38   // SD Chip Select
+#define SD_MOSI         39   // was 35 — conflicts with PSRAM
+#define SD_SCK          40   // was 36 — conflicts with PSRAM  
+#define SD_MISO         41   // was 37 — conflicts with PSRAM
+#define SD_CS           42   // was 38
 
 // ══════════════════════════════════════════════════════════════════════════════
 // PIN SAFETY NOTES FOR ESP32-S3 WROOM-1

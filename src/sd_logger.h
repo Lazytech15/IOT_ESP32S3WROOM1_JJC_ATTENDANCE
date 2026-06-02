@@ -34,6 +34,8 @@
 #pragma once
 #include <Arduino.h>
 #include <SD_MMC.h>
+#include <SPI.h>
+#include <SD.h>
 #include <esp_system.h>   // esp_register_shutdown_handler
 
 class SDLogger {
@@ -141,6 +143,8 @@ public:
 
     // ── logf (printf-style) ───────────────────────────────────────────────────
     static void logf(const char* tag, Level level, const char* fmt, ...) {
+        if (!fmt) return;
+        if (!tag) tag = "???";
         char buf[320];
         va_list args;
         va_start(args, fmt);

@@ -28,7 +28,8 @@
 // ══════════════════════════════════════════════════════════════════════════════
 #pragma once
 #include <Arduino.h>
-#include <SD_MMC.h>
+#include <SPI.h>
+#include <SD.h>
 #include <ArduinoJson.h>
 #include "sd_database.h"
 #include "employee_profile_display.h"

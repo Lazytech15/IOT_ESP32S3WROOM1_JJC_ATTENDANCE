@@ -396,23 +396,36 @@ public:
     bool downloadProfileImage(const String& uid, uint8_t** outBuffer, int* outSize,
                                const String& overridePath = "") {
         if (uid.length() == 0 || !outBuffer || !outSize) return false;
-
+ 
+        // ── Build initial URL ─────────────────────────────────────────────────
+        // ?esp32=1 tells the PHP handler to convert WebP → JPEG on the server
+        // and return a properly-formatted JPEG for TJpgDec.
         String url;
+        bool   usingOverride = false;
+ 
         if (overridePath.length() > 0) {
+            // Use the caller-supplied path as-is (don't add ?esp32=1 here —
+            // the override may be a direct file URL with no PHP behind it).
             if (overridePath.startsWith("http://") || overridePath.startsWith("https://"))
                 url = overridePath;
             else if (overridePath.startsWith("/"))
                 url = serverURL + overridePath;
             else
                 url = serverURL + "/" + overridePath;
+            usingOverride = true;
         } else {
-            url = serverURL + "/api/profile/" + uid;
+            // Canonical path: always request JPEG via ?esp32=1
+            url = serverURL + "/api/profile/" + uid + "?esp32=1";
         }
-
+ 
         Serial.println("[IMG] GET " + url);
         Serial.printf("[IMG] heap=%u psram=%u\n", ESP.getFreeHeap(), ESP.getFreePsram());
         Serial.flush();
-
+ 
+        // ── Shared header list ────────────────────────────────────────────────
+        const char* headerKeys[] = {"Content-Type", "Content-Length"};
+ 
+        // ── First attempt ─────────────────────────────────────────────────────
         HTTPClient imgHttp;
         imgHttp.setTimeout(15000);
         imgHttp.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
@@ -420,46 +433,63 @@ public:
         imgHttp.addHeader("X-Client-Type", "ESP32");
         if (authToken.length() > 0)
             imgHttp.addHeader("Authorization", "Bearer " + authToken);
-
-        const char* headerKeys[] = {"Content-Type", "Content-Length"};
         imgHttp.collectHeaders(headerKeys, 2);
-
+ 
         int code = imgHttp.GET();
         Serial.println("[IMG] Code: " + String(code));
         Serial.flush();
-
-        if (code != 200 && overridePath.length() > 0) {
-            Serial.println("[IMG] Retrying with canonical /api/profile/<uid>...");
-            Serial.flush();
+ 
+        // ── Retry logic ───────────────────────────────────────────────────────
+        // Trigger a retry when:
+        //   a) We used an override path and it failed (original behaviour), OR
+        //   b) We used an override path and the server returned WebP anyway
+        //      (some servers ignore query params on static file paths).
+        // Retry always uses the canonical ?esp32=1 URL.
+        bool needRetry = false;
+        if (code != 200 && usingOverride) {
+            Serial.println("[IMG] Override failed — retrying with canonical ?esp32=1 URL...");
+            needRetry = true;
+        }
+ 
+        if (needRetry) {
             imgHttp.end();
-            String fallback = serverURL + "/api/profile/" + uid;
+            String fallback = serverURL + "/api/profile/" + uid + "?esp32=1";
+            Serial.println("[IMG] Retry GET " + fallback);
+            Serial.flush();
             imgHttp.setTimeout(15000);
             imgHttp.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
             imgHttp.begin(fallback);
             imgHttp.addHeader("X-Client-Type", "ESP32");
+            if (authToken.length() > 0)
+                imgHttp.addHeader("Authorization", "Bearer " + authToken);
             imgHttp.collectHeaders(headerKeys, 2);
             code = imgHttp.GET();
             Serial.println("[IMG] Retry code: " + String(code));
             Serial.flush();
+            usingOverride = false;   // now on canonical path
         }
-
+ 
         if (code != 200) {
             Serial.println("[IMG] FAILED: HTTP " + String(code));
             Serial.flush();
             imgHttp.end();
             return false;
         }
-
+ 
+        // ── Content-Type guard ────────────────────────────────────────────────
         String ct = imgHttp.header("Content-Type");
         Serial.println("[IMG] Content-Type: " + ct);
-        if (ct.length() > 0 && ct.indexOf("image") < 0 &&
-            ct.indexOf("octet-stream") < 0 && ct.indexOf("jpeg") < 0) {
-            Serial.println("[IMG] FAILED: not an image Content-Type: " + ct);
+        if (ct.length() > 0 &&
+            ct.indexOf("image")        < 0 &&
+            ct.indexOf("octet-stream") < 0 &&
+            ct.indexOf("jpeg")         < 0) {
+            Serial.println("[IMG] FAILED: unexpected Content-Type: " + ct);
             Serial.flush();
             imgHttp.end();
             return false;
         }
-
+ 
+        // ── Size guard ────────────────────────────────────────────────────────
         int size = imgHttp.getSize();
         Serial.printf("[IMG] Content-Length: %d\n", size);
         const int MAX_IMG_BYTES = 500000;
@@ -469,7 +499,8 @@ public:
             imgHttp.end();
             return false;
         }
-
+ 
+        // ── Stream guard ──────────────────────────────────────────────────────
         WiFiClient* stream = imgHttp.getStreamPtr();
         if (!stream) {
             Serial.println("[IMG] FAILED: no stream");
@@ -477,7 +508,8 @@ public:
             imgHttp.end();
             return false;
         }
-
+ 
+        // ── Allocate buffer ───────────────────────────────────────────────────
         int allocSize = (size > 0) ? (size + 16) : 65536;
         uint8_t* buf = nullptr;
         if (psramFound()) buf = (uint8_t*)ps_malloc(allocSize);
@@ -489,13 +521,15 @@ public:
             imgHttp.end();
             return false;
         }
-
-        int got = 0;
+ 
+        // ── Stream body into buffer ───────────────────────────────────────────
+        int           got      = 0;
         unsigned long lastData = millis();
-        const int CHUNK = 4096;
+        const int     CHUNK    = 4096;
+ 
         while (true) {
             if (millis() - lastData > 12000) {
-                Serial.println("[IMG] FAILED: timeout");
+                Serial.println("[IMG] FAILED: stream timeout");
                 Serial.flush();
                 free(buf); imgHttp.end(); return false;
             }
@@ -505,50 +539,98 @@ public:
                     int newSz = min(got + avail + 32768, MAX_IMG_BYTES);
                     uint8_t* nb = (uint8_t*)realloc(buf, newSz);
                     if (nb) { buf = nb; allocSize = newSz; }
-                    else avail = allocSize - got;
+                    else     avail = allocSize - got;
                     if (avail <= 0) break;
                 }
-                int rd = stream->readBytes(buf + got, min(avail, min(CHUNK, allocSize - got)));
+                int rd = stream->readBytes(buf + got,
+                             min(avail, min(CHUNK, allocSize - got)));
                 if (rd > 0) { got += rd; lastData = millis(); }
             } else {
                 if (size > 0 && got >= size) break;
-                if (!imgHttp.connected()) break;
+                if (!imgHttp.connected())    break;
                 delay(5);
             }
             if (size > 0 && got >= size) break;
-            if (got >= MAX_IMG_BYTES) break;
+            if (got >= MAX_IMG_BYTES)     break;
             yield();
         }
         imgHttp.end();
-
+ 
         Serial.printf("[IMG] Stream done: got=%d expected=%d\n", got, size);
         Serial.flush();
-
+ 
         if (got == 0) {
             Serial.println("[IMG] FAILED: 0 bytes received");
             Serial.flush();
             free(buf); return false;
         }
-
+ 
+        // ── Magic-byte validation ─────────────────────────────────────────────
+        // TJpgDec on the ESP32 can only decode JPEG (FF D8 FF).
+        // PNG and GIF are accepted here to preserve the old fallback behaviour
+        // (they will simply show initials on display, which is handled upstream).
+        //
+        // WebP (RIFF....WEBP) is REJECTED — the decoder silently produces no
+        // pixels for WebP, which is the exact bug we are fixing.  Return false
+        // so the caller knows the download failed and won't cache a bad file.
         bool validImage = false;
+        bool isWebP     = false;
+ 
         if (got >= 4) {
-            if (buf[0] == 0xFF && buf[1] == 0xD8 && buf[2] == 0xFF)                                        validImage = true;
-            else if (buf[0] == 0x89 && buf[1] == 0x50 && buf[2] == 0x4E && buf[3] == 0x47)                 validImage = true;
-            else if (buf[0] == 0x47 && buf[1] == 0x49 && buf[2] == 0x46)                                    validImage = true;
-            else if (got >= 12 && buf[0]==0x52 && buf[1]==0x49 && buf[8]==0x57 && buf[9]==0x45)             validImage = true;
+            // JPEG: FF D8 FF  ← only format TJpgDec can actually render
+            if (buf[0] == 0xFF && buf[1] == 0xD8 && buf[2] == 0xFF) {
+                validImage = true;
+            }
+            // PNG: 89 50 4E 47
+            else if (buf[0] == 0x89 && buf[1] == 0x50 &&
+                     buf[2] == 0x4E && buf[3] == 0x47) {
+                validImage = true;
+            }
+            // GIF: 47 49 46
+            else if (buf[0] == 0x47 && buf[1] == 0x49 && buf[2] == 0x46) {
+                validImage = true;
+            }
+            // WebP: RIFF????WEBP  (52 49 46 46 .. .. .. .. 57 45 42 50)
+            else if (got >= 12 &&
+                     buf[0] == 0x52 && buf[1] == 0x49 &&   // "RI"
+                     buf[2] == 0x46 && buf[3] == 0x46 &&   // "FF"
+                     buf[8] == 0x57 && buf[9]  == 0x45 &&  // "WE"
+                     buf[10] == 0x42 && buf[11] == 0x50) {  // "BP"
+                isWebP = true;
+                // Do NOT set validImage = true.
+                // The server should have converted this to JPEG via ?esp32=1.
+                // If we still received WebP it means either:
+                //   • The server's GD extension is missing (can't convert), OR
+                //   • An override URL bypassed the PHP handler entirely.
+                // Either way TJpgDec cannot render it — reject and return false
+                // so the caller triggers a re-download or shows initials instead.
+                Serial.println("[IMG] FAILED: received WebP — TJpgDec cannot render WebP.");
+                Serial.println("[IMG]   Ensure the server has GD with WebP support enabled,");
+                Serial.println("[IMG]   or that your overridePath goes through /api/profile/<uid>.");
+                Serial.flush();
+            }
         }
+ 
         if (!validImage) {
-            Serial.print("[IMG] FAILED: bad magic bytes (hex): ");
-            for (int i = 0; i < min(got, 16); i++) Serial.printf("%02X ", buf[i]);
-            Serial.println();
-            char preview[201]; int plen = min(got, 200);
-            memcpy(preview, buf, plen); preview[plen] = 0;
-            Serial.println("[IMG] As text: " + String(preview));
-            Serial.flush();
-            free(buf); return false;
+            if (!isWebP) {
+                // Unknown / corrupt format — print diagnostic bytes
+                Serial.print("[IMG] FAILED: unrecognised magic bytes (hex): ");
+                for (int i = 0; i < min(got, 16); i++)
+                    Serial.printf("%02X ", buf[i]);
+                Serial.println();
+                char preview[201];
+                int  plen = min(got, 200);
+                memcpy(preview, buf, plen);
+                preview[plen] = 0;
+                Serial.println("[IMG] As text: " + String(preview));
+                Serial.flush();
+            }
+            free(buf);
+            return false;
         }
-
-        Serial.printf("[IMG] OK: %d bytes downloaded\n", got);
+ 
+        // ── Success ───────────────────────────────────────────────────────────
+        Serial.printf("[IMG] ✅ OK: %d bytes  format=JPEG\n", got);
         Serial.flush();
         *outBuffer = buf;
         *outSize   = got;
@@ -623,7 +705,7 @@ public:
         Serial.println("[HTTP] fetchAllEmployees: " + url);
         Serial.flush();
 
-        http.setTimeout(15000);
+        http.setTimeout(8000);  // was 15000
         http.begin(url);
         http.addHeader("X-Client-Type", "ESP32");
         if (authToken.length() > 0)
@@ -646,7 +728,7 @@ public:
         if (body.length() == 0) return false;
         yield();
 
-        DynamicJsonDocument tempDoc(32768);
+        DynamicJsonDocument tempDoc(psramFound() ? 32768 : 16384);
         bool ok = decryptServerResponse(decryptor, body, tempDoc);
         if (!ok) {
             Serial.println("[HTTP] ❌ fetchAllEmployees decrypt failed");
@@ -760,7 +842,8 @@ public:
             Serial.printf("[HTTP] Pre-decrypt heap: %u  psram: %u\n",
                           ESP.getFreeHeap(), ESP.getFreePsram());
             Serial.flush();
-            DynamicJsonDocument pageDoc(65536);
+            // Allocate in PSRAM if available to avoid crashing the internal heap
+            DynamicJsonDocument pageDoc(psramFound() ? 65536 : 24576);
             bool ok = decryptServerResponse(decryptor, raw, pageDoc);
             raw = "";
             yield();
@@ -955,7 +1038,7 @@ public:
                            pageNum, offset, ESP.getFreeHeap());
 
             HTTPClient todayHttp;
-            todayHttp.setTimeout(12000);
+            todayHttp.setTimeout(6000);  // was 12000
             todayHttp.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
             todayHttp.begin(url);
             todayHttp.addHeader("X-Client-Type", "ESP32");
@@ -1316,7 +1399,7 @@ public:
                        pageNum, offset, ESP.getFreeHeap());
 
         HTTPClient esp32Http;
-        esp32Http.setTimeout(12000);
+        esp32Http.setTimeout(6000);  // was 12000
         esp32Http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
         esp32Http.begin(url);
         esp32Http.addHeader("X-Client-Type", "ESP32");

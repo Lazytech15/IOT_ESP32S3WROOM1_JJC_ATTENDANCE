@@ -5,7 +5,8 @@
 #pragma once
 #include <Arduino.h>
 #include <TFT_eSPI.h>
-#include <SD_MMC.h>
+#include <SPI.h>
+#include <SD.h>
 #include "TFTDisplayManager.h"
 #include "sd_logger.h"
 #include <TJpg_Decoder.h>
@@ -86,6 +87,54 @@ public:
         String m = message;
         if (m.length() > 26) m = m.substring(0, 26);
         _tft->drawString(m, SCREEN_W / 2, 205, 2);
+        _tft->setTextDatum(TL_DATUM);
+    }
+
+    // ── showInactive ──────────────────────────────────────────────────────────
+    // WARNING block shown when an employee's status is not "Active".
+    // Instructs the employee to visit HR for further assistance.
+    // Attendance is NOT recorded for inactive employees.
+    // ─────────────────────────────────────────────────────────────────────────
+    void showInactive(const String& employeeName) {
+        if (!_tft) return;
+        _tft->fillScreen(TFTColors::BG_DARK);
+
+        const int CX   = SCREEN_W / 2;
+        const int ICO_Y = 82;
+        const uint16_t ORANGE = 0xFBE0;   // ~RGB(248,124,0)
+        const uint16_t DARK   = 0x4208;   // dark gray panel
+
+        // ── Warning icon — filled orange rounded square with "!" ──────────
+        _tft->fillRoundRect(CX - 42, ICO_Y - 42, 84, 84, 10, ORANGE);
+        _tft->drawRoundRect(CX - 42, ICO_Y - 42, 84, 84, 10, TFTColors::WHITE);
+        _tft->setTextColor(TFTColors::WHITE, ORANGE);
+        _tft->setTextDatum(MC_DATUM);
+        _tft->drawString("!", CX, ICO_Y + 4, 6);
+
+        // ── "INACTIVE ACCOUNT" title ──────────────────────────────────────
+        _tft->setTextColor(ORANGE, TFTColors::BG_DARK);
+        _tft->drawString("INACTIVE ACCOUNT", CX, 150, 2);
+
+        // ── Employee name ─────────────────────────────────────────────────
+        _tft->setTextColor(TFTColors::TEXT_PRIMARY, TFTColors::BG_DARK);
+        String name = employeeName;
+        if (name.length() > 22) name = name.substring(0, 20) + "..";
+        _tft->drawString(name, CX, 168, 2);
+
+        // ── Divider ───────────────────────────────────────────────────────
+        _tft->drawFastHLine(16, 184, SCREEN_W - 32, TFTColors::BORDER_DIM);
+
+        // ── HR instruction ────────────────────────────────────────────────
+        _tft->setTextColor(TFTColors::TEXT_SECONDARY, TFTColors::BG_DARK);
+        _tft->drawString("Please visit HR for", CX, 198, 2);
+        _tft->drawString("further assistance.", CX, 216, 2);
+
+        // ── Bottom warning bar ────────────────────────────────────────────
+        _tft->fillRect(0, 270, SCREEN_W, 50, DARK);
+        _tft->drawFastHLine(0, 270, SCREEN_W, ORANGE);
+        _tft->setTextColor(ORANGE, DARK);
+        _tft->drawString("Attendance NOT recorded", CX, 292, 2);
+
         _tft->setTextDatum(TL_DATUM);
     }
 

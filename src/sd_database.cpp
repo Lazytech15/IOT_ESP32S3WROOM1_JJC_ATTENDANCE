@@ -399,17 +399,28 @@ bool SDDatabase::hasEmployeeProfile(const String& empUid) {
 // savePhoto / hasPhoto / photoPath
 // ══════════════════════════════════════════════════════════════════════════════
 bool SDDatabase::savePhoto(const String& empUid, const uint8_t* data, size_t length) {
-    if (!_ready || empUid.length() == 0 || !data || length == 0) {
-        Serial.printf("[SD] savePhoto SKIP: ready=%d uid=%s len=%u\n",
-                      _ready, empUid.c_str(), (unsigned)length);
-        return false;
-    }
-
+    if (!_ready || empUid.length() == 0 || !data || length == 0) return false;
     ensureDir("/photos");
 
-    String path = "/photos/" + empUid + ".jpg";
+    // Detect format from magic bytes to use correct extension
+    String ext = ".jpg";
+    if (length >= 12 &&
+        data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46 &&
+        data[8] == 0x57 && data[9] == 0x45 && data[10] == 0x42 && data[11] == 0x50) {
+        ext = ".webp";
+    } else if (length >= 4 &&
+               data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47) {
+        ext = ".png";
+    }
 
-    // Remove any stale file before writing
+    // Remove any existing photo (any format) before writing new one
+    const char* exts[] = {".jpg", ".webp", ".png", nullptr};
+    for (int i = 0; exts[i]; i++) {
+        String old = "/photos/" + empUid + exts[i];
+        if (SD_MMC.exists(old)) SD_MMC.remove(old);
+    }
+
+    String path = "/photos/" + empUid + ext;
     if (SD_MMC.exists(path)) SD_MMC.remove(path);
 
     File f = SD_MMC.open(path, FILE_WRITE);
@@ -418,7 +429,6 @@ bool SDDatabase::savePhoto(const String& empUid, const uint8_t* data, size_t len
         return false;
     }
 
-    // Write in 4 KB chunks with yield() to avoid WDT resets
     const size_t CHUNK = 4096;
     size_t written = 0;
     while (written < length) {
@@ -428,43 +438,46 @@ bool SDDatabase::savePhoto(const String& empUid, const uint8_t* data, size_t len
         if (w != toWrite) break;
         yield();
     }
-
     f.flush();
     f.close();
 
     if (written != length) {
-        Serial.printf("[SD] Photo write incomplete: %u / %u\n",
-                      (unsigned)written, (unsigned)length);
+        Serial.printf("[SD] Photo write incomplete: %u / %u\n", (unsigned)written, (unsigned)length);
         SD_MMC.remove(path);
         return false;
     }
 
-    // Verify the file actually landed on the card with correct size
-    if (!SD_MMC.exists(path)) {
-        Serial.println("[SD] Photo missing after write: " + path);
-        return false;
-    }
     File vf = SD_MMC.open(path, FILE_READ);
     size_t onDisk = vf ? vf.size() : 0;
     if (vf) vf.close();
     if (onDisk != length) {
-        Serial.printf("[SD] Size mismatch on disk %u vs expected %u\n",
-                      (unsigned)onDisk, (unsigned)length);
+        Serial.printf("[SD] Size mismatch on disk %u vs expected %u\n", (unsigned)onDisk, (unsigned)length);
         SD_MMC.remove(path);
         return false;
     }
 
-    Serial.printf("[SD] Saved photo: %s (%u bytes verified)\n",
-                  path.c_str(), (unsigned)length);
+    Serial.printf("[SD] Saved photo: %s (%u bytes verified)\n", path.c_str(), (unsigned)length);
     return true;
 }
 
 bool SDDatabase::hasPhoto(const String& empUid) {
     if (!_ready || empUid.length() == 0) return false;
-    return SD_MMC.exists("/photos/" + empUid + ".jpg");
+    // Check all supported formats — server may send WebP, JPEG, or PNG
+    const char* exts[] = {".webp", ".jpg", ".png", nullptr};
+    for (int i = 0; exts[i]; i++) {
+        if (SD_MMC.exists("/photos/" + empUid + exts[i])) return true;
+    }
+    return false;
 }
 
 String SDDatabase::photoPath(const String& empUid) {
+    // Return the path of whichever format is actually cached
+    const char* exts[] = {".webp", ".jpg", ".png", nullptr};
+    for (int i = 0; exts[i]; i++) {
+        String p = "/photos/" + empUid + exts[i];
+        if (SD_MMC.exists(p)) return p;
+    }
+    // Default fallback (file doesn't exist yet)
     return "/photos/" + empUid + ".jpg";
 }
 

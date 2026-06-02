@@ -17,7 +17,8 @@
 // ══════════════════════════════════════════════════════════════════════════════
 #pragma once
 #include <Arduino.h>
-#include <SD_MMC.h>
+#include <SPI.h>
+#include <SD.h>
 #include "sd_logger.h"
 
 // ── FileInfo ──────────────────────────────────────────────────────────────────
