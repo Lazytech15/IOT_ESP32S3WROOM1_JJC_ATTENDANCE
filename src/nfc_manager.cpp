@@ -1,8 +1,13 @@
 #include "nfc_manager.h"
 
-// ── PN532 instance (Software SPI) ────────────────────────────────────────────
+// ── Hardware SPI bus for PN532 (HSPI on ESP32-S3, ~4 MHz) ────────────────────
+// Hardware SPI is ~10× faster than the software bit-bang constructor.
+// Using a dedicated SPIClass instance avoids conflicts with the TFT (FSPI).
+SPIClass PN532_SPI(HSPI);
+
+// ── PN532 instance (Hardware SPI) ────────────────────────────────────────────
 // NOT static — exported via extern in nfc_manager.h so main.cpp can poll it.
-Adafruit_PN532 nfc(PN532_SCK, PN532_MISO, PN532_MOSI, PN532_SS);
+Adafruit_PN532 nfc(PN532_SS, &PN532_SPI);
 
 // ── Public state ──────────────────────────────────────────────────────────────
 bool          nfcCardPresent = false;
@@ -33,6 +38,9 @@ static String sanitizeNfcString(const String& s) {
 // nfcInit
 // ══════════════════════════════════════════════════════════════════════════════
 bool nfcInit() {
+    // Initialise the HSPI bus with explicit pins before the PN532 driver starts.
+    // This is required when using Adafruit_PN532 with a custom SPIClass.
+    PN532_SPI.begin(PN532_SCK, PN532_MISO, PN532_MOSI, PN532_SS);
     nfc.begin();
 
     uint32_t ver = nfc.getFirmwareVersion();
@@ -54,8 +62,12 @@ bool nfcInit() {
 // Internal: Parse NTAG / MIFARE Ultralight (7-byte UID)
 // ══════════════════════════════════════════════════════════════════════════════
 static String parseNTAG(Adafruit_PN532& reader) {
+    // Read only pages 4-15 (48 bytes). The NFC tag in this project stores
+    // a short employee-ID string (≤20 chars), which fits comfortably in the
+    // first 12 pages. Reading all 36 pages (4-39) was the main source of
+    // per-scan latency with the old software-SPI driver.
     const int START_PAGE = 4;
-    const int END_PAGE   = 39;
+    const int END_PAGE   = 15;
 
     uint8_t raw[4 * (END_PAGE - START_PAGE + 1)];
     int     rawLen = 0;

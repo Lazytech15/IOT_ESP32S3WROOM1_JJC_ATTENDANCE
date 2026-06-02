@@ -1,34 +1,35 @@
 // ════════════════════════════════════════════════════════════════════════════
 // main.cpp — ESP32-S3 WROOM-1  NFC Attendance  (Portrait 240×320)
 //
-// ARCHITECTURE:
-//   • SD-FIRST: Boots and operates 100% offline using only SD card data.
-//               Internet is optional — used only to sync new employees and
-//               push pending attendance records.
-//   • CLOCK TYPE: Determines morning_in/morning_out/afternoon_in/afternoon_out
-//                 /evening_in/evening_out from existing SD records.
-//                 evening = afternoon overtime. overtime_in/out NOT used.
-//                 SD records — matching the server attendance table exactly.
-//   • SOCKET POLLER: Polls EmployeeSync::pollChanges() every SOCKET_POLL_MS ms
-//                    for employee-only events: employee_created / updated /
-//                    status_changed / deleted. Attendance events are intentionally
-//                    NOT handled here to prevent HTTP calls from freezing the clock.
-//   • SCAN GATES: noise filter, ghost-card debounce, cooldown.
+// OPTIMIZATIONS v3:
 //
-// ── FAST-TAP UPLOAD SCHEDULER (v2) ──────────────────────────────────────────
-//   Problem: attService.recordAttendance() was called INLINE during handleNFCDetected()
-//            which blocked the NFC poller for ~1-3 seconds per scan (HTTP round-trip).
-//            With queued employees this compounds into a 10-30s queue.
+//  1. FAST BOOT       — SD, NFC, WiFi, NTP start immediately. No blocking
+//                       delays after each step. Total target boot < 4s.
 //
-//   Solution: Every scan is ALWAYS logged to SD immediately (< 5ms), then
-//             ENQUEUED into pendingQueue. A separate scheduled uploader
-//             (UPLOAD_FLUSH_MS cadence) drains the queue in the background,
-//             ONLY when the system is on the dashboard (not during a scan).
-//             This means NFC taps are accepted at full speed (~150ms each)
-//             regardless of server response time or connectivity.
+//  2. FAST TAP        — NFC → SD write → profile display in < 200ms.
+//                       Profile shown for exactly PROFILE_DISPLAY_MS (2s),
+//                       then auto-returns to dashboard for next tap.
 //
-//   Key change: handleNFCDetected() NEVER calls attService.recordAttendance().
-//               All server POSTs happen via flushPending() only.
+//  3. OFFLINE-FIRST   — Every scan is ALWAYS written to SD first (< 5ms).
+//                       In-memory queue holds unsynced records; flushPending()
+//                       drains them to server in the background.
+//
+//  4. PEAK-HOUR DEFER — During 11:55-12:05 (noon out) and 16:55-17:05
+//                       (afternoon out) upload is DEFERRED to local-SD-only
+//                       mode. flushPending() won't run until PEAK_DEFER_MIN
+//                       (10 min) after the peak window. Outside peak, records
+//                       sync to the server in ~500ms (near-instant).
+//
+//  5. MANUAL SYNC     — Employee profiles and photos are downloaded ONLY via
+//                       the web portal "Sync" action. The system no longer
+//                       auto-downloads employees at boot unless the SD cache
+//                       is completely empty. Seeding (today's attendance from
+//                       server) is also triggered manually or on boot.
+//
+//  6. MANUAL RESEED   — Portal action "Reseed Today" fetches fresh attendance
+//                       from the server. Useful after deleting local data.
+//                       The periodic auto-reseed is kept as a light background
+//                       task but does NOT run during peak hours.
 // ════════════════════════════════════════════════════════════════════════════
 
 #include <Arduino.h>
@@ -49,48 +50,37 @@
 #include "employee_sync.h"
 
 // ─── Timing constants ────────────────────────────────────────────────────────
-#define NFC_POLL_INTERVAL_MS     150    // PN532 poll cadence
+#define NFC_POLL_INTERVAL_MS      50    // PN532 poll cadence (tightened for speed with hardware SPI)
 #define CLOCK_UPDATE_MS         1000
 #define STATS_REFRESH_MS       30000
-#define WIFI_RETRY_MS          15000
+#define WIFI_RETRY_MS          20000
 
-// ── UPLOAD SCHEDULER TIMING ──────────────────────────────────────────────────
-// UPLOAD_FLUSH_MS: How often the background uploader runs (in ms).
-//   • 3000ms (3s) means the server gets records within ~3s of any tap.
-//   • Set lower (e.g. 1500) for near-real-time push, higher (e.g. 5000)
-//     to reduce server load. Do NOT set below 1000 — the HTTPClient
-//     needs time to complete one round-trip before the next starts.
-//   • The uploader only runs when WiFi is up AND the system is on
-//     the dashboard, so it never interferes with active NFC display.
-#define UPLOAD_FLUSH_MS         3000
+// ── PROFILE DISPLAY ───────────────────────────────────────────────────────────
+// How long the employee photo/badge stays on screen after a scan.
+// 2000ms = 2 seconds — just enough for the card-holder to see their name,
+// then dashboard returns immediately for the next employee.
+#define PROFILE_DISPLAY_MS      2000
 
-// UPLOAD_BATCH_SIZE: Max records to POST per flush cycle.
-//   Keeping this at 1 means one HTTP call per cycle — predictable latency.
-//   Set to 3-5 if you want to catch up faster after an outage, but watch
-//   for WDT timeouts on slow connections.
-// FIX: Lowered from 3 to 1. With an 8s POST timeout, 3 records = up to
-// 24s of loop() freeze per flush cycle. 1 record = max ~8s, which
-// catchUpClock() recovers cleanly (no visible jump).
-#define UPLOAD_BATCH_SIZE          1
+// ── UPLOAD SCHEDULER ──────────────────────────────────────────────────────────
+#define UPLOAD_FLUSH_MS          500    // background upload cadence (normal hours) — near-instant outside peak
+#define UPLOAD_BATCH_SIZE          1    // one HTTP call per cycle → predictable latency
+#define SOCKET_POLL_MS          8000
+#define RESEED_INTERVAL_MS    300000    // auto-reseed every 5 min (skipped during peak)
 
-#define PENDING_FLUSH_MS       60000   // legacy retry for any stragglers
-#define SOCKET_POLL_MS          8000   // real-time event polling interval
-#define PROFILE_DISPLAY_MS      2000   // profile card display time
-
-// RESEED_INTERVAL_MS: How often the ESP32 re-fetches today's attendance from
-// the server to catch any records entered via the web portal or another device.
-// 5 minutes is a good balance — frequent enough to stay current, rare enough
-// not to hammer the server. Reduce to 60000 (1 min) for near-real-time accuracy.
-#define RESEED_INTERVAL_MS    300000
+// ── PEAK HOUR DEFERRAL ────────────────────────────────────────────────────────
+// During rush windows the upload queue is NOT flushed to the server.
+// All records still land on SD immediately. Uploads resume PEAK_DEFER_MIN
+// minutes AFTER the peak window ends, giving the server time to breathe.
+//
+// Peak windows (device local time, 24h):
+//   Noon out:      11:50 – 12:10
+//   Afternoon out: 16:50 – 17:10
+#define PEAK_DEFER_MIN          10      // minutes of post-peak upload hold (reduced from 20)
 
 // ─── NFC scan-gate constants ─────────────────────────────────────────────────
-#define MIN_CARD_ID_LEN          8     // reject partial / noise reads
-#define SCAN_COOLDOWN_MS       3500   // same-card lockout after accepted scan
-// FIX B: Lowered from 2 to 1. With 2, a quick tap required 2 successful
-// reads at ~100ms each; the card was gone before the 2nd read on any
-// normal tap, causing silent drops. SCAN_COOLDOWN_MS (3500ms) already
-// prevents double-registration when a card lingers on the reader.
-#define CARD_CONFIRM_NEEDED      1    // accept on first confirmed read
+#define MIN_CARD_ID_LEN          8
+#define SCAN_COOLDOWN_MS       3500    // same-card lockout
+#define CARD_CONFIRM_NEEDED      1
 
 #define AP_SSID     "JJC_Attendance_Config"
 #define AP_PASSWORD "ilovejjcenggworks"
@@ -100,9 +90,8 @@ String deviceId = "Attendance_Display_01";
 
 // ─── Software clock ──────────────────────────────────────────────────────────
 static uint8_t  clkH = 0, clkM = 0, clkS = 0;
-static uint32_t clkEpoch = 0;   // Unix timestamp of last NTP sync (0 = unknown)
+static uint32_t clkEpoch = 0;
 
-// Advance clock by 1 second
 static void tickClock() {
     if (++clkS >= 60) { clkS = 0;
     if (++clkM >= 60) { clkM = 0;
@@ -110,15 +99,12 @@ static void tickClock() {
     if (clkEpoch) clkEpoch++;
 }
 
-// Catch up clock for ALL seconds that elapsed since lastClock.
-// If loop() was blocked by HTTP for 5s, this ticks 5 times and
-// returns 5 so the caller can update the display once.
 static int catchUpClock(unsigned long& lastClock) {
     unsigned long now = millis();
     unsigned long elapsed = now - lastClock;
     if (elapsed < 1000) return 0;
     int ticks = (int)(elapsed / 1000);
-    if (ticks > 60) ticks = 60; // sanity cap
+    if (ticks > 60) ticks = 60;
     lastClock += (unsigned long)ticks * 1000;
     for (int i = 0; i < ticks; i++) tickClock();
     return ticks;
@@ -127,7 +113,6 @@ static String clockStr() {
     char b[12]; snprintf(b, sizeof(b), "%02d:%02d:%02d", clkH, clkM, clkS);
     return b;
 }
-// Returns "YYYY-MM-DD" from epoch or "" if clock not synced
 static String dateStr() {
     if (!clkEpoch) return "";
     time_t t = (time_t)clkEpoch;
@@ -138,7 +123,6 @@ static String dateStr() {
     return b;
 }
 static String buildDateStr() {
-    // Use real NTP date if clock is synced
     if (clkEpoch) {
         static const char* days[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
         time_t t = (time_t)clkEpoch;
@@ -149,8 +133,49 @@ static String buildDateStr() {
                  tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday);
         return String(b);
     }
-    // Fallback before NTP sync
     return "--- AWAITING SYNC ---";
+}
+
+// ── PEAK HOUR DETECTION ───────────────────────────────────────────────────────
+// Returns true if clock is currently inside a peak upload-defer window OR
+// within PEAK_DEFER_MIN minutes after one ended.
+//
+// Peak windows (device-local 24h):
+//   11:55–12:05 = noon out rush    (centred on 12:00)
+//   16:55–17:05 = afternoon out rush (centred on 17:00)
+//
+// Stores the minute at which the last peak window ended (peakEndMin) so that
+// the post-peak hold is counted in wall-clock minutes, not milliseconds.
+static uint16_t peakEndMin = 0xFFFF;  // 0xFFFF = no peak seen yet
+
+static bool isPeakHour() {
+    uint16_t nowMin = (uint16_t)clkH * 60 + clkM;
+
+    // Define peak windows [startMin, endMin] inclusive
+    struct { uint16_t s, e; } windows[] = {
+        { 11*60+55, 12*60+ 5 },   // noon out    (centred on 12:00)
+        { 16*60+55, 17*60+ 5 },   // afternoon out (centred on 17:00)
+    };
+
+    for (auto& w : windows) {
+        if (nowMin >= w.s && nowMin <= w.e) {
+            peakEndMin = w.e;     // update so post-peak hold works
+            return true;
+        }
+    }
+
+    // Post-peak deferral: hold uploads for PEAK_DEFER_MIN after window
+    if (peakEndMin != 0xFFFF) {
+        uint16_t holdUntil = peakEndMin + PEAK_DEFER_MIN;
+        if (nowMin > peakEndMin && nowMin <= holdUntil) {
+            return true;  // still in post-peak hold
+        }
+        if (nowMin > holdUntil) {
+            peakEndMin = 0xFFFF;  // hold expired, clear flag
+        }
+    }
+
+    return false;
 }
 
 // ─── Globals ─────────────────────────────────────────────────────────────────
@@ -160,11 +185,12 @@ AttendanceHTTPService  attService(SERVER_URL);
 EmployeeProfileDisplay* empDisplay = nullptr;
 
 static bool initialSyncDone = false;
-
-// FIX: g_forceReseedAt lets pollSocketEvents() schedule an early reseed
-// in loop() without blocking inside the socket poll.
-// Set to 0 to trigger immediately; 0xFFFFFFFF = no pending force.
 static unsigned long g_forceReseedAt = 0xFFFFFFFFUL;
+
+// Flags settable from web portal actions (checked in loop)
+volatile bool g_triggerEmployeeSync = false;   // download employees from server
+volatile bool g_triggerPhotoSync    = false;   // download missing photos
+volatile bool g_triggerReseedToday  = false;   // fetch today's attendance from server
 
 // ─── State machine ────────────────────────────────────────────────────────────
 enum SystemState : uint8_t {
@@ -251,14 +277,11 @@ static String resolveClockType(const String& empUid) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// PENDING ATTENDANCE QUEUE
+// PENDING ATTENDANCE QUEUE  (in-memory + SD-backed)
 //
-// DESIGN: Every NFC scan enqueues here FIRST — the HTTP upload happens
-// separately via flushPending(). This is the core of the fast-tap architecture.
-//
-// pendingQueue holds records that are CONFIRMED locally (written to SD)
-// but not yet ACKed by the server. flushPending() drains this at
-// UPLOAD_FLUSH_MS cadence, sending UPLOAD_BATCH_SIZE records per cycle.
+// Every NFC scan writes to SD immediately, then adds to this queue.
+// flushPending() drains the queue to the server in the background.
+// During peak hours the flush is skipped — records stay on SD.
 // ════════════════════════════════════════════════════════════════════════════
 struct PendingRecord {
     String empUid, nfcUid, clockType, timestamp, date;
@@ -274,8 +297,7 @@ static void enqueuePending(const String& empUid, const String& nfcUid,
         Serial.printf("[Queue] +1 pending (%d/32): %s %s\n",
                       pendingCount, empUid.c_str(), clockType.c_str());
     } else {
-        Serial.println("[Queue] FULL — dropping oldest record");
-        // Shift queue (lose oldest)
+        Serial.println("[Queue] FULL — dropping oldest");
         for (int i = 0; i < 31; i++) pendingQueue[i] = pendingQueue[i+1];
         pendingQueue[31] = {empUid, nfcUid, clockType, ts, dt};
     }
@@ -283,13 +305,16 @@ static void enqueuePending(const String& empUid, const String& nfcUid,
 
 // ── flushPending ──────────────────────────────────────────────────────────────
 // Sends up to UPLOAD_BATCH_SIZE queued records to the server.
-// Called on a timer from loop() — NEVER from handleNFCDetected().
-//
-// The batch limit keeps each flush cycle short enough that the NFC
-// poller is not blocked for long. On a fast connection each POST
-// takes ~300-600ms; 3 records = max ~2 seconds per cycle.
+// Skipped automatically during peak hours — see isPeakHour().
 static void flushPending() {
     if (!wifiConfig.isConnected() || pendingCount == 0) return;
+
+    // ── PEAK HOUR GATE ────────────────────────────────────────────────────
+    if (isPeakHour()) {
+        Serial.printf("[Flush] PEAK HOUR — deferring upload (%d queued, will resume in ~%dmin)\n",
+                      pendingCount, PEAK_DEFER_MIN);
+        return;
+    }
 
     int toSend = min(pendingCount, UPLOAD_BATCH_SIZE);
     Serial.printf("[Flush] Uploading %d/%d queued record(s)...\n", toSend, pendingCount);
@@ -299,14 +324,12 @@ static void flushPending() {
 
     for (int i = 0; i < pendingCount; i++) {
         if (i < toSend) {
-            // Try to upload this record
             bool ok = attService.recordAttendance(
                 pendingQueue[i].empUid, pendingQueue[i].nfcUid,
                 deviceId, pendingQueue[i].clockType,
                 pendingQueue[i].timestamp, pendingQueue[i].date);
 
             if (!ok) {
-                // Upload failed — keep it for next cycle
                 keep[remaining++] = pendingQueue[i];
                 Serial.printf("[Flush] RETRY later: %s %s\n",
                               pendingQueue[i].empUid.c_str(),
@@ -318,7 +341,6 @@ static void flushPending() {
             }
             yield();
         } else {
-            // Beyond batch limit — keep for next cycle
             keep[remaining++] = pendingQueue[i];
         }
     }
@@ -329,62 +351,25 @@ static void flushPending() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// SOCKET POLLER — employee data / profile / status only
-//
-// DESIGN CHANGE:
-//   The previous poller also polled /api/socket for attendance_created /
-//   attendance_updated events and called fetchTodayAttendance*() in response.
-//   Those HTTP calls (3-12 s) blocked loop(), causing the clock display to
-//   freeze and the "last scan" strip to stall.
-//
-//   NEW BEHAVIOUR:
-//   • Only processes employee-related events: employee_created,
-//     employee_updated, employee_status_changed, employee_deleted.
-//   • Attendance events (attendance_created, attendance_updated, etc.) are
-//     intentionally IGNORED here. Attendance stays in sync via:
-//       – flushPending()  (background upload, UPLOAD_FLUSH_MS cadence)
-//       – seedTodayAttendanceFromServer()  (initial boot seed)
-//       – periodic re-seed block in loop() (RESEED_INTERVAL_MS)
-//   • This keeps the poller's total wall-clock time to a single short HTTP
-//     call (~200-400 ms) so the clock never freezes.
+// SOCKET POLLER — employee-only events
 // ════════════════════════════════════════════════════════════════════════════
 static void pollSocketEvents() {
     if (!wifiConfig.isConnected()) return;
-
-    // ── Employee profile / status sync ────────────────────────────────────
-    // EmployeeSync::pollChanges() fetches /api/socket.php?action=poll&since=…
-    // and processes ONLY employee_created / employee_updated /
-    // employee_status_changed / employee_deleted events.
-    // It writes updated JSON profiles to the SD /employees/ cache so that
-    // the next NFC scan picks up the new name, status, or department
-    // without a server round-trip.
     int empChanges = EmployeeSync::pollChanges(attService, String(SERVER_URL));
     if (empChanges > 0) {
         Serial.printf("[Socket] %d employee change(s) applied to SD cache\n", empChanges);
-        // Refresh status dots — an employee status change may affect the
-        // "active employee" count shown in the dashboard header.
         if (currentState == STATE_DASHBOARD) {
             updateStatusDots(wifiConfig.isConnected(), SDDatabase::isReady(), true);
         }
     }
-    // NOTE: No attendance HTTP call here.
-    // Attendance seeding is handled by seedTodayAttendanceFromServer() on boot
-    // and by the periodic re-seed block inside loop() (RESEED_INTERVAL_MS).
-    // Scheduling an early re-seed via g_forceReseedAt is NOT triggered here
-    // because that would still block loop() for 3-6 s.
 }
 
 // ─── NTP Time Sync ────────────────────────────────────────────────────────────
 void syncNTPTime() {
     if (!wifiConfig.isConnected()) return;
     Serial.println("[Time] Syncing NTP...");
-
-    // configTime must be called from the main Arduino task (loopTask),
-    // never from inside an HTTP callback or lwIP callback context.
-    // esp_sntp_init() acquires the TCPIP lock internally — safe here.
     configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
 
-    // Wait up to 10s for sync — poll rather than block
     struct tm timeinfo;
     int attempts = 0;
     while (!getLocalTime(&timeinfo, 1000) && attempts < 10) {
@@ -403,15 +388,26 @@ void syncNTPTime() {
                       timeinfo.tm_year+1900, timeinfo.tm_mon+1, timeinfo.tm_mday,
                       clkH, clkM, clkS);
     } else {
-        Serial.println("[Time] NTP failed after 10s — using software clock");
+        Serial.println("[Time] NTP failed after 10s");
     }
 }
 
 // ─── Photo cache helper ───────────────────────────────────────────────────────
-static String downloadAndCachePhoto(const EmployeeProfile& emp) {
+// NOTE: Photo downloads only happen here as a fallback when a card is scanned
+// and no photo is on SD yet. The primary way to populate photos is via the
+// web portal "Sync Photos" action (manual, no auto-download at boot).
+static String getPhotoPath(const EmployeeProfile& emp) {
     if (!SDDatabase::isReady() || emp.uid.length() == 0) return "";
-    if (SDDatabase::hasPhoto(emp.uid)) return SDDatabase::photoPath(emp.uid);
-    if (!wifiConfig.isConnected()) return "";
+    if (SDDatabase::hasPhoto(emp.uid)) {
+        String cand = SDDatabase::photoPath(emp.uid);
+        if (SD_MMC.exists(cand)) {
+            File f = SD_MMC.open(cand, FILE_READ);
+            if (f && f.size() >= 100) { f.close(); return cand; }
+        }
+    }
+    // Only attempt download if WiFi is available — do NOT block NFC path here
+    // during peak hours; just return "" (profile shows without photo).
+    if (!wifiConfig.isConnected() || isPeakHour()) return "";
 
     Serial.println("[Photo] Downloading uid=" + emp.uid);
     uint8_t* buf = nullptr; int len = 0;
@@ -427,23 +423,15 @@ static String downloadAndCachePhoto(const EmployeeProfile& emp) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// seedTodayAttendanceFromServer
+// seedTodayAttendanceFromServer  (manual + boot)
 //
-// Pulls today's attendance from the server and writes missing entries into
-// the local SD CSV so resolveClockType() is correct after reboots or when
-// employees clocked in on another device / the web portal.
+// Pulls today's records from the server into the local SD CSV so that
+// resolveClockType() is accurate after reboots or web-portal entries.
 //
-// STRATEGY (v2 — ESP32-sync first):
-//   1. Try GET /api/attendance/esp32-sync?date=…  (daily_attendance_summary)
-//      • One HTTP call, all session slots per employee, saves a JSON snapshot.
-//      • Returns seeded > 0 or 0 (up-to-date) → done.
-//      • Returns -1 on network / decrypt error → fall through to raw endpoint.
-//   2. Fall back to GET /api/attendance?date=… (raw per-row endpoint).
-//      Same behaviour as before v2 — idempotent row-by-row seed.
-//   3. Refresh dashboard stats unconditionally so the display reflects the
-//      freshly seeded data.
-//
-// Only called once per session inside triggerInitialSync(), AFTER NTP sync.
+// Called:
+//   • Once at boot after NTP sync (triggerInitialSync)
+//   • On demand via web portal "Reseed Today" action
+//   • Periodically by loop() every RESEED_INTERVAL_MS — skipped during peak
 // ════════════════════════════════════════════════════════════════════════════
 static void seedTodayAttendanceFromServer() {
     if (!wifiConfig.isConnected()) return;
@@ -451,98 +439,65 @@ static void seedTodayAttendanceFromServer() {
 
     String today = dateStr();
     if (today.length() < 10) {
-        Serial.println("[Seed] Skipping — clock not yet synced (no NTP date)");
+        Serial.println("[Seed] Skipping — clock not yet synced");
         return;
     }
 
     Serial.println("[Seed] === Seeding today's attendance: " + today + " ===");
-    Serial.flush();
-
     int seeded = 0;
 
-    // ── PASS 1: Raw endpoint + SD profile enrichment (PRIMARY) ───────────
-    //
-    // WHY this is now PRIMARY:
-    //   The esp32-sync endpoint reads daily_attendance_summary, a server-side
-    //   aggregation table populated asynchronously. When the aggregation job
-    //   hasn't run, EVERY row has uid="", name="", all times null → 0 seeded.
-    //
-    //   seedCsvFromRawAttendance reads the LIVE attendance table directly
-    //   (always fresh), then enriches each row with the full employee profile
-    //   from the SD cache (/employees/<uid>.json) so name + dept are canonical.
-    //   This is the function that actually fills the CSV reliably.
-    Serial.println("[Seed] PASS 1: Raw endpoint + SD profile enrichment...");
-    Serial.flush();
+    // PASS 1: Raw live endpoint (always fresh)
     int rawResult = attService.seedCsvFromRawAttendance(today);
     if (rawResult > 0) {
         seeded += rawResult;
-        Serial.printf("[Seed] PASS 1: %d new CSV row(s) seeded\n", rawResult);
+        Serial.printf("[Seed] PASS 1: %d new row(s) seeded\n", rawResult);
     } else if (rawResult == 0) {
-        Serial.println("[Seed] PASS 1: 0 new rows (already up-to-date or no data yet)");
+        Serial.println("[Seed] PASS 1: 0 new rows (up-to-date or no data)");
     } else {
-        Serial.println("[Seed] PASS 1: network error (-1)");
+        Serial.println("[Seed] PASS 1: network error");
     }
 
-    // ── PASS 2: ESP32-sync snapshot refresh (keeps JSON file current) ─────
-    //
-    // Still call fetchTodayAttendanceEsp32 to refresh the snapshot JSON
-    // (/attendance/esp32_YYYY-MM-DD.json) used by the web portal fallback.
-    // Its internal dedup skips anything PASS 1 already wrote to the CSV.
-    // If the aggregation job HAS run, this seeds any remaining session slots.
-    Serial.println("[Seed] PASS 2: ESP32-sync snapshot refresh...");
-    Serial.flush();
+    // PASS 2: ESP32-sync snapshot (keeps JSON file current for portal fallback)
     int syncResult = attService.fetchTodayAttendanceEsp32(today);
     if (syncResult > 0) {
         seeded += syncResult;
-        Serial.printf("[Seed] PASS 2: %d additional esp32-sync row(s) seeded\n", syncResult);
-    } else if (syncResult == 0) {
-        Serial.println("[Seed] PASS 2: 0 new rows from esp32-sync (summary empty or all deduped)");
-    } else {
-        Serial.println("[Seed] PASS 2: esp32-sync failed (-1) — snapshot may be stale");
+        Serial.printf("[Seed] PASS 2: %d additional row(s) from esp32-sync\n", syncResult);
     }
 
-    // ── Always refresh dashboard stats after seeding ──────────────────────
     updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
                           max(0, SDDatabase::countTodayCheckOuts()));
-
     Serial.printf("[Seed] === Seed complete: %d total new row(s) ===\n", seeded);
-    Serial.flush();
 }
 
 // ─── triggerInitialSync ───────────────────────────────────────────────────────
+// Called once when WiFi first connects. Does NOT force-download employees
+// if the SD cache already exists — manual sync via portal is used instead.
 static void triggerInitialSync() {
     if (!wifiConfig.isConnected()) {
-        Serial.println("[Sync] SKIP: no WiFi — SD-only mode active");
+        Serial.println("[Sync] SKIP: no WiFi — SD-only mode");
         return;
     }
-    if (initialSyncDone) {
-        Serial.println("[Sync] SKIP: already synced this session");
-        return;
-    }
+    if (initialSyncDone) return;
     initialSyncDone = true;
 
-    Serial.println("[Sync] WiFi available — syncing employees (SD-first)");
-    Serial.printf("[Sync] Heap=%u  PSRAM=%u\n", ESP.getFreeHeap(), ESP.getFreePsram());
-    Serial.flush();
+    Serial.println("[Sync] WiFi available — checking employee cache (SD-first)");
 
+    // Only run full employee sync if cache is completely empty.
+    // Otherwise, let the user trigger it from the portal.
     bool hasCache = SDDatabase::isReady() &&
                     SD_MMC.exists("/employees") &&
                     SD_MMC.exists("/employees/sync_meta.json");
-    Serial.printf("[Sync] SD cache: %s\n", hasCache ? "exists — incremental" : "empty — full sync");
+    if (!hasCache) {
+        Serial.println("[Sync] SD cache empty — running first-time employee sync");
+        EmployeeSync::fullSyncIfNeeded(attService, true);
+    } else {
+        Serial.println("[Sync] SD cache present — skipping auto employee sync");
+    }
 
-    EmployeeSync::fullSyncIfNeeded(attService, !hasCache);
-
-    // ── SEED TODAY'S ATTENDANCE FROM SERVER ───────────────────────────────
-    // Must run AFTER fullSyncIfNeeded (employees must be in SD cache first)
-    // and AFTER NTP is available (dateStr() must return "YYYY-MM-DD").
-    // v2: tries /api/attendance/esp32-sync first (summary endpoint),
-    //     falls back to /api/attendance?date=… on failure.
-    // This ensures resolveClockType() is correct from the first tap of the day
-    // even if employees clocked in elsewhere before this device booted.
+    // Seed today's attendance from server
     seedTodayAttendanceFromServer();
 
-    // Notify any open browser that the seed is done — Attendance tab will
-    // auto-reload its table via the SSE stats listener.
+    // Broadcast stats to portal
     {
         int ins  = max(0, SDDatabase::countTodayCheckIns());
         int outs = max(0, SDDatabase::countTodayCheckOuts());
@@ -555,48 +510,37 @@ static void triggerInitialSync() {
         wifiManager.broadcastEvent("stats", statsJson);
     }
 
-    // Flush any records that were queued before WiFi came up
-    if (pendingCount > 0) flushPending();
+    if (pendingCount > 0 && !isPeakHour()) flushPending();
 
     drawStaticUI();
     updateStatusDots(true, SDDatabase::isReady(), true);
     updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
                           max(0, SDDatabase::countTodayCheckOuts()));
     Serial.println("[Sync] Complete");
-    Serial.flush();
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// handleNFCDetected  — FAST-TAP VERSION
+// handleNFCDetected  — FAST-TAP (< 200ms to profile display)
 //
-// CRITICAL CHANGE from previous version:
-//   ❌ OLD: attService.recordAttendance() called here → blocks loop for 1-3s
-//   ✅ NEW: SD log written here (< 5ms) → record enqueued → returns immediately
-//           Server upload happens in flushPending() on a 3s background timer.
-//
-// Tap-to-feedback latency: < 200ms (SD write + display render)
-// Server upload latency:   ~3s after tap (first flush cycle)
-//
-// Flow:
-//   1. Resolve employee UID from NFC card → SD mapping file
-//   2. Load employee profile from SD (offline-capable)
-//   3. If SD miss AND WiFi up: fetch from server + cache to SD
-//   4. Ensure photo cached on SD
-//   5. Determine next clock type
-//   6. Log attendance to SD immediately  ← local record guaranteed
-//   7. Enqueue for background upload     ← returns, does NOT block
-//   8. Show profile card + RECORDED badge
+// 1. Resolve employee UID → SD mapping
+// 2. Load profile from SD  (offline-capable)
+// 3. Server fallback only if SD miss AND WiFi up AND not peak hour
+// 4. Check photo on SD (no download during peak)
+// 5. Determine clock type from today's SD records
+// 6. Show profile card immediately
+// 7. Log to SD  (< 5ms — guaranteed local record)
+// 8. Enqueue for background upload (returns instantly)
+// 9. Broadcast SSE to portal
 // ════════════════════════════════════════════════════════════════════════════
 static void handleNFCDetected(const String& cardIdentifier) {
     Serial.println("\n================================================");
-    Serial.println("[NFC] Card detected: " + cardIdentifier);
-    Serial.printf("[NFC] Heap=%u  PSRAM=%u  SD=%s  WiFi=%s  Queue=%d\n",
+    Serial.println("[NFC] Card: " + cardIdentifier);
+    Serial.printf("[NFC] Heap=%u PSRAM=%u SD=%s WiFi=%s Q=%d Peak=%s\n",
         ESP.getFreeHeap(), ESP.getFreePsram(),
         SDDatabase::isReady() ? "OK" : "NO",
         wifiConfig.isConnected() ? "OK" : "NO",
-        pendingCount);
-    Serial.println("================================================");
-    Serial.flush();
+        pendingCount,
+        isPeakHour() ? "YES" : "NO");
 
     lastNFCUid = cardIdentifier;
     enterState(STATE_NFC_LOADING);
@@ -605,29 +549,29 @@ static void handleNFCDetected(const String& cardIdentifier) {
     EmployeeProfile emp;
     bool fromCache = false;
 
-    // ── STEP 1: Resolve employee UID from card ID ─────────────────────────
+    // ── STEP 1: Resolve UID ───────────────────────────────────────────────
     String empUid = SDDatabase::loadUidForNfc(cardIdentifier);
     if (empUid.length() == 0 && SDDatabase::hasEmployeeProfile(cardIdentifier))
         empUid = cardIdentifier;
-    Serial.printf("[STEP-1] empUid='%s'\n", empUid.c_str());
 
-    // ── STEP 2: Load profile from SD (SD-FIRST, offline-capable) ─────────
+    // ── STEP 2: Load from SD ──────────────────────────────────────────────
     if (empUid.length() > 0 && SDDatabase::hasEmployeeProfile(empUid)) {
         if (SDDatabase::loadEmployeeProfile(empUid, emp)) {
             fromCache = true;
             Serial.printf("[STEP-2] SD hit: %s\n", emp.fullName.c_str());
-        } else {
-            Serial.println("[STEP-2] SD hit but load FAILED");
         }
-    } else {
-        Serial.println("[STEP-2] SD miss");
     }
 
-    // ── STEP 3: Server fallback (only if SD miss) ─────────────────────────
+    // ── STEP 3: Server fallback (only if SD miss, WiFi up, not peak) ──────
     if (!fromCache) {
         if (!wifiConfig.isConnected()) {
-            Serial.println("[STEP-3] Offline + unknown card — no log");
             empDisplay->showError("Unknown Card\n(Offline)");
+            enterState(STATE_NFC_ERROR);
+            return;
+        }
+        // During peak, skip slow server auth — unknown cards get a brief error
+        if (isPeakHour()) {
+            empDisplay->showError("Unknown Card\n(Peak Mode)");
             enterState(STATE_NFC_ERROR);
             return;
         }
@@ -635,7 +579,6 @@ static void handleNFCDetected(const String& cardIdentifier) {
         Serial.println("[STEP-3] Fetching from server...");
         bool granted = attService.authenticateNFC(cardIdentifier, deviceId, emp);
         if (!granted) {
-            Serial.println("[STEP-3] Server denied — no log");
             empDisplay->showError(emp.hasData ? "Access Denied" : "Card Not Registered");
             enterState(STATE_NFC_ERROR);
             return;
@@ -644,37 +587,22 @@ static void handleNFCDetected(const String& cardIdentifier) {
         if (SDDatabase::isReady() && emp.uid.length() > 0) {
             SDDatabase::saveEmployeeProfile(emp.uid, emp);
             SDDatabase::saveNfcMapping(cardIdentifier, emp.uid);
-            Serial.println("[STEP-3] Cached to SD for offline use");
         }
     }
 
-    // ── STEP 3b: Inactive employee check ──────────────────────────────────
-    // If the employee's status is anything other than "Active", show the
-    // HR warning block and stop — no attendance is logged or uploaded.
+    // ── STEP 3b: Inactive check ───────────────────────────────────────────
     if (emp.hasData && emp.status.length() > 0 && emp.status != "Active") {
-        Serial.printf("[NFC] Employee '%s' is INACTIVE (status='%s') — blocking scan\n",
-                      emp.fullName.c_str(), emp.status.c_str());
+        Serial.printf("[NFC] Inactive employee '%s' — blocking\n", emp.fullName.c_str());
         empDisplay->showInactive(emp.fullName);
-        enterState(STATE_NFC_ERROR);   // reuses the same 2 s display + return-to-dashboard flow
+        enterState(STATE_NFC_ERROR);
         return;
     }
 
-    // ── STEP 4: Photo ─────────────────────────────────────────────────────
-    String photoPath = "";
-    if (SDDatabase::isReady() && emp.uid.length() > 0) {
-        if (SDDatabase::hasPhoto(emp.uid)) {
-            String cand = SDDatabase::photoPath(emp.uid);
-            if (SD_MMC.exists(cand)) {
-                File f = SD_MMC.open(cand, FILE_READ);
-                if (f && f.size() >= 100) { photoPath = cand; f.close(); }
-            }
-        }
-        if (photoPath.length() == 0 && wifiConfig.isConnected())
-            photoPath = downloadAndCachePhoto(emp);
-    }
+    // ── STEP 4: Photo path (SD only; no download during peak) ────────────
+    String photoPath = getPhotoPath(emp);
     Serial.printf("[STEP-4] photo='%s'\n", photoPath.c_str());
 
-    // ── STEP 5: Determine clock type ──────────────────────────────────────
+    // ── STEP 5: Clock type ────────────────────────────────────────────────
     String clockType = resolveClockType(emp.uid);
     emp.clockType = clockType;
     lastClockType = clockType;
@@ -683,27 +611,21 @@ static void handleNFCDetected(const String& cardIdentifier) {
 
     // ── STEP 6: Show profile card ─────────────────────────────────────────
     empDisplay->showEmployeeProfile(emp, photoPath);
-    Serial.println("[STEP-6] Profile shown");
 
-    // ── STEP 7: Log to SD immediately (guaranteed local record) ──────────
-    String ts        = clockStr();    // "HH:MM:SS"
-    String todayDate = dateStr();     // "YYYY-MM-DD" or ""
+    // ── STEP 7: Log to SD immediately ────────────────────────────────────
+    String ts        = clockStr();
+    String todayDate = dateStr();
 
     if (SDDatabase::isReady()) {
         SDDatabase::logAttendance(ts, cardIdentifier, emp, clockType, deviceId);
-        Serial.println("[STEP-7] SD logged — instant local record confirmed");
+        Serial.println("[STEP-7] SD logged");
     }
 
-    // ── STEP 8: Enqueue for background upload — DO NOT BLOCK HERE ─────────
-    // This returns immediately. flushPending() will POST to the server on the
-    // next UPLOAD_FLUSH_MS tick in loop(). Even if WiFi is down, the record is
-    // safe on SD and will sync when connectivity is restored.
+    // ── STEP 8: Enqueue (upload handled later by flushPending) ───────────
     enqueuePending(emp.uid, cardIdentifier, clockType, ts, todayDate);
-    Serial.printf("[STEP-8] Enqueued for upload. Queue size: %d\n", pendingCount);
+    Serial.printf("[STEP-8] Enqueued. Queue=%d\n", pendingCount);
 
-    // ── STEP 9: Broadcast SSE so the web portal updates instantly ─────────
-    // This pushes a "scan" event to the Dashboard live feed AND triggers the
-    // Attendance tab auto-refresh (via the SSE listener added there).
+    // ── STEP 9: Broadcast SSE ─────────────────────────────────────────────
     {
         String dispType = clockType;
         dispType.replace("_", " ");
@@ -713,7 +635,6 @@ static void handleNFCDetected(const String& cardIdentifier) {
                         + "\",\"time\":\"" + String(tsShort) + "\"}";
         wifiManager.broadcastEvent("scan", scanJson);
 
-        // Also push updated stats so Dashboard counters stay live
         int ins  = max(0, SDDatabase::countTodayCheckIns());
         int outs = max(0, SDDatabase::countTodayCheckOuts());
         uint64_t freeMB = SDDatabase::freeBytes() / 1048576;
@@ -724,137 +645,93 @@ static void handleNFCDetected(const String& cardIdentifier) {
         wifiManager.broadcastEvent("stats", statsJson);
     }
 
-    // "RECORDED" badge over the photo
     empDisplay->showSuccess(emp.fullName);
-
-    // Cooldown tracking
     lastAcceptedScanAt = millis();
     lastAcceptedCardId = cardIdentifier;
 
-    Serial.println("[STEP-8] Done → NFC_PROFILE timer (tap complete in ~200ms)");
-    Serial.println("================================================");
-    Serial.flush();
-
+    Serial.println("[NFC] Done → STATE_NFC_PROFILE (2s timer)");
     enterState(STATE_NFC_PROFILE);
 }
 
 // ─── setup ───────────────────────────────────────────────────────────────────
+// Fast boot: no long delays between steps. All steps are sequential but each
+// one is as tight as possible. Target: ready for NFC taps within 4 seconds.
 void setup() {
     Serial.begin(115200);
-    { unsigned long t0 = millis(); while (!Serial && millis()-t0 < 5000) delay(10); }
-    delay(200);
+    delay(100);   // minimal: just enough for USB CDC to settle
 
     SDLogger::beginSerial();
     SDLogger::flushEarlyBuffer();
     SDLogger::installPanicHandler();
 
-    Serial.println();
-    Serial.println("========================================");
-    Serial.println("[Boot] JJC NFC Attendance System");
+    Serial.println("\n========================================");
+    Serial.println("[Boot] JJC NFC Attendance System v3");
     Serial.printf("[Boot] %s  cores=%d  %dMHz\n",
                   ESP.getChipModel(), ESP.getChipCores(), getCpuFrequencyMhz());
     Serial.printf("[Boot] Heap=%u  PSRAM=%u\n", ESP.getFreeHeap(), ESP.getPsramSize());
-
-    // ── PSRAM check ───────────────────────────────────────────────────────────
-    // If PSRAM is not detected the large JSON allocations in attendance_http_service.h
-    // will exhaust the 320KB internal heap and cause a panic.
-    // Make sure board_build.arduino.memory_type = qio_opi in platformio.ini
-    // and BOARD_HAS_PSRAM=1 is in build_flags.
-    if (!psramFound()) {
-        Serial.println("[Boot] WARNING: PSRAM not detected! Large JSON allocations");
-        Serial.println("[Boot]          may exhaust heap. Check platformio.ini.");
-        Serial.println("[Boot]          memory_type should be qio_opi for WROOM-1");
-    } else {
-        Serial.printf("[Boot] PSRAM OK: %u bytes available\n", ESP.getFreePsram());
-    }
-    Serial.println("========================================");
-    Serial.flush();
+    if (!psramFound())
+        Serial.println("[Boot] WARNING: PSRAM not detected!");
 
     // ── 1. TFT ────────────────────────────────────────────────────────────
-    Serial.println("[Boot] 1/6 TFT...");
     if (!TFTDisplayManager::init(0)) {
-        Serial.println("[Boot] TFT FAILED — halt");
         while (true) delay(2000);
     }
     dashboardInit();
-    showLoadingAnimation(0, "Initializing...");
+    showLoadingAnimation(0, "Booting...");
     empDisplay = new EmployeeProfileDisplay();
-    showLoadingAnimation(15, "Display OK");
-    delay(100);
 
     // ── 2. SD Card ────────────────────────────────────────────────────────
-    Serial.println("[Boot] 2/6 SD...");
-    showLoadingAnimation(20, "Mounting SD...");
+    showLoadingAnimation(20, "SD...");
     if (SDDatabase::begin()) {
-        showLoadingAnimation(35, "SD Ready");
-        Serial.println("[Boot] SD OK — offline mode available");
-        SDDatabase::printInfo();
+        Serial.println("[Boot] SD OK");
     } else {
-        showLoadingAnimation(35, "SD FAILED");
-        Serial.println("[Boot] SD FAILED — no local cache");
+        showLoadingAnimation(20, "SD FAILED");
+        Serial.println("[Boot] SD FAILED");
     }
-    delay(100);
 
     // ── 3. NFC ────────────────────────────────────────────────────────────
-    Serial.println("[Boot] 3/6 NFC...");
-    showLoadingAnimation(40, "NFC Init...");
+    showLoadingAnimation(35, "NFC...");
     if (!nfcInit()) {
         showLoadingAnimation(100, "NFC FAILED!");
-        Serial.println("[Boot] NFC FAILED — halt");
-        delay(1000); while (true) delay(2000);
+        delay(500);
+        while (true) delay(2000);
     }
-    showLoadingAnimation(60, "NFC Ready");
     Serial.println("[Boot] NFC OK");
-    delay(100);
 
-    // ── 4. WiFi ───────────────────────────────────────────────────────────
-    Serial.println("[Boot] 4/6 WiFi...");
-    showLoadingAnimation(65, "WiFi connecting...");
+    // ── 4. WiFi (non-blocking connect attempt) ────────────────────────────
+    showLoadingAnimation(50, "WiFi...");
     wifiConfig.begin();
     if (wifiConfig.isConnected()) {
-        showLoadingAnimation(80, ("WiFi: " + wifiConfig.getSSID()).c_str());
-        Serial.println("[Boot] WiFi: " + wifiConfig.getSSID() +
-                       "  IP=" + wifiConfig.getIPAddress());
+        showLoadingAnimation(65, ("WiFi: " + wifiConfig.getSSID()).c_str());
         syncNTPTime();
     } else {
-        showLoadingAnimation(80, "WiFi: AP mode (SD-only)");
-        Serial.println("[Boot] WiFi not connected — running SD-only");
+        showLoadingAnimation(65, "WiFi: AP mode");
+        Serial.println("[Boot] WiFi not connected — SD-only");
     }
-    delay(100);
 
     // ── 5. Web portal ─────────────────────────────────────────────────────
-    Serial.println("[Boot] 5/6 Portal...");
-    showLoadingAnimation(85, "Web Portal...");
+    showLoadingAnimation(80, "Portal...");
     wifiManager.init(deviceId, &wifiConfig, SERVER_URL, &attService);
-    showLoadingAnimation(95, "Portal Ready");
-    delay(100);
 
-    // ── 6. Ready ──────────────────────────────────────────────────────────
-    showLoadingAnimation(100, "System Ready!");
-    delay(300);
+    // ── 6. Ready — draw dashboard immediately, THEN sync in background ────
+    showLoadingAnimation(100, "READY!");
+    delay(200);   // brief flash of READY before dashboard
 
     TFT_eSPI* t = dashboardGetTFT();
     t->fillScreen(TFTColors::BLACK);
-    t->setTextColor(TFTColors::GREEN);
-    t->setTextDatum(MC_DATUM);
-    t->drawString("READY!", SCREEN_W/2, SCREEN_H/2, 4);
-    t->setTextDatum(TL_DATUM);
-    delay(400);
-
     drawStaticUI();
     updateStatusDots(wifiConfig.isConnected(), SDDatabase::isReady(), true);
     updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
                           max(0, SDDatabase::countTodayCheckOuts()));
     enterState(STATE_DASHBOARD);
 
-    Serial.flush();
-
+    // Initial sync runs AFTER dashboard is live — NFC already accepts taps
     if (wifiConfig.isConnected()) {
         triggerInitialSync();
         updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
                               max(0, SDDatabase::countTodayCheckOuts()));
     } else {
-        Serial.println("[Ready] SD-only mode — scanning active");
+        Serial.println("[Ready] SD-only — scanning active");
     }
 
     Serial.println("[Ready] NFC scanning active");
@@ -870,9 +747,9 @@ void loop() {
     static unsigned long lastNFCPoll     = 0;
     static unsigned long lastStats       = 0;
     static unsigned long lastWifiRetry   = 0;
-    static unsigned long lastUploadFlush = 0;   // ← NEW: background upload timer
+    static unsigned long lastUploadFlush = 0;
     static unsigned long lastSocketPoll  = 0;
-    static unsigned long lastReSeed      = 0;   // ← periodic SD re-seed from server
+    static unsigned long lastReSeed      = 0;
     static bool          wasConnected    = false;
     static uint8_t       tick            = 0;
     unsigned long now = millis();
@@ -886,7 +763,7 @@ void loop() {
         wasConnected = true;
         Serial.println("[WiFi] Connected");
         syncNTPTime();
-        triggerInitialSync();       // seeds today's attendance from server on first connect
+        triggerInitialSync();
         updateStatusDots(true, SDDatabase::isReady(), true);
         drawStaticUI();
     }
@@ -902,44 +779,84 @@ void loop() {
         WiFi.reconnect();
     }
 
-    // ── Socket event poller ───────────────────────────────────────────────
-    if (isConnected && currentState == STATE_DASHBOARD &&
-        (now - lastSocketPoll >= SOCKET_POLL_MS)) {
-        lastSocketPoll = now;
-        // Guard: skip poll if heap is dangerously low (< 40KB free)
-        // A DynamicJsonDocument(4096) + HTTPClient headers need ~30-40KB
-        if (ESP.getFreeHeap() > 40000) {
-            pollSocketEvents();
-        } else {
-            Serial.printf("[Socket] SKIP: heap too low (%u)\n", ESP.getFreeHeap());
+    // ── Manual action triggers from web portal ────────────────────────────
+    if (g_triggerEmployeeSync) {
+        g_triggerEmployeeSync = false;
+        if (isConnected && currentState == STATE_DASHBOARD) {
+            Serial.println("[Action] Manual employee sync triggered");
+            EmployeeSync::fullSyncIfNeeded(attService, true);
+            drawStaticUI();
+            updateStatusDots(isConnected, SDDatabase::isReady(), true);
+        }
+    }
+    if (g_triggerReseedToday) {
+        g_triggerReseedToday = false;
+        if (isConnected && currentState == STATE_DASHBOARD) {
+            Serial.println("[Action] Manual reseed triggered");
+            seedTodayAttendanceFromServer();
+            updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
+                                  max(0, SDDatabase::countTodayCheckOuts()));
+        }
+    }
+    if (g_triggerPhotoSync) {
+        g_triggerPhotoSync = false;
+        if (isConnected && currentState == STATE_DASHBOARD) {
+            Serial.println("[Action] Manual photo sync triggered");
+            // Walk /employees/*.json and download any missing photo
+            File root = SD_MMC.open("/employees");
+            if (root) {
+                File f = root.openNextFile();
+                while (f) {
+                    String name = String(f.name());
+                    if (name.endsWith(".json") && !name.endsWith("sync_meta.json")
+                        && !name.endsWith("photo_results.csv")) {
+                        // Extract UID from filename
+                        String uid = name;
+                        int sl = uid.lastIndexOf('/');
+                        if (sl >= 0) uid = uid.substring(sl + 1);
+                        uid.replace(".json", "");
+                        if (uid.length() > 0 && !SDDatabase::hasPhoto(uid)) {
+                            Serial.println("[PhotoSync] Downloading: " + uid);
+                            uint8_t* buf = nullptr; int len = 0;
+                            if (attService.downloadProfileImage(uid, &buf, &len, "")) {
+                                SDDatabase::savePhoto(uid, buf, (size_t)len);
+                                free(buf);
+                                Serial.println("[PhotoSync] Saved: " + uid);
+                            }
+                            yield();
+                        }
+                    }
+                    f.close();
+                    f = root.openNextFile();
+                }
+                root.close();
+            }
+            Serial.println("[PhotoSync] Done");
         }
     }
 
-    // ── Periodic SD re-seed from server ──────────────────────────────────
-    // FIX: ONE HTTP call per cycle instead of three back-to-back.
-    //
-    // Root cause of the 5-minute clock freeze:
-    //   Old code: fetchTodayAttendanceEsp32 (6s) + fetchTodayAttendance (6s)
-    //           + fetchAndSeedByEmployeeList (N x 8s per employee) = ~18-20s
-    //   All three ran synchronously on the Arduino main thread, blocking
-    //   loop(), freezing the clock display, and pausing the count.
-    //
-    // Fix: alternates between esp32-sync and raw on successive 5-min cycles
-    //   (one HTTP call = max 6s, which catchUpClock() recovers cleanly).
-    //   fetchAndSeedByEmployeeList is removed — it walks all employees with
-    //   N HTTP calls and must only run at initial sync, not every 5 min.
-    //   g_forceReseedAt (set by pollSocketEvents) allows an early cycle.
+    // ── Socket event poller (employee profile updates) ────────────────────
+    if (isConnected && currentState == STATE_DASHBOARD &&
+        !isPeakHour() &&
+        (now - lastSocketPoll >= SOCKET_POLL_MS)) {
+        lastSocketPoll = now;
+        if (ESP.getFreeHeap() > 40000) {
+            pollSocketEvents();
+        }
+    }
+
+    // ── Periodic SD re-seed from server (skipped during peak) ─────────────
     {
         bool timerFired = (now - lastReSeed >= RESEED_INTERVAL_MS);
         bool forceFired = (now >= g_forceReseedAt);
         if (isConnected && currentState == STATE_DASHBOARD &&
             SDDatabase::isReady() && dateStr().length() >= 10 &&
+            !isPeakHour() &&
             (timerFired || forceFired)) {
 
             lastReSeed      = now;
-            g_forceReseedAt = 0xFFFFFFFFUL;  // clear force flag
+            g_forceReseedAt = 0xFFFFFFFFUL;
 
-            // Alternate esp32-sync <-> raw on successive cycles
             static bool useEsp32Sync = true;
             int rs = 0;
             if (useEsp32Sync) {
@@ -965,25 +882,18 @@ void loop() {
         }
     }
 
-    // ── Background upload scheduler (CORE OF FAST-TAP FIX) ───────────────
-    // Runs every UPLOAD_FLUSH_MS when:
-    //   • WiFi is connected (server reachable)
-    //   • There are records in the queue
-    //   • System is on the dashboard (not mid-scan display)
-    //     This last condition prevents the HTTP call from competing with
-    //     the TFT render during the 2-second profile display window.
+    // ── Background upload scheduler ───────────────────────────────────────
+    // Runs only when: WiFi up + records queued + on dashboard + not peak hour
     if (isConnected && pendingCount > 0 &&
         currentState == STATE_DASHBOARD &&
         (now - lastUploadFlush >= UPLOAD_FLUSH_MS)) {
         lastUploadFlush = now;
-        flushPending();
+        flushPending();   // isPeakHour() check is inside flushPending()
 
-        // Refresh stats after upload so the dashboard counts stay live
         if (currentState == STATE_DASHBOARD) {
             int ins  = max(0, SDDatabase::countTodayCheckIns());
             int outs = max(0, SDDatabase::countTodayCheckOuts());
             updateAttendanceStats(ins, outs);
-            // Push updated counts to any open web portal browser
             uint64_t freeMB = SDDatabase::freeBytes() / 1048576;
             String statsJson = "{\"ins\":" + String(ins)
                              + ",\"outs\":" + String(outs)
@@ -995,8 +905,9 @@ void loop() {
 
     // ── State machine ─────────────────────────────────────────────────────
     switch (currentState) {
- 
+
         case STATE_NFC_PROFILE:
+            // Wait exactly PROFILE_DISPLAY_MS (2s) then snap back to dashboard
             if (stateElapsed() >= PROFILE_DISPLAY_MS) {
                 enterState(STATE_DASHBOARD);
                 drawStaticUI();
@@ -1013,7 +924,7 @@ void loop() {
                 }
             }
             break;
- 
+
         case STATE_NFC_ERROR:
             if (stateElapsed() >= PROFILE_DISPLAY_MS) {
                 enterState(STATE_DASHBOARD);
@@ -1023,14 +934,11 @@ void loop() {
                                       max(0, SDDatabase::countTodayCheckOuts()));
             }
             break;
- 
+
         default: break;
     }
 
     // ── Clock tick ────────────────────────────────────────────────────────
-    // catchUpClock advances by ALL seconds elapsed since lastClock.
-    // If loop() was blocked by HTTP, the clock catches up instantly
-    // instead of appearing frozen then jumping.
     if (currentState == STATE_DASHBOARD) {
         int ticked = catchUpClock(lastClock);
         if (ticked > 0) {
@@ -1040,14 +948,15 @@ void loop() {
             if (tick % 60   == 0) updateDate(buildDateStr());
             if (tick % 3600 == 0 && isConnected) syncNTPTime();
 
-        if (clkH == 0 && clkM == 0 && clkS == 0) {
-            Serial.println("[Midnight] New day — resetting stats and UI");
-            drawStaticUI();
-            updateStatusDots(isConnected, SDDatabase::isReady(), true);
-            updateAttendanceStats(0, 0);
-            updateDate(buildDateStr());
-            SDDatabase::setDateProvider([]() -> String { return dateStr(); });
-        }
+            if (clkH == 0 && clkM == 0 && clkS == 0) {
+                Serial.println("[Midnight] New day — resetting stats");
+                peakEndMin = 0xFFFF;  // reset peak tracking at midnight
+                drawStaticUI();
+                updateStatusDots(isConnected, SDDatabase::isReady(), true);
+                updateAttendanceStats(0, 0);
+                updateDate(buildDateStr());
+                SDDatabase::setDateProvider([]() -> String { return dateStr(); });
+            }
         }
     }
 
@@ -1059,59 +968,34 @@ void loop() {
     }
 
     // ── NFC poll ──────────────────────────────────────────────────────────
-    // FAST-NFC DESIGN: nfcData (NDEF text payload) is used as the card
-    // identifier when present because:
-    //   1. Text payloads are globally unique per employee (written by HR).
-    //   2. UID / serial numbers can be duplicated across card batches,
-    //      making them risky as sole identifiers.
-    //   3. NDEF text lookup skips the UID→empUid mapping file entirely —
-    //      one SD read less per scan.
-    //
-    // IDENTIFIER PRIORITY (fastest first):
-    //   a) nfcData (NDEF text) — used directly as the lookup key
-    //   b) nfcUID  (colon-hex) — fallback when card has no NDEF payload
-    //
-    // Both paths go through the same handleNFCDetected() → SD lookup chain.
     if (currentState != STATE_NFC_LOADING &&
         (now - lastNFCPoll >= NFC_POLL_INTERVAL_MS)) {
         lastNFCPoll = now;
 
         uint8_t uid[7] = {0}; uint8_t uidLen = 0;
-        if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen, 100)) {
+        if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen, 50)) {
             nfcProcessCard(uid, uidLen);
 
-            // ── Choose best identifier ────────────────────────────────────
-            // nfcData is the NDEF text payload (e.g. employee UUID written by HR).
-            // When present it is always preferred over the hardware UID because
-            // UID serial numbers can be non-unique across card manufacturers.
             String cardId;
             if (nfcData.length() >= MIN_CARD_ID_LEN) {
-                // NDEF text path — fastest and safest
                 cardId = nfcData;
-                Serial.printf("[NFC] Using NDEF text as identifier: '%s'\n", cardId.c_str());
             } else if (nfcUID.length() >= MIN_CARD_ID_LEN) {
-                // UID fallback (no NDEF payload on this card)
                 cardId = nfcUID;
-                Serial.printf("[NFC] No NDEF text — falling back to UID: '%s'\n", cardId.c_str());
             } else {
-                // Both too short — noise/partial read, discard
-                Serial.printf("[NFC] NOISE — UID len=%d NDEF len=%d — ignored\n",
-                              (int)nfcUID.length(), (int)nfcData.length());
                 goto nfc_poll_end;
             }
 
             if (!cardConfirmed(cardId)) {
-                Serial.printf("[NFC] CONFIRMING: '%s'\n", cardId.c_str());
+                // still counting confirmations
 
             } else if (cardId == lastAcceptedCardId &&
                        (now - lastAcceptedScanAt) < SCAN_COOLDOWN_MS) {
-                // Same card resting on reader — cooldown (silent)
+                // same card on reader — cooldown
 
             } else if (currentState != STATE_DASHBOARD) {
-                Serial.printf("[NFC] WAITING: '%s' (not on dashboard)\n", cardId.c_str());
+                // waiting for profile display to finish
 
             } else {
-                Serial.println("[NFC] ACCEPTED: " + cardId);
                 _lastRawCard   = cardId;
                 _cardConfirmCt = CARD_CONFIRM_NEEDED;
                 handleNFCDetected(cardId);

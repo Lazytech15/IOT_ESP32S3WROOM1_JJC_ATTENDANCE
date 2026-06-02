@@ -290,6 +290,9 @@ label{font-size:.8rem;color:var(--dim);display:block;margin-bottom:4px}
         _srv.on("/api/wifi/connect",    HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiConnect(); });
         _srv.on("/api/wifi/disconnect", HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiDisconnect(); });
         _srv.on("/api/reboot",     HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiReboot(); });
+        _srv.on("/api/sync/employees", HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiSyncEmployees(); });
+        _srv.on("/api/sync/photos",    HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiSyncPhotos(); });
+        _srv.on("/api/sync/reseed",    HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiReseedToday(); });
     }
 
     void _redir() { _srv.sendHeader("Location","/login"); _srv.send(302); }
@@ -1104,28 +1107,69 @@ loadCsv('today');
     </div>
     <div style="background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:8px;padding:14px;text-align:center">
       <div style="font-size:1.6rem;margin-bottom:6px">&#128247;</div>
-      <div style="font-size:.82rem;font-weight:600;margin-bottom:8px">Employee Photos</div>
+      <div style="font-size:.82rem;font-weight:600;margin-bottom:8px">Browse SD Files</div>
       <a href="/portal/files" class="btn btn-ghost btn-sm">Browse SD</a>
     </div>
-    <div style="background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:8px;padding:14px;text-align:center;opacity:.5">
-      <div style="font-size:1.6rem;margin-bottom:6px">&#128465;</div>
-      <div style="font-size:.82rem;font-weight:600;margin-bottom:8px">Clear Cache</div>
-      <button class="btn btn-ghost btn-sm" disabled>Coming Soon</button>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">Manual Data Sync
+    <span style="font-size:.72rem;color:#64748b;margin-left:8px;font-weight:400">(run only when needed — not automatic)</span>
+  </div>
+  <p style="font-size:.82rem;color:#64748b;margin:0 0 12px">
+    Employee profiles and photos are NOT downloaded automatically at boot.<br>
+    Use these buttons when you add new employees or upload a new photo on the server.
+  </p>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px">
+    <div style="background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:8px;padding:14px">
+      <div style="font-size:1.4rem;margin-bottom:6px">&#128100;</div>
+      <div style="font-size:.82rem;font-weight:600;margin-bottom:4px">Sync Employees</div>
+      <div style="font-size:.75rem;color:#64748b;margin-bottom:10px">Downloads all employee profiles from server to SD card.</div>
+      <button class="btn btn-primary btn-sm" onclick="doAction('/api/sync/employees','Syncing employees...')">Sync Employees</button>
     </div>
-    <div style="background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:8px;padding:14px;text-align:center;opacity:.5">
-      <div style="font-size:1.6rem;margin-bottom:6px">&#128100;</div>
-      <div style="font-size:.82rem;font-weight:600;margin-bottom:8px">Manage Users</div>
-      <button class="btn btn-ghost btn-sm" disabled>Coming Soon</button>
+    <div style="background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:8px;padding:14px">
+      <div style="font-size:1.4rem;margin-bottom:6px">&#128247;</div>
+      <div style="font-size:.82rem;font-weight:600;margin-bottom:4px">Sync Photos</div>
+      <div style="font-size:.75rem;color:#64748b;margin-bottom:10px">Downloads missing profile photos to SD card.</div>
+      <button class="btn btn-primary btn-sm" onclick="doAction('/api/sync/photos','Downloading photos...')">Sync Photos</button>
     </div>
   </div>
-  <div id="actionMsg" class="alert"></div>
 </div>
+
+<div class="card">
+  <div class="card-title">Attendance Reseed
+    <span style="font-size:.72rem;color:#64748b;margin-left:8px;font-weight:400">(use after clearing local data)</span>
+  </div>
+  <p style="font-size:.82rem;color:#64748b;margin:0 0 12px">
+    Use this if you deleted today's local attendance CSV and want to re-download
+    today's records from the server. This ensures clock-in/out types are correct.
+  </p>
+  <div style="background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:8px;padding:14px;display:inline-block;min-width:200px">
+    <div style="font-size:1.4rem;margin-bottom:6px">&#128260;</div>
+    <div style="font-size:.82rem;font-weight:600;margin-bottom:4px">Reseed Today's Attendance</div>
+    <div style="font-size:.75rem;color:#64748b;margin-bottom:10px">Fetches today's records from server and writes them to SD.</div>
+    <button class="btn btn-ghost btn-sm" onclick="doAction('/api/sync/reseed','Reseeding attendance...')">Reseed Today</button>
+  </div>
+</div>
+
+<div id="actionMsg" class="alert" style="display:none"></div>
 <script>
 function doReboot(){
   if(!confirm('Reboot the device?'))return;
-  fetch('/api/reboot',{method:'POST'}).then(r=>r.json()).then(function(){
-    var m=document.getElementById('actionMsg');
-    m.className='alert alert-ok';m.textContent='Rebooting...';m.style.display='block';
+  var m=document.getElementById('actionMsg');
+  m.className='alert alert-ok';m.textContent='Rebooting...';m.style.display='block';
+  fetch('/api/reboot',{method:'POST'});
+}
+function doAction(url,msg){
+  var m=document.getElementById('actionMsg');
+  m.className='alert';m.textContent=msg;m.style.display='block';
+  fetch(url,{method:'POST'}).then(r=>r.json()).then(function(d){
+    m.className=d.success?'alert alert-ok':'alert alert-err';
+    m.textContent=d.message||JSON.stringify(d);
+    m.style.display='block';
+  }).catch(function(e){
+    m.className='alert alert-err';m.textContent='Error: '+e;m.style.display='block';
   });
 }
 </script>
@@ -2613,5 +2657,29 @@ loadStatus();loadNets();
     void _apiReboot() {
         _srv.send(200,"application/json","{\"success\":true,\"message\":\"Rebooting...\"}");
         delay(500); ESP.restart();
+    }
+
+    // ── Manual employee sync (downloads all profiles from server) ──────────
+    void _apiSyncEmployees() {
+        extern volatile bool g_triggerEmployeeSync;
+        g_triggerEmployeeSync = true;
+        _srv.send(200,"application/json",
+            "{\"success\":true,\"message\":\"Employee sync queued. Check serial log for progress.\"}");
+    }
+
+    // ── Manual photo sync (downloads missing photos from server) ───────────
+    void _apiSyncPhotos() {
+        extern volatile bool g_triggerPhotoSync;
+        g_triggerPhotoSync = true;
+        _srv.send(200,"application/json",
+            "{\"success\":true,\"message\":\"Photo sync queued. New photos will download in background.\"}");
+    }
+
+    // ── Manual reseed (fetch today's attendance from server) ───────────────
+    void _apiReseedToday() {
+        extern volatile bool g_triggerReseedToday;
+        g_triggerReseedToday = true;
+        _srv.send(200,"application/json",
+            "{\"success\":true,\"message\":\"Reseed queued. Today attendance will refresh from server.\"}");
     }
 };

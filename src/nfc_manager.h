@@ -16,11 +16,16 @@
 //   • 4-byte UID → MIFARE Classic 1K          (block-4 NDEF Text record)
 // ══════════════════════════════════════════════════════════════════════════════
 
-// ── Pin configuration (Software SPI) ─────────────────────────────────────────
+// ── Pin configuration (Hardware SPI — HSPI on ESP32-S3) ──────────────────────
+// Pins 10-13 map to ESP32-S3 HSPI bus. Hardware SPI is ~10x faster than
+// software bit-bang, which is the primary cause of slow NFC recognition.
 #define PN532_SCK   12
 #define PN532_MISO  13
 #define PN532_MOSI  11
 #define PN532_SS    10
+
+// Hardware SPI bus instance shared by PN532
+extern SPIClass PN532_SPI;
 
 // ── Public PN532 instance ─────────────────────────────────────────────────────
 // Declared extern here so main.cpp can call readPassiveTargetID directly.
@@ -36,7 +41,7 @@ extern String        nfcUID;           // colon-separated HEX UID string
 // ── API ───────────────────────────────────────────────────────────────────────
 
 /**
- * @brief  Initialise the PN532 module (Software SPI).
+ * @brief  Initialise the PN532 module (Hardware SPI for fast recognition).
  *         Returns true on success; false if the chip is not found.
  */
 bool nfcInit();
