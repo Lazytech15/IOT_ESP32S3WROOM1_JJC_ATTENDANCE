@@ -28,8 +28,7 @@
 //
 //  6. MANUAL RESEED   — Portal action "Reseed Today" fetches fresh attendance
 //                       from the server. Useful after deleting local data.
-//                       The periodic auto-reseed is kept as a light background
-//                       task but does NOT run during peak hours.
+//                       Auto-reseed has been removed; seeding is manual-only.
 // ════════════════════════════════════════════════════════════════════════════
 
 #include <Arduino.h>
@@ -48,24 +47,31 @@
 #include "attendance_http_service.h"
 #include "sd_database.h"
 #include "employee_sync.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
 // ─── Timing constants ────────────────────────────────────────────────────────
-#define NFC_POLL_INTERVAL_MS      50    // PN532 poll cadence (tightened for speed with hardware SPI)
+#define NFC_POLL_INTERVAL_MS      30    // loop check cadence — how often we call readPassiveTargetID
+                                        // (the read itself still uses a 50ms RF timeout inside)
 #define CLOCK_UPDATE_MS         1000
 #define STATS_REFRESH_MS       30000
 #define WIFI_RETRY_MS          20000
+#define SCREEN_TIMEOUT_MS     300000   // 5 minutes of inactivity → backlight off
 
 // ── PROFILE DISPLAY ───────────────────────────────────────────────────────────
 // How long the employee photo/badge stays on screen after a scan.
-// 2000ms = 2 seconds — just enough for the card-holder to see their name,
-// then dashboard returns immediately for the next employee.
+// Normal:   2000ms — comfortable read time during quiet periods.
+// Peak:      800ms — fast turnover during rush-hour lineups.
+// The display auto-shortens during peak hours so the queue moves faster.
+// A new card from a DIFFERENT employee also short-circuits the wait immediately.
 #define PROFILE_DISPLAY_MS      2000
+#define PROFILE_DISPLAY_PEAK_MS  800   // rush-hour display time
 
 // ── UPLOAD SCHEDULER ──────────────────────────────────────────────────────────
-#define UPLOAD_FLUSH_MS          500    // background upload cadence (normal hours) — near-instant outside peak
+#define UPLOAD_FLUSH_MS      600000    // upload cadence: 10 minutes (was 500ms — was causing freeze after every scan)
 #define UPLOAD_BATCH_SIZE          1    // one HTTP call per cycle → predictable latency
-#define SOCKET_POLL_MS          8000
-#define RESEED_INTERVAL_MS    300000    // auto-reseed every 5 min (skipped during peak)
+#define SOCKET_POLL_MS       3600000   // 1 hour — prevents clock freeze on dashboard
 
 // ── PEAK HOUR DEFERRAL ────────────────────────────────────────────────────────
 // During rush windows the upload queue is NOT flushed to the server.
@@ -104,8 +110,9 @@ static int catchUpClock(unsigned long& lastClock) {
     unsigned long elapsed = now - lastClock;
     if (elapsed < 1000) return 0;
     int ticks = (int)(elapsed / 1000);
-    if (ticks > 60) ticks = 60;
-    lastClock += (unsigned long)ticks * 1000;
+    // No cap — after a long sleep we must jump to the correct time.
+    // Anchor lastClock so the next call starts from a clean slate.
+    lastClock = now - (elapsed % 1000);   // keep sub-second remainder
     for (int i = 0; i < ticks; i++) tickClock();
     return ticks;
 }
@@ -185,7 +192,55 @@ AttendanceHTTPService  attService(SERVER_URL);
 EmployeeProfileDisplay* empDisplay = nullptr;
 
 static bool initialSyncDone = false;
-static unsigned long g_forceReseedAt = 0xFFFFFFFFUL;
+
+// ─── Screen timeout ───────────────────────────────────────────────────────────
+static unsigned long lastActivityMs  = 0;   // last time the screen was "touched"
+static bool          screenIsOff     = false;
+
+static bool          wasConnectedGlobal = false;  // tracks WiFi state across loop()
+
+// Set true by wakeScreen() so loop()'s clock branch resets lastClock to now,
+// preventing a huge catch-up burst of ticks after a long standby.
+static bool g_clockNeedsReset = false;
+
+// Re-sync the software clock from the ESP32 RTC (no network needed).
+// The RTC keeps ticking during standby / screen-off, so this instantly
+// corrects any drift that accumulated while the display was blanked.
+static void resyncClockFromRTC() {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 0)) {
+        clkH     = timeinfo.tm_hour;
+        clkM     = timeinfo.tm_min;
+        clkS     = timeinfo.tm_sec;
+        clkEpoch = (uint32_t)mktime(&timeinfo);
+        Serial.printf("[Clock] RTC resync on wake: %02d:%02d:%02d\n",
+                      clkH, clkM, clkS);
+    } else {
+        // RTC unavailable (no NTP yet) — keep rolling from wherever we are
+        Serial.println("[Clock] RTC unavailable on wake, keeping software clock");
+    }
+}
+
+static void wakeScreen() {
+    if (screenIsOff) {
+        screenIsOff = false;
+
+        // Resync software clock from RTC so the display jumps to the correct
+        // time immediately rather than catching up second-by-second.
+        resyncClockFromRTC();
+        g_clockNeedsReset = true;   // anchor lastClock to now in loop()
+
+        TFTDisplayManager::backlightOn();
+        drawStaticUI();
+        updateClock(clkH, clkM, clkS);
+        updateDate(buildDateStr());
+        updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
+                              max(0, SDDatabase::countTodayCheckOuts()));
+        Serial.println("[Screen] Wake — screen restored");
+    }
+    lastActivityMs = millis();
+}
+static void resetScreenTimer() { lastActivityMs = millis(); }
 
 // Flags settable from web portal actions (checked in loop)
 volatile bool g_triggerEmployeeSync = false;   // download employees from server
@@ -210,6 +265,19 @@ static unsigned long lastAcceptedScanAt = 0;
 static String        lastAcceptedCardId = "";
 static String        _lastRawCard       = "";
 static uint8_t       _cardConfirmCt     = 0;
+
+// ── Deferred stats refresh flag ──────────────────────────────────────────────
+// Set to true when the state machine returns to dashboard after a scan.
+// loop() reads this on the NEXT tick and refreshes attendance stats (which
+// require SD file scans) WITHOUT blocking the NFC poll or clock on the
+// same tick as the drawStaticUI() redraw.
+static bool g_pendingStatsRefresh = false;
+
+// ── Scan-ahead buffer ────────────────────────────────────────────────────────
+// During rush hour the profile display is showing (STATE_NFC_PROFILE) but the
+// next person has already tapped. We buffer that card so the state machine can
+// process it the instant the display clears — zero idle gap between employees.
+static String        _nextPendingCard   = "";   // buffered while in NFC_PROFILE/ERROR
 
 static bool cardConfirmed(const String& cardId) {
     if (cardId == _lastRawCard) {
@@ -431,7 +499,6 @@ static String getPhotoPath(const EmployeeProfile& emp) {
 // Called:
 //   • Once at boot after NTP sync (triggerInitialSync)
 //   • On demand via web portal "Reseed Today" action
-//   • Periodically by loop() every RESEED_INTERVAL_MS — skipped during peak
 // ════════════════════════════════════════════════════════════════════════════
 static void seedTodayAttendanceFromServer() {
     if (!wifiConfig.isConnected()) return;
@@ -519,6 +586,60 @@ static void triggerInitialSync() {
     Serial.println("[Sync] Complete");
 }
 
+
+// ════════════════════════════════════════════════════════════════════════════
+// NFC WORKER TASK  — runs on Core 0 so loop() on Core 1 is never blocked.
+//
+// Architecture:
+//   loop()   — detects card, posts cardId to g_nfcQueue, returns immediately.
+//   nfcWorkerTask() — picks up the cardId, runs all SD/HTTP/display work,
+//                     then signals completion via g_nfcDone semaphore.
+//
+// Shared state rules:
+//   • Only the worker task writes to currentState / lastEmployee / lastClockType.
+//   • TFT calls (updateClock, drawStaticUI) stay on Core 1 inside loop();
+//     the worker only calls empDisplay->show*() which uses the same TFT —
+//     this is safe because the worker and loop() are serialised by the fact
+//     that loop() does not call any TFT function while currentState ==
+//     STATE_NFC_LOADING (the NFC poll gate already blocks it).
+// ════════════════════════════════════════════════════════════════════════════
+
+// Queue depth 1 — we only process one scan at a time.
+// A second scan while the worker is busy gets buffered in _nextPendingCard
+// and fired after the worker signals done.
+static QueueHandle_t   g_nfcQueue   = nullptr;
+static SemaphoreHandle_t g_nfcDone  = nullptr;
+static TaskHandle_t    g_nfcTask    = nullptr;
+
+// Card ID buffer written by loop(), read by the worker task.
+// Max NFC data string is ~32 chars; 64 is plenty.
+static char g_nfcCardBuf[64] = {0};
+
+// ── Upload task — runs flushPending() on Core 0 ───────────────────────────────
+// flushPending() calls recordAttendance() which is an HTTP POST that can
+// block for up to 8 seconds. Running it in loop() (Core 1) freezes NFC polling
+// and the clock. This task runs it on Core 0 so loop() is never blocked.
+static TaskHandle_t      g_uploadTask   = nullptr;
+static SemaphoreHandle_t g_uploadTrigger = nullptr;  // binary — loop() signals, task wakes
+
+static void uploadWorkerTask(void* /*param*/) {
+    for (;;) {
+        // Wait for loop() to signal that an upload is needed
+        if (xSemaphoreTake(g_uploadTrigger, portMAX_DELAY) == pdTRUE) {
+            // Drain the ENTIRE queue, not just one record.
+            // UPLOAD_BATCH_SIZE = 1 means flushPending() sends one record per
+            // call, so we loop here until all pending records are uploaded.
+            // This is critical when screen-off fires with multiple queued scans
+            // (e.g. morning_in + morning_out) — the binary semaphore would
+            // otherwise only wake us once and leave the 2nd record stranded.
+            while (wifiConfig.isConnected() && pendingCount > 0 && !isPeakHour()) {
+                flushPending();
+                if (pendingCount > 0) delay(200);  // brief pause between HTTP calls
+            }
+        }
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // handleNFCDetected  — FAST-TAP (< 200ms to profile display)
 //
@@ -532,7 +653,17 @@ static void triggerInitialSync() {
 // 8. Enqueue for background upload (returns instantly)
 // 9. Broadcast SSE to portal
 // ════════════════════════════════════════════════════════════════════════════
-static void handleNFCDetected(const String& cardIdentifier) {
+static void nfcWorkerBody(const String& cardIdentifier) {
+    // ── Wake display / refresh clock immediately ──────────────────────────
+    if (screenIsOff) {
+        wakeScreen();   // full restore: backlight + drawStaticUI + clock
+    } else {
+        // Screen already on — repaint clock right now before any blocking
+        // SD / server work, so the display never appears frozen mid-scan
+        updateClock(clkH, clkM, clkS);
+        updateDate(buildDateStr());
+    }
+
     Serial.println("\n================================================");
     Serial.println("[NFC] Card: " + cardIdentifier);
     Serial.printf("[NFC] Heap=%u PSRAM=%u SD=%s WiFi=%s Q=%d Peak=%s\n",
@@ -543,8 +674,9 @@ static void handleNFCDetected(const String& cardIdentifier) {
         isPeakHour() ? "YES" : "NO");
 
     lastNFCUid = cardIdentifier;
-    enterState(STATE_NFC_LOADING);
-    empDisplay->showLoading();
+    // Note: enterState(STATE_NFC_LOADING) and showLoading() are called by
+    // handleNFCDetected() (the dispatcher) before posting to the queue,
+    // so loop() sees the state change immediately without waiting for the worker.
 
     EmployeeProfile emp;
     bool fromCache = false;
@@ -561,6 +693,7 @@ static void handleNFCDetected(const String& cardIdentifier) {
             Serial.printf("[STEP-2] SD hit: %s\n", emp.fullName.c_str());
         }
     }
+    yield();   // let background tasks breathe between heavy steps
 
     // ── STEP 3: Server fallback (only if SD miss, WiFi up, not peak) ──────
     if (!fromCache) {
@@ -601,6 +734,7 @@ static void handleNFCDetected(const String& cardIdentifier) {
     // ── STEP 4: Photo path (SD only; no download during peak) ────────────
     String photoPath = getPhotoPath(emp);
     Serial.printf("[STEP-4] photo='%s'\n", photoPath.c_str());
+    yield();   // photo lookup can be slow — yield before clock type resolve
 
     // ── STEP 5: Clock type ────────────────────────────────────────────────
     String clockType = resolveClockType(emp.uid);
@@ -635,14 +769,18 @@ static void handleNFCDetected(const String& cardIdentifier) {
                         + "\",\"time\":\"" + String(tsShort) + "\"}";
         wifiManager.broadcastEvent("scan", scanJson);
 
-        int ins  = max(0, SDDatabase::countTodayCheckIns());
-        int outs = max(0, SDDatabase::countTodayCheckOuts());
-        uint64_t freeMB = SDDatabase::freeBytes() / 1048576;
-        String statsJson = "{\"ins\":" + String(ins)
-                         + ",\"outs\":" + String(outs)
-                         + ",\"free_mb\":" + String((int)freeMB)
-                         + ",\"wifi\":true}";
-        wifiManager.broadcastEvent("stats", statsJson);
+        // During peak, skip the SD countToday calls — they scan the file and
+        // add ~5-10ms per tap. Stats will catch up on the next 30s refresh.
+        if (!isPeakHour()) {
+            int ins  = max(0, SDDatabase::countTodayCheckIns());
+            int outs = max(0, SDDatabase::countTodayCheckOuts());
+            uint64_t freeMB = SDDatabase::freeBytes() / 1048576;
+            String statsJson = "{\"ins\":" + String(ins)
+                             + ",\"outs\":" + String(outs)
+                             + ",\"free_mb\":" + String((int)freeMB)
+                             + ",\"wifi\":true}";
+            wifiManager.broadcastEvent("stats", statsJson);
+        }
     }
 
     empDisplay->showSuccess(emp.fullName);
@@ -651,6 +789,49 @@ static void handleNFCDetected(const String& cardIdentifier) {
 
     Serial.println("[NFC] Done → STATE_NFC_PROFILE (2s timer)");
     enterState(STATE_NFC_PROFILE);
+}
+
+// ── FreeRTOS task: wraps nfcWorkerBody, runs on Core 0 ───────────────────────
+static void nfcWorkerTask(void* /*param*/) {
+    for (;;) {
+        // Block until loop() posts a card ID into the queue
+        char buf[64] = {0};
+        if (xQueueReceive(g_nfcQueue, buf, portMAX_DELAY) == pdTRUE) {
+            nfcWorkerBody(String(buf));
+        }
+        // Signal loop() that we are idle and ready for the next card
+        xSemaphoreGive(g_nfcDone);
+    }
+}
+
+// ── Non-blocking dispatcher: called from loop() ───────────────────────────────
+// Posts the card ID to the worker queue and returns immediately.
+// loop() continues ticking the clock and polling NFC while the worker runs.
+static void handleNFCDetected(const String& cardIdentifier) {
+    if (!g_nfcQueue || !g_nfcDone) {
+        // Fallback: queue not initialised yet (shouldn't happen after setup)
+        nfcWorkerBody(cardIdentifier);
+        return;
+    }
+
+    // If the worker is still busy (semaphore not given yet), buffer the card
+    // — _nextPendingCard already handles this in the NFC poll gate, so we
+    // just drop here to avoid queue overflow.
+    if (uxQueueMessagesWaiting(g_nfcQueue) > 0) {
+        Serial.println("[NFC] Worker busy — card buffered by scan-ahead");
+        return;
+    }
+
+    // Copy card ID into the shared buffer and post to queue
+    strncpy(g_nfcCardBuf, cardIdentifier.c_str(), sizeof(g_nfcCardBuf) - 1);
+    g_nfcCardBuf[sizeof(g_nfcCardBuf) - 1] = '\0';
+
+    // enterState here so loop() sees NFC_LOADING immediately (NFC poll gate)
+    enterState(STATE_NFC_LOADING);
+    empDisplay->showLoading();
+
+    xQueueSend(g_nfcQueue, g_nfcCardBuf, 0);
+    Serial.println("[NFC] Card posted to worker: " + cardIdentifier);
 }
 
 // ─── setup ───────────────────────────────────────────────────────────────────
@@ -724,8 +905,8 @@ void setup() {
     updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
                           max(0, SDDatabase::countTodayCheckOuts()));
     enterState(STATE_DASHBOARD);
-
-    // Initial sync runs AFTER dashboard is live — NFC already accepts taps
+    lastActivityMs = millis();        // start screen timeout countdown from boot
+    wasConnectedGlobal = wifiConfig.isConnected();  // sync state so loop() never fires a false reconnect event
     if (wifiConfig.isConnected()) {
         triggerInitialSync();
         updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
@@ -733,6 +914,38 @@ void setup() {
     } else {
         Serial.println("[Ready] SD-only — scanning active");
     }
+
+    // ── 7. NFC worker task (Core 0) ──────────────────────────────────────────
+    // loop() runs on Core 1 (Arduino default). The NFC worker runs on Core 0
+    // so SD/HTTP work never blocks the clock, display, or NFC poll in loop().
+    g_nfcQueue = xQueueCreate(1, sizeof(g_nfcCardBuf));   // depth-1 queue
+    g_nfcDone  = xSemaphoreCreateBinary();
+    xSemaphoreGive(g_nfcDone);   // start in "idle" state
+    xTaskCreatePinnedToCore(
+        nfcWorkerTask,   // task function
+        "nfcWorker",     // name
+        8192,            // stack (bytes) — enough for JSON + HTTP
+        nullptr,         // parameter
+        2,               // priority (higher than loop's 1)
+        &g_nfcTask,      // handle
+        0                // Core 0
+    );
+    Serial.println("[Ready] NFC worker task started on Core 0");
+
+    // ── 8. Upload worker task (Core 0) ────────────────────────────────────────
+    // Runs flushPending() (HTTP POST) off Core 1 so loop() is never blocked.
+    // loop() signals this task via g_uploadTrigger when an upload is needed.
+    g_uploadTrigger = xSemaphoreCreateBinary();
+    xTaskCreatePinnedToCore(
+        uploadWorkerTask,  // task function
+        "uploadWorker",    // name
+        8192,              // stack — enough for HTTP + JSON
+        nullptr,           // parameter
+        1,                 // priority (same as loop, lower than nfcWorker)
+        &g_uploadTask,     // handle
+        0                  // Core 0 — keeps HTTP off Core 1
+    );
+    Serial.println("[Ready] Upload worker task started on Core 0");
 
     Serial.println("[Ready] NFC scanning active");
     Serial.printf("[Ready] Portal: http://%s:8080\n",
@@ -749,26 +962,56 @@ void loop() {
     static unsigned long lastWifiRetry   = 0;
     static unsigned long lastUploadFlush = 0;
     static unsigned long lastSocketPoll  = 0;
-    static unsigned long lastReSeed      = 0;
-    static bool          wasConnected    = false;
     static uint8_t       tick            = 0;
     unsigned long now = millis();
 
     wifiConfig.handleClient();
     wifiManager.handleClient();
 
-    // ── WiFi connect / disconnect events ─────────────────────────────────
-    bool isConnected = wifiConfig.isConnected();
-    if (isConnected && !wasConnected) {
-        wasConnected = true;
-        Serial.println("[WiFi] Connected");
-        syncNTPTime();
-        triggerInitialSync();
-        updateStatusDots(true, SDDatabase::isReady(), true);
-        drawStaticUI();
+    // ── Screen timeout ────────────────────────────────────────────────────
+    if (!screenIsOff &&
+        currentState == STATE_DASHBOARD &&
+        (now - lastActivityMs >= SCREEN_TIMEOUT_MS)) {
+        screenIsOff = true;
+        TFTDisplayManager::backlightOff();
+        TFTDisplayManager::clearScreen(0x0000);
+        Serial.println("[Screen] Timeout — screen blanked");
+
+        // ── Trigger upload immediately on screen-off ──────────────────────
+        // Instead of waiting up to 10 minutes for the upload timer, kick off
+        // the background worker as soon as the screen blanks. The worker runs
+        // on Core 0 so it never blocks NFC or the clock.
+        if (wifiConfig.isConnected() && pendingCount > 0 && !isPeakHour()) {
+            Serial.println("[Screen] Screen off — triggering immediate background upload");
+            lastUploadFlush = now;   // reset the timer so the next fire is a full 10 min later
+            if (g_uploadTrigger) xSemaphoreGive(g_uploadTrigger);
+        }
     }
-    if (!isConnected && wasConnected) {
-        wasConnected = false;
+
+    // ── Post-standby timer reset ──────────────────────────────────────────
+    // After a long standby all interval timers have huge elapsed values.
+    // Reset them to 'now' so they don't all fire simultaneously on the first
+    // loop after wake, which would block the clock and NFC for several seconds.
+    if (g_clockNeedsReset) {
+        // g_clockNeedsReset is also used by the clock section — don't clear it
+        // here; let the clock section clear it after anchoring lastClock.
+        lastStats       = now;
+        lastWifiRetry   = now;
+        lastUploadFlush = now;
+        lastSocketPoll  = now;
+        // lastNFCPoll is intentionally not reset — we want NFC responsive immediately
+    }
+    bool isConnected = wifiConfig.isConnected();
+    if (isConnected && !wasConnectedGlobal) {
+        // WiFi reconnected after a drop — re-sync time and re-seed only
+        wasConnectedGlobal = true;
+        Serial.println("[WiFi] Reconnected");
+        syncNTPTime();
+        initialSyncDone = false;   // allow re-seed after reconnect
+        triggerInitialSync();
+    }
+    if (!isConnected && wasConnectedGlobal) {
+        wasConnectedGlobal = false;
         Serial.println("[WiFi] Lost — SD-only mode");
         updateStatusDots(false, SDDatabase::isReady(), true);
     }
@@ -845,50 +1088,16 @@ void loop() {
         }
     }
 
-    // ── Periodic SD re-seed from server (skipped during peak) ─────────────
-    {
-        bool timerFired = (now - lastReSeed >= RESEED_INTERVAL_MS);
-        bool forceFired = (now >= g_forceReseedAt);
-        if (isConnected && currentState == STATE_DASHBOARD &&
-            SDDatabase::isReady() && dateStr().length() >= 10 &&
-            !isPeakHour() &&
-            (timerFired || forceFired)) {
-
-            lastReSeed      = now;
-            g_forceReseedAt = 0xFFFFFFFFUL;
-
-            static bool useEsp32Sync = true;
-            int rs = 0;
-            if (useEsp32Sync) {
-                rs = attService.fetchTodayAttendanceEsp32(dateStr());
-                Serial.printf("[ReSeed] esp32-sync: %d row(s)\n", rs);
-            } else {
-                rs = attService.fetchTodayAttendance(dateStr());
-                Serial.printf("[ReSeed] raw: %d row(s)\n", rs);
-            }
-            useEsp32Sync = !useEsp32Sync;
-
-            if (rs > 0) {
-                int ins  = max(0, SDDatabase::countTodayCheckIns());
-                int outs = max(0, SDDatabase::countTodayCheckOuts());
-                updateAttendanceStats(ins, outs);
-                uint64_t freeMB = SDDatabase::freeBytes() / 1048576;
-                String statsJson = "{\"ins\":" + String(ins)
-                                 + ",\"outs\":" + String(outs)
-                                 + ",\"free_mb\":" + String((int)freeMB)
-                                 + ",\"wifi\":true}";
-                wifiManager.broadcastEvent("stats", statsJson);
-            }
-        }
-    }
-
     // ── Background upload scheduler ───────────────────────────────────────
-    // Runs only when: WiFi up + records queued + on dashboard + not peak hour
+    // Signals the upload worker task (Core 0) to run flushPending().
+    // flushPending() makes HTTP calls (up to 8s) — running it here in loop()
+    // would block NFC polling and the clock. The worker task handles it instead.
     if (isConnected && pendingCount > 0 &&
         currentState == STATE_DASHBOARD &&
         (now - lastUploadFlush >= UPLOAD_FLUSH_MS)) {
         lastUploadFlush = now;
-        flushPending();   // isPeakHour() check is inside flushPending()
+        // Wake the upload worker — non-blocking, returns immediately
+        if (g_uploadTrigger) xSemaphoreGive(g_uploadTrigger);
 
         if (currentState == STATE_DASHBOARD) {
             int ins  = max(0, SDDatabase::countTodayCheckIns());
@@ -906,14 +1115,42 @@ void loop() {
     // ── State machine ─────────────────────────────────────────────────────
     switch (currentState) {
 
-        case STATE_NFC_PROFILE:
-            // Wait exactly PROFILE_DISPLAY_MS (2s) then snap back to dashboard
-            if (stateElapsed() >= PROFILE_DISPLAY_MS) {
+        case STATE_NFC_LOADING:
+            // The worker task (Core 0) does the actual work and calls enterState()
+            // when done. loop() just watches here:
+            //  • Normal: worker finishes and sets STATE_NFC_PROFILE itself.
+            //  • Watchdog: if worker takes > 13s (HTTP stuck despite timeouts),
+            //    force back to dashboard so the system is never permanently frozen.
+            if (stateElapsed() > 13000) {
+                Serial.println("[WDT] STATE_NFC_LOADING exceeded 13s — forcing dashboard");
+                if (g_nfcTask) vTaskSuspend(g_nfcTask);   // kill hung worker
+                if (g_nfcDone) xSemaphoreGive(g_nfcDone); // reset semaphore
+                if (g_nfcTask) vTaskResume(g_nfcTask);     // restart it
                 enterState(STATE_DASHBOARD);
                 drawStaticUI();
                 updateStatusDots(isConnected, SDDatabase::isReady(), true);
-                updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
-                                      max(0, SDDatabase::countTodayCheckOuts()));
+                g_pendingStatsRefresh = true;   // defer SD reads to next tick
+                resetScreenTimer();
+            }
+            break;
+
+        case STATE_NFC_PROFILE: {
+            // During peak hours use a shorter display window so the queue moves faster.
+            unsigned long displayMs = isPeakHour() ? PROFILE_DISPLAY_PEAK_MS : PROFILE_DISPLAY_MS;
+
+            // A buffered next-card also short-circuits the wait immediately:
+            // the current person has clearly moved on, so show the next one now.
+            bool nextCardReady = (_nextPendingCard.length() > 0);
+
+            if (stateElapsed() >= displayMs || nextCardReady) {
+                enterState(STATE_DASHBOARD);
+                drawStaticUI();
+                updateStatusDots(isConnected, SDDatabase::isReady(), true);
+                // FIX: defer SD stat reads to next loop tick so NFC polling
+                // resumes immediately. The SD file scan in countTodayCheckIns/
+                // countTodayCheckOuts can take 50-200ms and was causing the
+                // dashboard to appear frozen / miss rapid back-to-back taps.
+                g_pendingStatsRefresh = true;
                 if (lastEmployee.hasData) {
                     char timeShort[6];
                     snprintf(timeShort, sizeof(timeShort), "%02d:%02d", clkH, clkM);
@@ -922,16 +1159,28 @@ void loop() {
                                    wasIn ? "check-in" : "check-out",
                                    String(timeShort));
                 }
+                resetScreenTimer();
+
+                // If a card was buffered while we were showing the profile,
+                // process it immediately without waiting for the next loop tick.
+                if (nextCardReady) {
+                    String buffered = _nextPendingCard;
+                    _nextPendingCard = "";
+                    Serial.println("[NFC] Processing buffered scan-ahead card: " + buffered);
+                    handleNFCDetected(buffered);
+                }
             }
             break;
+        }
 
         case STATE_NFC_ERROR:
             if (stateElapsed() >= PROFILE_DISPLAY_MS) {
                 enterState(STATE_DASHBOARD);
                 drawStaticUI();
                 updateStatusDots(isConnected, SDDatabase::isReady(), true);
-                updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
-                                      max(0, SDDatabase::countTodayCheckOuts()));
+                // FIX: same deferred refresh — don't block NFC on SD reads here.
+                g_pendingStatsRefresh = true;
+                resetScreenTimer();   // activity just happened — restart timeout
             }
             break;
 
@@ -940,12 +1189,20 @@ void loop() {
 
     // ── Clock tick ────────────────────────────────────────────────────────
     if (currentState == STATE_DASHBOARD) {
+        // After a screen wake, anchor lastClock to now so catchUpClock()
+        // starts fresh — the RTC resync already corrected clkH/clkM/clkS.
+        if (g_clockNeedsReset) {
+            lastClock = millis();
+            g_clockNeedsReset = false;
+        }
         int ticked = catchUpClock(lastClock);
         if (ticked > 0) {
             tick += (uint8_t)ticked;
-            pulseStatus(tick % 2);
-            updateClock(clkH, clkM, clkS);
-            if (tick % 60   == 0) updateDate(buildDateStr());
+            if (!screenIsOff) {                          // skip TFT writes when off
+                pulseStatus(tick % 2);
+                updateClock(clkH, clkM, clkS);
+                if (tick % 60   == 0) updateDate(buildDateStr());
+            }
             if (tick % 3600 == 0 && isConnected) syncNTPTime();
 
             if (clkH == 0 && clkM == 0 && clkS == 0) {
@@ -961,7 +1218,18 @@ void loop() {
     }
 
     // ── Stats refresh ─────────────────────────────────────────────────────
-    if (currentState == STATE_DASHBOARD && (now - lastStats >= STATS_REFRESH_MS)) {
+    // g_pendingStatsRefresh is set by STATE_NFC_PROFILE/ERROR transitions
+    // so the SD scan happens on the NEXT loop() tick, not the same tick
+    // as drawStaticUI() — this prevents blocking rapid back-to-back NFC taps.
+    if (g_pendingStatsRefresh && currentState == STATE_DASHBOARD && !screenIsOff) {
+        g_pendingStatsRefresh = false;
+        lastStats = now;   // reset the periodic timer so we don't double-count
+        updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
+                              max(0, SDDatabase::countTodayCheckOuts()));
+    }
+
+    if (currentState == STATE_DASHBOARD && !screenIsOff &&
+        (now - lastStats >= STATS_REFRESH_MS)) {
         lastStats = now;
         updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
                               max(0, SDDatabase::countTodayCheckOuts()));
@@ -973,6 +1241,9 @@ void loop() {
         lastNFCPoll = now;
 
         uint8_t uid[7] = {0}; uint8_t uidLen = 0;
+        // 50ms timeout: minimum reliable value for PN532 ISO14443A.
+        // The RF field needs ~20ms to energize the card + framing overhead.
+        // Going below 50ms causes missed reads on NTAG/MIFARE cards.
         if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen, 50)) {
             nfcProcessCard(uid, uidLen);
 
@@ -992,12 +1263,24 @@ void loop() {
                        (now - lastAcceptedScanAt) < SCAN_COOLDOWN_MS) {
                 // same card on reader — cooldown
 
+            } else if (currentState == STATE_NFC_PROFILE || currentState == STATE_NFC_ERROR) {
+                // Profile is showing. Buffer this card (if it's a different employee)
+                // so we can process it the moment the display clears.
+                // Same card as what's currently showing is ignored (still cooling down).
+                if (cardId != lastAcceptedCardId) {
+                    if (_nextPendingCard != cardId) {
+                        _nextPendingCard = cardId;
+                        Serial.println("[NFC] Buffered scan-ahead: " + cardId);
+                    }
+                }
+
             } else if (currentState != STATE_DASHBOARD) {
-                // waiting for profile display to finish
+                // NFC_LOADING in progress — drop silently
 
             } else {
                 _lastRawCard   = cardId;
                 _cardConfirmCt = CARD_CONFIRM_NEEDED;
+                _nextPendingCard = "";   // clear any stale buffer
                 handleNFCDetected(cardId);
             }
 

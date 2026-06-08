@@ -241,6 +241,11 @@ private:
         Serial.println("[HTTP] Payload: " + payload);
         Serial.flush();
 
+        // setConnectTimeout covers TCP handshake; setTimeout covers headers.
+        // Body is read via readHttpBodyReliable() which has a hard 12s deadline
+        // and yields regularly — http.getString() has NO body timeout and can
+        // block the entire ESP32 forever when the server stalls mid-response.
+        http.setConnectTimeout(5000);
         http.setTimeout(8000);
         http.begin(url);
         addCommonHeaders();
@@ -255,9 +260,7 @@ private:
             return false;
         }
 
-        String body = http.getString();
-        WiFiClient* stream = http.getStreamPtr();
-        if (stream) { while (stream->available()) { stream->read(); yield(); } }
+        String body = readHttpBodyReliable(http, 65536);
         http.end();
 
         Serial.println("[HTTP] Body length: " + String(body.length()));
@@ -716,7 +719,7 @@ public:
         Serial.flush();
 
         if (code <= 0) { http.end(); return false; }
-        String body = http.getString();
+        String body = readHttpBodyReliable(http, 65536);
         http.end();
 
         Serial.printf("[HTTP] fetchAllEmployees body len: %d\n", (int)body.length());
@@ -815,11 +818,7 @@ public:
                 break;
             }
 
-            String raw = http.getString();
-            {
-                WiFiClient* s = http.getStreamPtr();
-                if (s) while (s->available()) { s->read(); yield(); }
-            }
+            String raw = readHttpBodyReliable(http, 65536);
             http.end();
 
             Serial.printf("[HTTP] Raw body: %d bytes\n", (int)raw.length());

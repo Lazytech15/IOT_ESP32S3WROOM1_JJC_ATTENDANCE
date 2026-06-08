@@ -353,27 +353,54 @@ button:hover{background:linear-gradient(135deg,#f97316,#fbbf24)}
     // TAB 0 — DASHBOARD
     // ════════════════════════════════════════════════════════════════════════
     void _handleDash() {
-        int ins  = max(0, SDDatabase::countTodayCheckIns());
-        int outs = max(0, SDDatabase::countTodayCheckOuts());
-        uint64_t freeMB = SDDatabase::freeBytes() / 1048576;
+        // FIX: Do NOT call countTodayCheckIns/Outs here — those do SD file
+        // scans that block loop() for 50-200ms, causing the browser to receive
+        // no bytes and show a blank page. Stats are loaded via AJAX after the
+        // page HTML is fully delivered, using the existing /api/status endpoint.
         bool wOk = _cfg && _cfg->isConnected();
 
-        String html = _head("Dashboard", 0);
-        // IDs targeted by SSE listener for live updates
-        html += "<div class='stat-row'>";
-        html += "<div class='stat'><div class='stat-n' style='color:#10b981' id='live-ins'>" + String(ins) + "</div><div class='stat-l'>Clock-ins today</div></div>";
-        html += "<div class='stat'><div class='stat-n' style='color:#f97316' id='live-outs'>" + String(outs) + "</div><div class='stat-l'>Clock-outs today</div></div>";
-        html += "<div class='stat'><div class='stat-n' style='color:#22d3ee' id='live-mb'>" + String(freeMB) + "<span style='font-size:1rem'>MB</span></div><div class='stat-l'>SD Free</div></div>";
-        html += "<div class='stat'><div class='stat-n' style='color:" + String(wOk?"#10b981":"#ef4444") + ";font-size:1rem' id='live-wifi'>" + (wOk ? "Online" : "Offline") + "</div><div class='stat-l'>WiFi</div></div>";
-        html += "</div>";
-        // Live scan feed
-        html += "<div class='card'><div class='card-title' style='display:flex;align-items:center;gap:8px'>";
-        html += "<span id='live-dot' style='display:inline-block;width:8px;height:8px;border-radius:50%;background:#64748b'></span>";
-        html += "LIVE FEED";
-        html += "<span id='live-status' style='font-size:.72rem;color:#64748b;margin-left:auto'>Connecting...</span></div>";
-        html += "<div id='live-log' style='font-family:monospace;font-size:.8rem;color:#94a3b8;min-height:40px'></div></div>";
-        html += R"SSE(<script>
+        // FIX: Use chunked streaming — bytes reach the browser immediately
+        // instead of building one huge String that may OOM or time out.
+        _srv.setContentLength(CONTENT_LENGTH_UNKNOWN);
+        _srv.sendHeader("Content-Type", "text/html");
+        _srv.sendHeader("Cache-Control", "no-cache");
+        _srv.send(200);
+
+        _srv.sendContent(_head("Dashboard", 0));
+
+        // Stats placeholders — filled by /api/status AJAX call below
+        _srv.sendContent("<div class='stat-row'>"
+            "<div class='stat'><div class='stat-n' style='color:#10b981' id='live-ins'>...</div><div class='stat-l'>Clock-ins today</div></div>"
+            "<div class='stat'><div class='stat-n' style='color:#f97316' id='live-outs'>...</div><div class='stat-l'>Clock-outs today</div></div>"
+            "<div class='stat'><div class='stat-n' style='color:#22d3ee' id='live-mb'>...<span style='font-size:1rem'>MB</span></div><div class='stat-l'>SD Free</div></div>"
+            "<div class='stat'><div class='stat-n' style='color:");
+        _srv.sendContent(wOk ? "#10b981" : "#ef4444");
+        _srv.sendContent(";font-size:1rem' id='live-wifi'>");
+        _srv.sendContent(wOk ? "Online" : "Offline");
+        _srv.sendContent("</div><div class='stat-l'>WiFi</div></div></div>");
+
+        _srv.sendContent(
+            "<div class='card'><div class='card-title' style='display:flex;align-items:center;gap:8px'>"
+            "<span id='live-dot' style='display:inline-block;width:8px;height:8px;border-radius:50%;background:#64748b'></span>"
+            "LIVE FEED"
+            "<span id='live-status' style='font-size:.72rem;color:#64748b;margin-left:auto'>Connecting...</span></div>"
+            "<div id='live-log' style='font-family:monospace;font-size:.8rem;color:#94a3b8;min-height:40px'></div></div>");
+
+        if (wOk) {
+            _srv.sendContent("<div class='card'><div class='card-title'>Network</div>");
+            _srv.sendContent("<p style='font-size:.85rem;color:#94a3b8'>Connected to: <strong style='color:#22d3ee'>" + _cfg->getSSID() + "</strong></p>");
+            _srv.sendContent("<p style='font-size:.85rem;color:#94a3b8;margin-top:6px'>IP: <strong>" + _cfg->getIPAddress() + "</strong></p></div>");
+        }
+
+        // JS: load stats via AJAX + SSE live updates
+        _srv.sendContent(R"DASH(<script>
 (function(){
+  fetch('/api/status').then(function(r){return r.json();}).then(function(d){
+    if(d.ins!==undefined)document.getElementById('live-ins').textContent=d.ins;
+    if(d.outs!==undefined)document.getElementById('live-outs').textContent=d.outs;
+    if(d.free_mb!==undefined)document.getElementById('live-mb').innerHTML=d.free_mb+'<span style="font-size:1rem">MB</span>';
+    if(d.wifi!==undefined){var w=document.getElementById('live-wifi');w.textContent=d.wifi?'Online':'Offline';w.style.color=d.wifi?'#10b981':'#ef4444';}
+  }).catch(function(){});
   var es=new EventSource('/api/events');
   var dot=document.getElementById('live-dot');
   var st=document.getElementById('live-status');
@@ -394,7 +421,7 @@ button:hover{background:linear-gradient(135deg,#f97316,#fbbf24)}
     try{
       var d=JSON.parse(e.data);
       var col=d.type==='check-in'?'#22d3ee':d.type==='check-out'?'#f97316':'#ef4444';
-      lines.unshift('<div style="color:'+col+';margin-bottom:4px">['+( d.time||'--:--')+'] <strong>'+(d.name||'?')+'</strong> &mdash; '+d.type.toUpperCase()+'</div>');
+      lines.unshift('<div style="color:'+col+';margin-bottom:4px">['+(d.time||'--:--')+'] <strong>'+(d.name||'?')+'</strong> &mdash; '+d.type.toUpperCase()+'</div>');
       if(lines.length>8)lines.length=8;
       log.innerHTML=lines.join('');
     }catch(err){}
@@ -404,23 +431,22 @@ button:hover{background:linear-gradient(135deg,#f97316,#fbbf24)}
     st.textContent='Live \u2022 '+new Date().toLocaleTimeString();
   });
 })();
-</script>)SSE";
+</script>)DASH");
 
-        if (wOk) {
-            html += "<div class='card'><div class='card-title'>Network</div>";
-            html += "<p style='font-size:.85rem;color:#94a3b8'>Connected to: <strong style='color:#22d3ee'>" + _cfg->getSSID() + "</strong></p>";
-            html += "<p style='font-size:.85rem;color:#94a3b8;margin-top:6px'>IP: <strong>" + _cfg->getIPAddress() + "</strong></p>";
-            html += "</div>";
-        }
-        html += _foot();
-        _srv.send(200, "text/html", html);
+        _srv.sendContent(_foot());
+        _srv.sendContent("");  // end chunked stream
     }
 
     // ════════════════════════════════════════════════════════════════════════
     // TAB 1 — SD FILES (NEW: Move/Copy/Rename/Delete)
     // ════════════════════════════════════════════════════════════════════════
     void _handleFiles() {
-        String html = _head("SD Files", 1);
+        _srv.setContentLength(CONTENT_LENGTH_UNKNOWN);
+        _srv.sendHeader("Content-Type", "text/html");
+        _srv.sendHeader("Cache-Control", "no-cache");
+        _srv.send(200);
+        {
+            String html = _head("SD Files", 1);
         html += R"HTML(
 <div class="card">
   <div class="card-title">SD Card Browser</div>
@@ -526,7 +552,10 @@ browseDir();
 </script>
 )HTML";
         html += _foot();
-        _srv.send(200, "text/html", html);
+            _srv.sendContent(html);
+            _srv.sendContent("");
+        }
+        return;
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -537,7 +566,12 @@ browseDir();
     char todayLabel[32];
     strftime(todayLabel, sizeof(todayLabel), "Today (%a %b %d, %Y)", &ti);
  
-    String html = _head("Attendance", 2);
+    _srv.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    _srv.sendHeader("Content-Type", "text/html");
+    _srv.sendHeader("Cache-Control", "no-cache");
+    _srv.send(200);
+    {
+        String html = _head("Attendance", 2);
     html += R"HTML(
 <div class="card">
   <div class="card-title">Attendance Log</div>
@@ -1088,14 +1122,22 @@ loadCsv('today');
 </script>
 )HTML";
     html += _foot();
-    _srv.send(200, "text/html", html);
+        _srv.sendContent(html);
+        _srv.sendContent("");
+    }
+    return;
 }
 
     // ════════════════════════════════════════════════════════════════════════
     // TAB 3 — ACTIONS
     // ════════════════════════════════════════════════════════════════════════
     void _handleActions() {
-        String html = _head("Actions", 3);
+        _srv.setContentLength(CONTENT_LENGTH_UNKNOWN);
+        _srv.sendHeader("Content-Type", "text/html");
+        _srv.sendHeader("Cache-Control", "no-cache");
+        _srv.send(200);
+        {
+            String html = _head("Actions", 3);
         html += R"HTML(
 <div class="card">
   <div class="card-title">Device Actions</div>
@@ -1175,7 +1217,10 @@ function doAction(url,msg){
 </script>
 )HTML";
         html += _foot();
-        _srv.send(200, "text/html", html);
+            _srv.sendContent(html);
+            _srv.sendContent("");
+        }
+        return;
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1183,7 +1228,12 @@ function doAction(url,msg){
     // ════════════════════════════════════════════════════════════════════════
     void _handleWifi() {
         bool wOk = _cfg && _cfg->isConnected();
-        String html = _head("WiFi", 4);
+        _srv.setContentLength(CONTENT_LENGTH_UNKNOWN);
+        _srv.sendHeader("Content-Type", "text/html");
+        _srv.sendHeader("Cache-Control", "no-cache");
+        _srv.send(200);
+        {
+            String html = _head("WiFi", 4);
         html += R"HTML(
 <div class="card">
   <div class="card-title">Current Connection</div>
@@ -1278,7 +1328,10 @@ loadStatus();loadNets();
 </script>
 )HTML";
         html += _foot();
-        _srv.send(200, "text/html", html);
+            _srv.sendContent(html);
+            _srv.sendContent("");
+        }
+        return;
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1361,6 +1414,9 @@ loadStatus();loadNets();
         doc["sd"]      = SDDatabase::isReady();
         doc["free_mb"] = (int)(SDDatabase::freeBytes() / 1048576);
         doc["uptime"]  = millis() / 1000;
+        // ins/outs used by dashboard AJAX initial stats load
+        doc["ins"]     = max(0, SDDatabase::countTodayCheckIns());
+        doc["outs"]    = max(0, SDDatabase::countTodayCheckOuts());
         String out; serializeJson(doc,out);
         _srv.sendHeader("Access-Control-Allow-Origin","*");
         _srv.send(200,"application/json",out);
