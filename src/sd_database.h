@@ -70,6 +70,16 @@ public:
     // e.g. "morning_in,morning_out,afternoon_in"
     // Returns "" if no records exist for this employee today.
     static String loadAttendanceToday(const String& empUid);
+
+    // Removes every row in TODAY's CSV matching (empUid, clockType).
+    // Rewrites the whole file (read-filter-write) since SD CSVs are
+    // append-only and there is no in-place line delete on FAT32.
+    // Used by server-reconciliation: when a record is deleted server-side,
+    // the local seed/mirror copy needs to be dropped too, or every future
+    // sync pass will just keep skipping it as "already in CSV".
+    // Returns true if the file is in the desired state afterward
+    // (including the no-op case where nothing matched).
+    static bool removeAttendanceRow(const String& empUid, const String& clockType);
     static bool   saveNfcMapping(const String& cardId, const String& empUid);
     static String loadUidForNfc(const String& cardId);
 

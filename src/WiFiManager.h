@@ -31,6 +31,37 @@
 #include "sd_database.h"
 #include "sd_file_manager.h" // Ensure file manager tools are included
 #include "attendance_http_service.h"
+#include <functional>
+
+// ══════════════════════════════════════════════════════════════════════════════
+// g_pendingQueueRemover
+//
+// Set by main.cpp during setup() to point at its own removeFromPendingQueue()
+// helper (the in-memory + SD-persisted pending_queue.json upload queue lives
+// entirely inside main.cpp's translation unit, so WiFiManager can't reach it
+// directly).
+//
+// WHY THIS EXISTS:
+//   The portal's "Delete row" action (_apiAttendanceDeleteRow below) only ever
+//   removed the row from the SD CSV and the server-ID map, and told the server
+//   to delete it IF a serverId was already known. If the tapped record hadn't
+//   been uploaded yet (serverId == 0 — it was still sitting in main.cpp's
+//   offline pendingQueue waiting its turn), that queue entry was never touched.
+//   Because pendingQueue is deliberately reboot-durable (mirrored to
+//   pending_queue.json on every change so an offline tap can never be silently
+//   lost), the "deleted" record survived the delete, survived a reboot, and
+//   was eventually POSTed to the server by flushPending() anyway — recreating
+//   it there. The periodic seed/reconcile pass then pulled that freshly
+//   recreated row back down into the local CSV as a SERVER_SEED row, making a
+//   just-deleted record appear to come back on its own.
+//
+// FIX: every portal delete now also asks main.cpp to purge any matching
+// not-yet-uploaded entry from pendingQueue, so a deletion is final even if
+// the tap hadn't synced yet.
+// ══════════════════════════════════════════════════════════════════════════════
+static std::function<bool(const String& empUid, const String& clockType,
+                           const String& date, const String& timeOnly)>
+    g_pendingQueueRemover = nullptr;
 
 // Some cores don't expose WIFI_SCAN_RUNNING; ensure we have a fallback
 #ifndef WIFI_SCAN_RUNNING
@@ -2029,6 +2060,39 @@ loadStatus();loadNets();
             int sp2 = rowTs.indexOf(' ');
             if (sp2 >= 0) timeOnly = rowTs.substring(sp2 + 1);
             SDDatabase::removeServerIdMapping(fileDateStr, empUid, evType, timeOnly);
+
+            // ── Also purge a matching not-yet-uploaded entry from the offline
+            //    pending-upload queue (see g_pendingQueueRemover doc comment
+            //    above). This is the part that actually stops a deleted-but-
+            //    unsynced tap from reappearing after a reboot: without it,
+            //    deleting a row here (especially when serverId==0, i.e. this
+            //    tap never made it to the server yet) left the queue entry
+            //    completely untouched, so it would survive the delete, survive
+            //    a reboot, and get uploaded later anyway.
+            if (g_pendingQueueRemover) {
+                bool wasPending = g_pendingQueueRemover(empUid, evType, fileDateStr, timeOnly);
+                if (wasPending) {
+                    Serial.println("[WM] Delete: also purged matching not-yet-uploaded "
+                                    "record from the pending upload queue");
+                }
+            }
+        }
+
+        // ── Refresh the TFT so a deletion made here (device-side, not the
+        //    portal) is reflected immediately instead of waiting on the next
+        //    periodic sync cycle. handleClient() runs synchronously from
+        //    loop() on the same core as the dashboard redraw, so touching
+        //    the TFT directly here is safe (same as broadcastEvent below).
+        //  - Stats card: recount check-ins/check-outs now that a row is gone.
+        //  - Last-scan name strip: it isn't derived from the CSV at all, it
+        //    only reflects the most recent NFC tap, so deleting a row here
+        //    (unlike the periodic reconcile passes) would otherwise leave a
+        //    deleted employee's name on screen indefinitely since nothing
+        //    else ever re-touches it.
+        if (fileArg == "today") {
+            updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
+                                  max(0, SDDatabase::countTodayCheckOuts()));
+            clearLastScan("both");
         }
 
         DynamicJsonDocument resp(128);
@@ -2218,7 +2282,11 @@ loadStatus();loadNets();
                                     _fn = (_f + " " + _l); _fn.trim();
                                 }
 
-                                String _uid  = String(_rec["employee_uid"] | "");
+                                // employee_uid is a JSON number from the server, and
+                                // `| ""` doesn't convert numbers (see fix above) — use
+                                // .as<String>() so this column isn't blank for every row.
+                                String _uid  = _rec["employee_uid"].isNull()
+                                                   ? "" : _rec["employee_uid"].as<String>();
                                 String _dept = String(_rec["department"]   | "");
                                 String _type = String(_rec["clock_type"]   | "");
 
@@ -2329,7 +2397,29 @@ loadStatus();loadNets();
             }
         }
 
-        DynamicJsonDocument doc(12288);
+        // FIX: this doc holds the ENTIRE day's attendance table as JSON
+        // (headers + one array per CSV row + serverIds). It used to be a
+        // fixed 12288 bytes — fine for a handful of rows at 8 AM, but by
+        // mid-afternoon a busy day (e.g. 43 employees x ~2 events = ~80+
+        // rows x 7 cells) blows well past that. ArduinoJson fails SILENTLY
+        // once the pool is full: createNestedArray()/add() just stop
+        // adding elements — no error, no crash — so whichever rows come
+        // LAST in the CSV get dropped from the JSON response. That's why
+        // the newest/latest-timestamp employee (e.g. an afternoon tap)
+        // simply disappears from the portal table and search, even though
+        // the row is sitting right there in the raw SD CSV.
+        //
+        // Size the buffer off the actual CSV length instead of a fixed
+        // guess: each raw CSV byte becomes roughly 5-6x its size once
+        // wrapped in JSON array/string overhead, plus headroom for the
+        // serverIds array built later. Use PSRAM when available so this
+        // scales safely as the day's row count grows.
+        size_t attJsonCap = (size_t)csv.length() * 6 + 4096;
+        if (attJsonCap < 12288) attJsonCap = 12288;              // small-file floor
+        size_t attJsonMax = psramFound() ? 200000 : 49152;       // heap safety ceiling
+        if (attJsonCap > attJsonMax) attJsonCap = attJsonMax;
+
+        DynamicJsonDocument doc(attJsonCap);
         JsonArray headers   = doc.createNestedArray("headers");
         JsonArray rows      = doc.createNestedArray("rows");
         JsonArray serverIds = doc.createNestedArray("serverIds"); // parallel to rows
@@ -2392,6 +2482,16 @@ loadStatus();loadNets();
                 }
                 if(nl<0)break; start=nl+1;
             }
+        }
+
+        // Surface it if we still overflowed even after sizing off csv.length()
+        // (e.g. capacity got clamped by attJsonMax on a low-heap device) —
+        // better a visible warning in Serial + the response than silently
+        // missing rows again.
+        if (doc.overflowed()) {
+            Serial.printf("[WM] _apiAttendance: JSON doc OVERFLOWED (cap=%u) — some rows may be missing from the response!\n",
+                          (unsigned)attJsonCap);
+            doc["truncated"] = true;
         }
 
         // ── Fetch server record IDs for this date so the editor can PUT (not POST) ──
@@ -2459,7 +2559,15 @@ loadStatus();loadNets();
                     // Key includes time → no more collision on duplicate clock_types
                     for (JsonObject rec : srvArr) {
                         if (sCount >= MAP_SZ) break;
-                        String eu = rec["employee_uid"] | "";
+                        // NOTE: employee_uid comes back as a JSON *number* from this
+                        // endpoint (e.g. 2, not "2"). The `| ""` operator only returns
+                        // the value if it's ALREADY stored as a String — it does not
+                        // convert numbers, so it silently fell back to "" for every
+                        // record, which zeroed out sCount and made every synced row
+                        // look "deleted on the server" below. .as<String>() performs
+                        // the actual number->string conversion.
+                        String eu = rec["employee_uid"].isNull()
+                                        ? "" : rec["employee_uid"].as<String>();
                         String ct = rec["clock_type"]   | "";
                         int    id = rec["id"]           | 0;
                         // clock_time may be "YYYY-MM-DD HH:MM:SS" — extract time only

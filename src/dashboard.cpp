@@ -327,6 +327,24 @@ void updateLastScan(const String& name, const String& eventType,
     drawZ8();
 }
 
+// ── clearLastScan ─────────────────────────────────────────────────────────────
+// Resets the Clock-In/Clock-Out name strip back to blank. Needed because
+// updateLastScan() only ever fires from an actual local NFC tap — if the
+// admin deletes that attendance row from the portal afterwards, nothing
+// else touches _lastInName/_lastOutName, so the deleted person's name would
+// otherwise stay on screen forever even though the counts above it update.
+void clearLastScan(const String& eventType) {
+    if (eventType == "check-in" || eventType == "both") {
+        _lastInName = "";
+        _lastInTime = "--:--";
+    }
+    if (eventType == "check-out" || eventType == "both") {
+        _lastOutName = "";
+        _lastOutTime = "--:--";
+    }
+    drawZ8();
+}
+
 // ── updateStatusDots ──────────────────────────────────────────────────────────
 void updateStatusDots(bool wifiOk, bool sdOk, bool nfcOk) {
     TFT_eSPI* t = tft();

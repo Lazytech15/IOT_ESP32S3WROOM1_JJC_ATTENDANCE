@@ -1917,6 +1917,504 @@ public:
 }
 
     // ══════════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════════
+    // reconcileTodayAttendance  — deletes local rows the server no longer has
+    //
+    // PROBLEM THIS SOLVES:
+    //   Every seed function (fetchTodayAttendanceEsp32, fetchTodayAttendance,
+    //   fetchAndSeedByEmployeeList, seedCsvFromRawAttendance) is ADD-ONLY.
+    //   Each one asks "is this clock_type already in the local CSV? if not,
+    //   write it" — none of them ever ask the reverse question. So if a
+    //   record is deleted on the server (e.g. an admin removes a mistaken
+    //   morning_out), the ESP32's local CSV keeps it forever: every future
+    //   sync pass sees "already in CSV" and skips, so nothing ever cleans it
+    //   up. This function closes that gap.
+    //
+    // HOW IT WORKS:
+    //   1. Paginate the same /api/attendance/esp32-sync endpoint used by
+    //      fetchTodayAttendanceEsp32() to get the server's current picture
+    //      of every employee's session columns for `date`.
+    //   2. For every employee UID actually returned by the server, build the
+    //      set of clock_types the server currently has (non-null columns).
+    //   3. Compare that against the local CSV (loadAttendanceToday). Any
+    //      clock_type present locally but NOT in the server's set gets
+    //      removed via SDDatabase::removeAttendanceRow(), and its server-ID
+    //      mapping entry is cleaned up too.
+    //
+    // SAFETY NOTE — why this only reconciles UIDs the server actually returned:
+    //   If an employee never appears in the esp32-sync response at all for
+    //   this date (e.g. the aggregation job hasn't run for them yet), we do
+    //   NOT touch their local rows. Reconciling against an "empty" server
+    //   set for someone the server simply hasn't processed yet would wipe
+    //   out live NFC taps that are just waiting to sync — that's a bug, not
+    //   a reconciliation. We only ever delete local rows for employees the
+    //   server explicitly told us something about.
+    //
+    // WHEN TO CALL:
+    //   Periodically (e.g. once every few minutes, same cadence as your
+    //   SSE/serverIds poll), NOT immediately after every single NFC tap —
+    //   give the local write time to actually reach the server first via
+    //   the normal upload queue, or you'll race a legitimate unsynced tap
+    //   against this and delete it before it ever uploads.
+    //
+    // RETURNS: number of local rows removed, or -1 on fatal error.
+    // ══════════════════════════════════════════════════════════════════════════
+    int reconcileTodayAttendance(const String& date) {
+        if (date.length() < 10) {
+            SDLogger::log("Reconcile", SDLogger::WARN, "Skipped — no valid date");
+            return 0;
+        }
+        if (!SDDatabase::isReady()) {
+            SDLogger::log("Reconcile", SDLogger::WARN, "SD not ready");
+            return 0;
+        }
+
+        SDLogger::log("Reconcile", SDLogger::INFO,
+                      "=== reconcileTodayAttendance START date=" + date + " ===");
+
+        static const char* SESSION_COLS[] = {
+            "morning_in",   "morning_out",
+            "afternoon_in", "afternoon_out",
+            "evening_in",   "evening_out",
+            "overtime_in",  "overtime_out",
+            nullptr
+        };
+
+        // ── Server-side truth, built up across pages ───────────────────────────
+        const int MAX_EMP = 128;
+        String* srvUid   = new String[MAX_EMP];   // employee_uid
+        String* srvTypes = new String[MAX_EMP];   // comma list of non-null cols on server
+        bool*   srvSeen  = new bool[MAX_EMP];
+        if (!srvUid || !srvTypes || !srvSeen) {
+            SDLogger::log("Reconcile", SDLogger::ERROR, "OOM srv arrays");
+            delete[] srvUid; delete[] srvTypes; delete[] srvSeen;
+            return -1;
+        }
+        int srvCount = 0;
+
+        auto getSrvSlot = [&](const String& empUid) -> int {
+            for (int i = 0; i < srvCount; i++)
+                if (srvUid[i] == empUid) return i;
+            if (srvCount < MAX_EMP) {
+                srvUid[srvCount]   = empUid;
+                srvTypes[srvCount] = "";
+                srvSeen[srvCount]  = true;
+                return srvCount++;
+            }
+            return -1;  // table full — skip reconciling this uid this pass
+        };
+
+        StaticJsonDocument<768> filter;
+        JsonObject rowF = filter["data"].createNestedObject();
+        rowF["employee_uid"]  = true;
+        rowF["morning_in"]    = true;
+        rowF["morning_out"]   = true;
+        rowF["afternoon_in"]  = true;
+        rowF["afternoon_out"] = true;
+        rowF["evening_in"]    = true;
+        rowF["evening_out"]   = true;
+        rowF["overtime_in"]   = true;
+        rowF["overtime_out"]  = true;
+
+        const int PAGE_SIZE = 10;
+        int offset  = 0;
+        int pageNum = 0;
+
+        while (true) {
+            pageNum++;
+            String url = serverURL + "/api/attendance/esp32-sync?date=" + date
+                         + "&limit=" + String(PAGE_SIZE)
+                         + "&offset=" + String(offset);
+
+            SDLogger::logf("Reconcile", SDLogger::INFO,
+                           "Page %d: GET offset=%d  heap=%u",
+                           pageNum, offset, ESP.getFreeHeap());
+
+            HTTPClient recHttp;
+            recHttp.setTimeout(6000);
+            recHttp.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+            recHttp.begin(url);
+            recHttp.addHeader("X-Client-Type", "ESP32");
+            if (authToken.length() > 0)
+                recHttp.addHeader("Authorization", "Bearer " + authToken);
+
+            int code = recHttp.GET();
+            if (code <= 0 || (code != 200 && code != 403)) {
+                SDLogger::logf("Reconcile", SDLogger::ERROR,
+                               "Page %d: bad HTTP %d — aborting", pageNum, code);
+                recHttp.end();
+                break;
+            }
+
+            String raw = readHttpBodyReliable(recHttp, 16384);
+            recHttp.end();
+            yield();
+
+            if (raw.length() == 0) {
+                SDLogger::logf("Reconcile", SDLogger::ERROR,
+                               "Page %d: empty body — aborting", pageNum);
+                break;
+            }
+
+            bool isEncrypted = (raw.indexOf("\"encrypted\":true") >= 0) &&
+                               (raw.indexOf("\"data\":\"") >= 0);
+            String plainJson = "";
+            if (isEncrypted) {
+                int dataKeyIdx = raw.indexOf("\"data\":\"");
+                int dataStart  = dataKeyIdx + 8;
+                int dataEnd    = raw.indexOf("\"", dataStart);
+                if (dataEnd <= dataStart) break;
+                String encPayload = raw.substring(dataStart, dataEnd);
+                encPayload.replace("\\/", "/");
+                raw = ""; yield();
+                plainJson = decryptor.decrypt(encPayload);
+                if (plainJson.length() == 0) break;
+            } else {
+                plainJson = raw; raw = ""; yield();
+            }
+
+            DynamicJsonDocument* docPtr = new DynamicJsonDocument(12288);
+            if (!docPtr) break;
+
+            DeserializationError parseErr = deserializeJson(*docPtr, plainJson,
+                                                            DeserializationOption::Filter(filter));
+            plainJson = ""; yield();
+
+            if (parseErr) {
+                SDLogger::logf("Reconcile", SDLogger::ERROR,
+                               "Page %d: parse error: %s", pageNum, parseErr.c_str());
+                delete docPtr;
+                break;
+            }
+
+            JsonArray rows;
+            if (docPtr->containsKey("data") && (*docPtr)["data"].is<JsonArray>())
+                rows = (*docPtr)["data"].as<JsonArray>();
+
+            if (rows.isNull()) { delete docPtr; break; }
+
+            int pageCount = rows.size();
+            SDLogger::logf("Reconcile", SDLogger::INFO,
+                           "Page %d: %d rows", pageNum, pageCount);
+
+            if (pageCount == 0) { delete docPtr; break; }
+
+            for (JsonObject row : rows) {
+                String empUid = "";
+                JsonVariantConst uv = row["employee_uid"];
+                if (uv.is<int>())       empUid = String(uv.as<int>());
+                else if (uv.is<long>()) empUid = String(uv.as<long>());
+                else                    empUid = uv | "";
+                if (empUid.length() == 0) { yield(); continue; }
+
+                int slot = getSrvSlot(empUid);
+                if (slot < 0) { yield(); continue; }
+
+                for (int ci = 0; SESSION_COLS[ci] != nullptr; ci++) {
+                    const char* col = SESSION_COLS[ci];
+                    if (row[col].isNull()) continue;
+                    String v = row[col] | "";
+                    if (v.length() == 0 || v == "null" || v == "0000-00-00 00:00:00") continue;
+
+                    String needle = "," + String(col) + ",";
+                    if ((("," + srvTypes[slot] + ",").indexOf(needle)) < 0) {
+                        if (srvTypes[slot].length() > 0) srvTypes[slot] += ",";
+                        srvTypes[slot] += col;
+                    }
+                }
+                yield();
+            }
+
+            delete docPtr;
+
+            offset += pageCount;
+            if (pageCount < PAGE_SIZE) break;
+            if (pageNum >= 50) break;
+            delay(50);
+            yield();
+        }
+
+        SDLogger::logf("Reconcile", SDLogger::INFO,
+                       "Server truth built: %d employees seen across %d page(s)",
+                       srvCount, pageNum);
+
+        // ── Diff against local CSV for each employee the server told us about ──
+        int totalRemoved = 0;
+
+        for (int i = 0; i < srvCount; i++) {
+            String localTypes = SDDatabase::loadAttendanceToday(srvUid[i]);
+            if (localTypes.length() == 0) { yield(); continue; }
+
+            // Split localTypes on commas and check each against server set
+            int start = 0;
+            while (start <= (int)localTypes.length()) {
+                int comma = localTypes.indexOf(',', start);
+                String type = (comma < 0) ? localTypes.substring(start)
+                                          : localTypes.substring(start, comma);
+                type.trim();
+
+                if (type.length() > 0) {
+                    String needle = "," + type + ",";
+                    bool onServer = (("," + srvTypes[i] + ",").indexOf(needle)) >= 0;
+
+                    if (!onServer) {
+                        SDLogger::logf("Reconcile", SDLogger::INFO,
+                                       "STALE uid=%s type=%s — on device but not on server, removing",
+                                       srvUid[i].c_str(), type.c_str());
+
+                        bool removed = SDDatabase::removeAttendanceRow(srvUid[i], type);
+                        if (removed) {
+                            totalRemoved++;
+                            // Best-effort cleanup of the server-ID map too.
+                            // We don't know the exact HH:MM:SS anymore once the
+                            // row is gone, so this is skipped here — stale
+                            // server-ID map entries are harmless leftovers
+                            // (they just won't resolve to a live CSV row).
+                        } else {
+                            SDLogger::logf("Reconcile", SDLogger::ERROR,
+                                           "removeAttendanceRow FAILED uid=%s type=%s",
+                                           srvUid[i].c_str(), type.c_str());
+                        }
+                    }
+                }
+
+                if (comma < 0) break;
+                start = comma + 1;
+                yield();
+            }
+            yield();
+        }
+
+        delete[] srvUid;
+        delete[] srvTypes;
+        delete[] srvSeen;
+
+        SDLogger::logf("Reconcile", SDLogger::INFO,
+                       "=== DONE: employees_checked=%d rows_removed=%d heap=%u ===",
+                       srvCount, totalRemoved, ESP.getFreeHeap());
+        Serial.printf("[Reconcile] Done: %d employees checked, %d stale row(s) removed\n",
+                      srvCount, totalRemoved);
+        Serial.flush();
+        return totalRemoved;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // ══════════════════════════════════════════════════════════════════════════
+    // reconcileAgainstLiveRecords — makes the server the single source of
+    // truth for today's CSV. Catches every deletion reconcileTodayAttendance()
+    // (and the old ID-map-only pass) missed.
+    //
+    // THE GAP THIS CLOSES:
+    //   reconcileTodayAttendance() diffs against /api/attendance/esp32-sync,
+    //   which returns AGGREGATED per-employee session columns — an employee
+    //   only appears in it at all if they currently have at least one
+    //   attendance row for `date`. Delete an employee's ONLY record for the
+    //   day and they vanish from that response entirely, so the "only
+    //   reconcile UIDs the server actually returned" safety rule skips them
+    //   forever — the stale row survives every cycle and every reboot.
+    //
+    //   A server-ID-map diff alone doesn't fully close it either: rows seeded
+    //   FROM the server (deviceId "SNAP_SEED"/"SERVER_SEED", written by
+    //   seedCsvFromRawAttendance/fetchAndSeedByEmployeeList) never get a
+    //   server-ID map entry in the first place, so they're invisible to a
+    //   map-only diff too — exactly the case in practice (the CSV's "SNAP_SEED"
+    //   device column on a deleted-but-still-showing row).
+    //
+    // HOW THIS WORKS — server is truth, CSV is diffed row-by-row against it:
+    //   1. Fetch the server's current, non-aggregated record list for `date`
+    //      via /api/attendanceEdit/range (same endpoint the portal's own
+    //      row editor uses) — a flat "every attendance row that exists right
+    //      now" list, not an aggregation, so an employee with zero remaining
+    //      records simply has zero entries here. That absence is itself the
+    //      truth, not a gap to be cautious around.
+    //   2. Read today's CSV and check EVERY row against that live set, keyed
+    //      on empUid|clockType|HH:MM:SS.
+    //   3. Rows seeded from the server (deviceId SNAP_SEED/SERVER_SEED) are
+    //      removed unconditionally if missing live — they only ever existed
+    //      because the server said so, so if the server no longer says so,
+    //      they're stale by definition. No "protect an unsynced tap" concern
+    //      applies to them; they were never locally originated.
+    //   4. Rows actually created by a local NFC tap (deviceId == this
+    //      device's own ID) are only removed if they're ALSO confirmed in the
+    //      SD server-ID map (i.e. we know for certain this device already
+    //      uploaded it) and that ID is missing from the live set. A local tap
+    //      with no map entry yet is left untouched — it may just be waiting
+    //      to upload, and reconciling it away here would delete a live tap
+    //      before it ever reaches the server.
+    //
+    // RETURNS: number of rows removed, or -1 on fatal error (fetch failed).
+    // ══════════════════════════════════════════════════════════════════════════
+    int reconcileAgainstLiveRecords(const String& date) {
+        if (date.length() < 10) return 0;
+        if (!SDDatabase::isReady()) return 0;
+
+        // ── Step 1: fetch the server's live, non-aggregated record list ────────
+        HTTPClient hc;
+        hc.setTimeout(8000);
+        hc.begin(serverURL + "/api/attendanceEdit/range?start_date=" + date +
+                 "&end_date=" + date);
+        addCommonHeaders();
+        int code = hc.GET();
+        if (code != 200) {
+            SDLogger::logf("Reconcile", SDLogger::WARN,
+                           "reconcileAgainstLiveRecords: range fetch failed code=%d", code);
+            hc.end();
+            return code > 0 ? 0 : -1;   // HTTP error (e.g. offline) — try again next cycle
+        }
+
+        String rbody = readHttpBodyReliable(hc, 32768);
+        hc.end();
+        if (rbody.length() == 0) return 0;
+
+        DynamicJsonDocument srvDoc(24576);
+        bool ok = decryptBody(rbody, srvDoc);
+        if (!ok) ok = (deserializeJson(srvDoc, rbody) == DeserializationError::Ok);
+        if (!ok) {
+            SDLogger::log("Reconcile", SDLogger::WARN,
+                          "reconcileAgainstLiveRecords: could not parse range response");
+            return 0;
+        }
+
+        JsonArray srvArr;
+        if (srvDoc["data"].is<JsonArray>())
+            srvArr = srvDoc["data"].as<JsonArray>();
+        else if (srvDoc["data"]["data"].is<JsonArray>())
+            srvArr = srvDoc["data"]["data"].as<JsonArray>();
+
+        // Build the set of "empUid|clockType|HH:MM:SS" keys the server
+        // currently, actually has. Heap-allocated — MAX_LIVE String objects
+        // on the stack overflows seedWorkerTask's 8KB stack when combined
+        // with the HTTPClient/JSON locals also live in this function.
+        const int MAX_LIVE = 256;
+        String* liveKeys = new String[MAX_LIVE];
+        if (!liveKeys) {
+            SDLogger::log("Reconcile", SDLogger::ERROR,
+                          "reconcileAgainstLiveRecords: OOM liveKeys");
+            return -1;
+        }
+        int liveCount = 0;
+        for (JsonObject rec : srvArr) {
+            if (liveCount >= MAX_LIVE) break;
+            String eu = rec["employee_uid"].isNull() ? "" : rec["employee_uid"].as<String>();
+            String ct = rec["clock_type"] | "";
+            int    id = rec["id"] | 0;
+            String ctTime = rec["clock_time"] | "";
+            int sp = ctTime.indexOf(' ');
+            if (sp >= 0) ctTime = ctTime.substring(sp + 1);
+            if (eu.length() == 0 || id == 0) continue;
+            liveKeys[liveCount] = eu + "|" + ct + "|" + ctTime;
+            liveCount++;
+        }
+
+        // ── Step 2: load the SD server-ID map (for the "confirmed uploaded
+        //    local tap" check in step 4) ──────────────────────────────────────
+        DynamicJsonDocument mapDoc(4096);
+        String mapJson = SDDatabase::loadServerIdMapJson(date);
+        bool mapLoaded = (mapJson.length() > 2) &&
+                         (deserializeJson(mapDoc, mapJson) == DeserializationError::Ok);
+        JsonObject mapObj = mapLoaded ? mapDoc.as<JsonObject>() : mapDoc.to<JsonObject>();
+
+        // ── Step 3: read today's CSV and diff every row ─────────────────────────
+        String path = "/attendance/" + date + ".csv";
+        if (!SD_MMC.exists(path)) { delete[] liveKeys; return 0; }
+        File rf = SD_MMC.open(path, FILE_READ);
+        if (!rf) { delete[] liveKeys; return 0; }
+
+        String tmpPath = path + ".tmp";
+        File wf = SD_MMC.open(tmpPath, FILE_WRITE);
+        if (!wf) { rf.close(); delete[] liveKeys; return 0; }
+
+        int lineNum = 0, removedCount = 0;
+        bool mapChanged = false;
+        while (rf.available()) {
+            String line = rf.readStringUntil('\n');
+            line.trim();
+            if (line.length() == 0) { lineNum++; continue; }
+
+            if (lineNum == 0) {
+                wf.println(line);  // header
+                lineNum++; yield(); continue;
+            }
+
+            // Columns: timestamp,nfc_uid,employee_uid,employee_name,department,event_type,device_id
+            String cols[7]; int ci = 0, s = 0;
+            while (s <= (int)line.length() && ci < 7) {
+                int cm = line.indexOf(',', s);
+                cols[ci++] = (cm < 0) ? line.substring(s) : line.substring(s, cm);
+                if (cm < 0) break; s = cm + 1;
+            }
+            String rowTs     = cols[0]; rowTs.trim();
+            String rowEu     = cols[2]; rowEu.trim();
+            String rowCt     = cols[5]; rowCt.trim();
+            String rowDevice = cols[6]; rowDevice.trim();
+            int sp2 = rowTs.indexOf(' ');
+            String rowTime = (sp2 >= 0) ? rowTs.substring(sp2 + 1) : rowTs;
+            String rowKey  = rowEu + "|" + rowCt + "|" + rowTime;
+
+            bool foundLive = false;
+            for (int i = 0; i < liveCount; i++) {
+                if (liveKeys[i] == rowKey) { foundLive = true; break; }
+            }
+
+            bool serverSeeded = (rowDevice == "SNAP_SEED" || rowDevice == "SERVER_SEED");
+            bool confirmedSynced = mapObj.containsKey(rowKey);
+
+            // serverSeeded rows: server is the only reason they exist, so a
+            // missing-live match is unconditional truth. Local-tap rows: only
+            // trust a missing-live match once we know it was actually
+            // uploaded (map entry present) — otherwise it may just be
+            // waiting its turn and must not be touched here.
+            bool isStale = !foundLive && (serverSeeded || confirmedSynced);
+
+            if (isStale) {
+                removedCount++;
+                SDLogger::logf("Reconcile", SDLogger::INFO,
+                               "STALE (live-diff) uid=%s type=%s device=%s — deleted server-side, removing",
+                               rowEu.c_str(), rowCt.c_str(), rowDevice.c_str());
+                if (confirmedSynced) { mapObj.remove(rowKey.c_str()); mapChanged = true; }
+            } else {
+                wf.println(line);
+            }
+            lineNum++;
+            yield();
+        }
+        rf.close(); wf.flush(); wf.close();
+
+        if (removedCount > 0) {
+            SD_MMC.remove(path);
+            File src = SD_MMC.open(tmpPath, FILE_READ);
+            File dst = SD_MMC.open(path, FILE_WRITE);
+            if (src && dst) {
+                uint8_t buf[256];
+                while (src.available()) {
+                    int n = src.read(buf, sizeof(buf));
+                    if (n > 0) dst.write(buf, n);
+                    yield();
+                }
+                src.close(); dst.flush(); dst.close();
+            } else {
+                if (src) src.close();
+                if (dst) dst.close();
+            }
+            SD_MMC.remove(tmpPath);
+
+            if (mapChanged) {
+                String mapPath = "/attendance/server_ids_" + date + ".json";
+                File mf = SD_MMC.open(mapPath.c_str(), FILE_WRITE);
+                if (mf) { serializeJson(mapDoc, mf); mf.close(); }
+            }
+        } else {
+            SD_MMC.remove(tmpPath);
+        }
+
+        SDLogger::logf("Reconcile", SDLogger::INFO,
+                       "=== reconcileAgainstLiveRecords DONE: live=%d rows_removed=%d ===",
+                       liveCount, removedCount);
+        Serial.printf("[Reconcile] Live-diff pass: %d stale row(s) removed\n", removedCount);
+        delete[] liveKeys;
+        return removedCount;
+    }
+
     // fetchAndSeedByEmployeeList  — SD employee-walk seeder
     //
     // PURPOSE:

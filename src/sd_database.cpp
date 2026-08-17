@@ -592,6 +592,94 @@ String SDDatabase::loadAttendanceToday(const String& empUid) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// removeAttendanceRow
+//
+// Rewrites TODAY's CSV, dropping every row whose (employee_uid, event_type)
+// matches the given pair. FAT32 / SD_MMC has no "delete this one line" API,
+// so this reads the whole file into a String, filters, then reopens with
+// FILE_WRITE (which truncates) and writes the filtered content back.
+//
+// Today's CSV is small (tens to low-hundreds of rows), so buffering the
+// whole thing in RAM is fine — this mirrors the same read-all pattern
+// already used by loadAttendanceToday()/countTodayCheckIns().
+// ══════════════════════════════════════════════════════════════════════════════
+bool SDDatabase::removeAttendanceRow(const String& empUid, const String& clockType) {
+    if (!_ready || empUid.length() == 0 || clockType.length() == 0) return false;
+
+    String path = todayFilename();
+    if (!SD_MMC.exists(path)) return true;  // nothing to remove — already "gone"
+
+    File rf = SD_MMC.open(path, FILE_READ);
+    if (!rf) {
+        Serial.println("[SD] removeAttendanceRow: cannot open for read: " + path);
+        return false;
+    }
+
+    String keptLines;
+    bool   removedAny = false;
+
+    while (rf.available()) {
+        String line = rf.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) continue;
+
+        if (line.startsWith("timestamp")) {
+            keptLines += line + "\n";
+            continue;
+        }
+
+        // CSV: timestamp,nfc_uid,employee_uid,name,dept,event_type,device_id
+        int c0 = line.indexOf(',');
+        int c1 = (c0>=0) ? line.indexOf(',', c0+1) : -1;
+        int c2 = (c1>=0) ? line.indexOf(',', c1+1) : -1;
+        int c3 = (c2>=0) ? line.indexOf(',', c2+1) : -1;
+        int c4 = (c3>=0) ? line.indexOf(',', c3+1) : -1;
+        int c5 = (c4>=0) ? line.indexOf(',', c4+1) : -1;
+
+        bool matches = false;
+        if (c1 >= 0 && c2 >= 0 && c4 >= 0 && c5 >= 0) {
+            String uid = line.substring(c1+1, c2);
+            uid.trim();
+            if (uid.startsWith("\"")) uid = uid.substring(1);
+            if (uid.endsWith("\""))   uid = uid.substring(0, uid.length()-1);
+
+            String evType = line.substring(c4+1, c5);
+            evType.trim();
+            if (evType.startsWith("\"")) evType = evType.substring(1);
+            if (evType.endsWith("\""))   evType = evType.substring(0, evType.length()-1);
+
+            if (uid == empUid && evType == clockType) matches = true;
+        }
+
+        if (matches) {
+            removedAny = true;
+            Serial.println("[SD] removeAttendanceRow: dropping -> " + line);
+        } else {
+            keptLines += line + "\n";
+        }
+        yield();
+    }
+    rf.close();
+
+    if (!removedAny) {
+        // Nothing matched — file already reflects the desired state.
+        return true;
+    }
+
+    File wf = SD_MMC.open(path, FILE_WRITE);  // FILE_WRITE truncates on ESP32
+    if (!wf) {
+        Serial.println("[SD] removeAttendanceRow: cannot reopen for write: " + path);
+        return false;
+    }
+    wf.print(keptLines);
+    wf.close();
+
+    Serial.println("[SD] removeAttendanceRow: uid=" + empUid +
+                   " type=" + clockType + " removed — CSV rewritten (" + path + ")");
+    return true;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // saveNfcMapping / loadUidForNfc
 //
 // FIX: NFC UIDs contain colons (e.g. "04:A3:2F:12:6B:4C:80").

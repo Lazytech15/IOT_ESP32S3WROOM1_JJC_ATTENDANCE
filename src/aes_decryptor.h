@@ -301,7 +301,37 @@ inline bool decryptServerResponse(AesDecryptor&        decryptor,
                            plainJson.substring(0, min(200, (int)plainJson.length())));
             Serial.flush();
 
-            outDoc.clear();
+            // ── Self-sizing capacity guard ────────────────────────────────────
+            // Callers pass outDoc pre-sized (4KB/8KB/16KB/...) based on a guess
+            // of typical payload size for their endpoint. Larger-than-usual
+            // responses (e.g. a wide date range, many employees) then blow that
+            // guess and fail with NoMemory even though the JSON itself is fine.
+            //
+            // ArduinoJson v6 documents need roughly 1.5-2x the raw JSON text
+            // length in overhead for arrays of small objects (each string,
+            // number, and nesting level costs a fixed per-node fee on top of
+            // the text itself). We size to plaintext length * 3 + headroom,
+            // which comfortably covers that overhead, and reassign outDoc
+            // in place — DynamicJsonDocument supports move-assignment, so
+            // this transparently reallocates without the caller needing to
+            // know its original guess was too small.
+            {
+                size_t neededCap = ((size_t)plainJson.length() * 3) + 2048;
+                const size_t MAX_CAP = 262144;  // 256KB hard ceiling — sanity guard
+                if (neededCap > MAX_CAP) neededCap = MAX_CAP;
+
+                if (neededCap > outDoc.capacity()) {
+                    Serial.printf("[AES] PASS 1: growing outDoc capacity %u -> %u"
+                                  " for plainJson len=%d\n",
+                                  (unsigned)outDoc.capacity(), (unsigned)neededCap,
+                                  (int)plainJson.length());
+                    Serial.flush();
+                    outDoc = DynamicJsonDocument(neededCap);
+                } else {
+                    outDoc.clear();
+                }
+            }
+
             DeserializationError err = deserializeJson(outDoc, plainJson);
             if (!err) {
                 Serial.println("[AES] PASS 1: JSON parse OK → success");
@@ -325,8 +355,24 @@ inline bool decryptServerResponse(AesDecryptor&        decryptor,
     Serial.println("[AES] PASS 2: attempting direct JSON parse");
     Serial.flush();
 
-    outDoc.clear();
     {
+        // Same self-sizing guard as PASS 1, based on the raw (undecrypted)
+        // body length this time, since that's the text we're about to parse.
+        size_t neededCap = ((size_t)rawBody.length() * 3) + 2048;
+        const size_t MAX_CAP = 262144;
+        if (neededCap > MAX_CAP) neededCap = MAX_CAP;
+
+        if (neededCap > outDoc.capacity()) {
+            Serial.printf("[AES] PASS 2: growing outDoc capacity %u -> %u"
+                          " for bodyLen=%d\n",
+                          (unsigned)outDoc.capacity(), (unsigned)neededCap,
+                          (int)rawBody.length());
+            Serial.flush();
+            outDoc = DynamicJsonDocument(neededCap);
+        } else {
+            outDoc.clear();
+        }
+
         DeserializationError err = deserializeJson(outDoc, rawBody);
         if (!err) {
             Serial.println("[AES] PASS 2: JSON parse OK → success");

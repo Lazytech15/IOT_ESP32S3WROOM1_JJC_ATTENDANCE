@@ -61,6 +61,21 @@ public:
         _serialReady = true;
     }
 
+    // ── suspendSDWrite ───────────────────────────────────────────────────────
+    // Skips the per-line SD_MMC.open/append/flush/close in log() while
+    // suspended (Serial output is unaffected). Each SD file open/close is
+    // several ms; a seed pass fires ~60 trace lines per employee, so across
+    // 44 employees that overhead alone was a large chunk of the 50-67s a
+    // single pass was taking. These are debug traces, not audit data (the
+    // actual attendance CSV/reconcile results are unaffected either way), so
+    // the seed passes suspend SD writes for just their noisy per-employee
+    // loops and resume afterward. Nest-safe via a counter, not a bool, so a
+    // pass calling another logged helper doesn't accidentally re-enable mid-way.
+    static void suspendSDWrite(bool suspend) {
+        if (suspend) _sdWriteSuspendDepth++;
+        else if (_sdWriteSuspendDepth > 0) _sdWriteSuspendDepth--;
+    }
+
     // ── flushEarlyBuffer ──────────────────────────────────────────────────────
     // Call after Serial.begin() + beginSerial() to dump all lines that were
     // buffered before Serial was initialised.
@@ -123,7 +138,14 @@ public:
 
         if (_serialReady) {
             Serial.println(line);
-            Serial.flush();
+            // NOTE: Serial.flush() removed — it blocked until every byte was
+            // physically clocked out over the 115200-baud UART before this
+            // call could return. With ~60 log lines fired per employee across
+            // a 44-employee seed pass, that blocking wait (not the actual SD
+            // write below) was the single biggest contributor to a seed pass
+            // taking 50-67s instead of a few seconds. The UART's own buffer
+            // still drains asynchronously in the background — nothing is lost,
+            // it just no longer stalls the caller.
         } else {
             // Serial not yet ready — buffer the line
             if (_earlyCount < EARLY_BUF_SIZE) {
@@ -132,7 +154,7 @@ public:
             // Still write to SD even without Serial
         }
 
-        if (!_sdReady) return;
+        if (!_sdReady || _sdWriteSuspendDepth > 0) return;
 
         File f = SD_MMC.open(_logPath(), FILE_APPEND);
         if (!f) return;
@@ -304,6 +326,7 @@ private:
 
     inline static bool   _sdReady     = false;
     inline static bool   _serialReady = false;
+    inline static int    _sdWriteSuspendDepth = 0;
     inline static String _earlyBuf[EARLY_BUF_SIZE];
     inline static int    _earlyCount  = 0;
 

@@ -57,6 +57,16 @@
 #define CLOCK_UPDATE_MS         1000
 #define STATS_REFRESH_MS       30000
 #define WIFI_RETRY_MS          20000
+#define WIFI_RECONNECT_RESYNC_COOLDOWN_MS  30000   // debounce for flapping WiFi (see loop())
+
+// ── RECONCILE POLLER ──────────────────────────────────────────────────────────
+// Periodically re-runs seedTodayAttendanceFromServer() (PASS 1-3, including the
+// server-delete reconciliation) so a portal-side deletion reaches the device
+// without waiting for boot / WiFi-reconnect / manual "Reseed Today". Modeled on
+// the web portal's PollingManager (websocket/polling-manager.jsx): fixed base
+// interval, exponential backoff on failure, reset to base on success.
+#define RECONCILE_POLL_BASE_MS     15000    // 15s, same cadence as the portal poller
+#define RECONCILE_POLL_MAX_MS     120000    // cap backoff at 2 minutes
 #define SCREEN_TIMEOUT_MS     300000   // 5 minutes of inactivity → backlight off
 
 // ── PROFILE DISPLAY ───────────────────────────────────────────────────────────
@@ -272,6 +282,18 @@ static uint8_t       _cardConfirmCt     = 0;
 // require SD file scans) WITHOUT blocking the NFC poll or clock on the
 // same tick as the drawStaticUI() redraw.
 static bool g_pendingStatsRefresh = false;
+// Set when reconcileTodayAttendance() removes a row (i.e. an admin deleted
+// an attendance entry from the portal). We don't track which employee/type
+// the removed row belonged to, so on the next dashboard tick we clear both
+// Clock-In/Clock-Out name strips rather than risk leaving a deleted
+// person's name on screen.
+static bool g_pendingLastScanClear = false;
+
+// ── Midnight rollover state ───────────────────────────────────────────────────
+// See purgeSyncedAttendanceDate() and the rollover block in loop().
+static String g_lastSeenDate         = "";   // last dateStr() observed — detects the day changing
+static String g_cleanupPendingDate   = "";   // yesterday's date, waiting for pendingCount==0 to purge
+static bool   g_weeklyRefreshPending = false; // set on a Monday rollover; run once dashboard is idle
 
 // ── Scan-ahead buffer ────────────────────────────────────────────────────────
 // During rush hour the profile display is showing (STATE_NFC_PROFILE) but the
@@ -292,6 +314,27 @@ static bool cardConfirmed(const String& cardId) {
 // ════════════════════════════════════════════════════════════════════════════
 // CLOCK TYPE RESOLUTION
 // ════════════════════════════════════════════════════════════════════════════
+//
+// Session time windows (device-local 24h), aligned with the peak windows in
+// isPeakHour() (noon out ~12:00, afternoon out ~17:00):
+//   morning:   00:00 – 11:59
+//   afternoon: 12:00 – 16:59
+//   evening:   17:00 – 23:59
+//
+// FIX: resolveClockType() used to ignore the clock entirely and just fill
+// slots in fixed order (morning_in -> morning_out -> afternoon_in -> ...).
+// A late/off-schedule tap (e.g. 1:47 PM) got labelled "morning_in" simply
+// because morning was the first empty slot — not because it was morning.
+// We now pick the session that matches the CURRENT time first, and only
+// fall back to old "first empty slot" scanning for edge cases (e.g. the
+// current session's in/out are both already filled — a duplicate tap).
+static int _currentSessionIndex() {
+    uint16_t nowMin = (uint16_t)clkH * 60 + clkM;
+    if (nowMin < 12*60) return 0;       // morning
+    if (nowMin < 17*60) return 1;       // afternoon
+    return 2;                            // evening
+}
+
 static String resolveClockType(const String& empUid) {
     static const char* SESSIONS[] = {
         "morning", "afternoon", "evening", nullptr
@@ -307,22 +350,31 @@ static String resolveClockType(const String& empUid) {
         if (existing.indexOf(inKey)  >= 0) hasIn[si]  = true;
         if (existing.indexOf(outKey) >= 0) hasOut[si] = true;
     }
+
+    int cur = _currentSessionIndex();
+    if (hasIn[cur] && !hasOut[cur]) return String(SESSIONS[cur]) + "_out";
+    if (!hasIn[cur])                 return String(SESSIONS[cur]) + "_in";
+
+    // Current session already fully clocked (duplicate tap) — fall back
+    // to the first genuinely open slot elsewhere in the day.
     for (int si = 0; SESSIONS[si]; si++) {
         if (hasIn[si] && !hasOut[si]) return String(SESSIONS[si]) + "_out";
     }
     for (int si = 0; SESSIONS[si]; si++) {
         if (!hasIn[si]) return String(SESSIONS[si]) + "_in";
     }
-    return "morning_in";
+    return String(SESSIONS[cur]) + "_out";  // everything filled — re-log current session's out
 
 #else
-    if (!SDDatabase::isReady()) return "morning_in";
+    if (!SDDatabase::isReady()) return String(SESSIONS[_currentSessionIndex()]) + "_in";
 
     String todayLog = SDDatabase::loadAttendanceToday(empUid);
 
     if (todayLog.length() == 0) {
         bool anyRecord = SDDatabase::hasCheckedInToday(empUid);
-        return anyRecord ? "morning_out" : "morning_in";
+        int cur = _currentSessionIndex();
+        return anyRecord ? (String(SESSIONS[cur]) + "_out")
+                          : (String(SESSIONS[cur]) + "_in");
     }
 
     bool hasIn[3]  = {false, false, false};
@@ -334,13 +386,19 @@ static String resolveClockType(const String& empUid) {
         if (todayLog.indexOf(outKey) >= 0) hasOut[si] = true;
     }
 
+    int cur = _currentSessionIndex();
+    if (hasIn[cur] && !hasOut[cur]) return String(SESSIONS[cur]) + "_out";
+    if (!hasIn[cur])                 return String(SESSIONS[cur]) + "_in";
+
+    // Current session already fully clocked (duplicate tap) — fall back
+    // to the first genuinely open slot elsewhere in the day.
     for (int si = 0; SESSIONS[si]; si++) {
         if (hasIn[si] && !hasOut[si]) return String(SESSIONS[si]) + "_out";
     }
     for (int si = 0; SESSIONS[si]; si++) {
         if (!hasIn[si]) return String(SESSIONS[si]) + "_in";
     }
-    return "morning_in";
+    return String(SESSIONS[cur]) + "_out";  // everything filled — re-log current session's out
 #endif
 }
 
@@ -350,12 +408,84 @@ static String resolveClockType(const String& empUid) {
 // Every NFC scan writes to SD immediately, then adds to this queue.
 // flushPending() drains the queue to the server in the background.
 // During peak hours the flush is skipped — records stay on SD.
+//
+// SD-backed: the queue is mirrored to /attendance/pending_queue.json on every
+// change (enqueue, successful upload, drop-oldest) and reloaded on boot. This
+// is separate from the per-day attendance CSV — that's the permanent record
+// of the tap; this file is purely "what still needs to reach the server."
+// A record only leaves this file once recordAttendance() gets a confirmed
+// OK from the server — so a reboot or power loss mid-day can't silently
+// lose an unsynced scan the way the in-memory-only queue used to.
 // ════════════════════════════════════════════════════════════════════════════
+#define PENDING_QUEUE_PATH "/attendance/pending_queue.json"
+
 struct PendingRecord {
     String empUid, nfcUid, clockType, timestamp, date;
 };
 static PendingRecord pendingQueue[32];
 static int           pendingCount = 0;
+
+// Overwrites PENDING_QUEUE_PATH with the current in-memory queue.
+// Called after every change so the SD copy never falls behind. 32 short
+// records is a small write (well under a second) — fine to do inline.
+static void savePendingQueueToSD() {
+    if (!SDDatabase::isReady()) return;
+
+    DynamicJsonDocument doc(4096);
+    JsonArray arr = doc.to<JsonArray>();
+    for (int i = 0; i < pendingCount; i++) {
+        JsonObject o = arr.createNestedObject();
+        o["empUid"]    = pendingQueue[i].empUid;
+        o["nfcUid"]    = pendingQueue[i].nfcUid;
+        o["clockType"] = pendingQueue[i].clockType;
+        o["timestamp"] = pendingQueue[i].timestamp;
+        o["date"]      = pendingQueue[i].date;
+    }
+
+    File f = SD_MMC.open(PENDING_QUEUE_PATH, FILE_WRITE);
+    if (!f) {
+        Serial.println("[Queue] WARNING: could not open pending_queue.json for write");
+        return;
+    }
+    serializeJson(doc, f);
+    f.close();
+}
+
+// Called once at boot (after SD is ready, before scanning starts) to restore
+// whatever didn't make it to the server before the last shutdown/reboot.
+static void loadPendingQueueFromSD() {
+    if (!SDDatabase::isReady()) return;
+    if (!SD_MMC.exists(PENDING_QUEUE_PATH)) return;
+
+    File f = SD_MMC.open(PENDING_QUEUE_PATH, FILE_READ);
+    if (!f) return;
+
+    DynamicJsonDocument doc(4096);
+    DeserializationError err = deserializeJson(doc, f);
+    f.close();
+    if (err) {
+        Serial.printf("[Queue] pending_queue.json parse failed: %s — starting empty\n",
+                      err.c_str());
+        return;
+    }
+
+    JsonArray arr = doc.as<JsonArray>();
+    pendingCount = 0;
+    for (JsonObject o : arr) {
+        if (pendingCount >= 32) break;
+        pendingQueue[pendingCount++] = {
+            String((const char*)(o["empUid"]    | "")),
+            String((const char*)(o["nfcUid"]    | "")),
+            String((const char*)(o["clockType"] | "")),
+            String((const char*)(o["timestamp"] | "")),
+            String((const char*)(o["date"]      | ""))
+        };
+    }
+    if (pendingCount > 0) {
+        Serial.printf("[Queue] Restored %d unsynced record(s) from SD (survived reboot)\n",
+                      pendingCount);
+    }
+}
 
 static void enqueuePending(const String& empUid, const String& nfcUid,
                            const String& clockType, const String& ts,
@@ -369,6 +499,35 @@ static void enqueuePending(const String& empUid, const String& nfcUid,
         for (int i = 0; i < 31; i++) pendingQueue[i] = pendingQueue[i+1];
         pendingQueue[31] = {empUid, nfcUid, clockType, ts, dt};
     }
+    savePendingQueueToSD();   // mirror to SD immediately — survives reboot from here on
+}
+
+// Removes a matching not-yet-uploaded record from the pending queue.
+// Called by the portal's "Delete row" action (via g_pendingQueueRemover, see
+// WiFiManager.h) so that deleting a record which hasn't synced to the server
+// yet actually sticks — otherwise the queue entry survives the delete,
+// survives a reboot, and flushPending() uploads it later anyway, silently
+// recreating the row the admin just deleted.
+// Matches on empUid + clockType + date, and on timeOnly too when the caller
+// has it (portal deletes always do); an empty timeOnly matches any time for
+// that empUid/clockType/date, which is only used defensively.
+static bool removeFromPendingQueue(const String& empUid, const String& clockType,
+                                    const String& date, const String& timeOnly) {
+    for (int i = 0; i < pendingCount; i++) {
+        if (pendingQueue[i].empUid    != empUid)    continue;
+        if (pendingQueue[i].clockType != clockType) continue;
+        if (pendingQueue[i].date      != date)      continue;
+        if (timeOnly.length() > 0 && pendingQueue[i].timestamp != timeOnly) continue;
+
+        Serial.printf("[Queue] Portal delete: purging matching pending record "
+                      "(%s %s %s %s)\n", empUid.c_str(), clockType.c_str(),
+                      date.c_str(), pendingQueue[i].timestamp.c_str());
+        for (int j = i; j < pendingCount - 1; j++) pendingQueue[j] = pendingQueue[j + 1];
+        pendingCount--;
+        savePendingQueueToSD();
+        return true;
+    }
+    return false;
 }
 
 // ── flushPending ──────────────────────────────────────────────────────────────
@@ -415,6 +574,8 @@ static void flushPending() {
 
     for (int j = 0; j < remaining; j++) pendingQueue[j] = keep[j];
     pendingCount = remaining;
+    savePendingQueueToSD();   // mirror the drained/retry-trimmed queue back to SD —
+                              // confirmed-uploaded records are now gone from the file too
     Serial.printf("[Flush] Done. %d remain in queue.\n", pendingCount);
 }
 
@@ -500,40 +661,181 @@ static String getPhotoPath(const EmployeeProfile& emp) {
 //   • Once at boot after NTP sync (triggerInitialSync)
 //   • On demand via web portal "Reseed Today" action
 // ════════════════════════════════════════════════════════════════════════════
-static void seedTodayAttendanceFromServer() {
-    if (!wifiConfig.isConnected()) return;
-    if (!SDDatabase::isReady()) return;
+// Returns false only on a genuine network/transport failure (used by the
+// background poller below to back off). A day with legitimately 0 rows to
+// seed/remove still returns true — that's success, not an error.
+static bool seedTodayAttendanceFromServer() {
+    if (!wifiConfig.isConnected()) return false;
+    if (!SDDatabase::isReady()) return false;
 
     String today = dateStr();
     if (today.length() < 10) {
         Serial.println("[Seed] Skipping — clock not yet synced");
-        return;
+        return false;
     }
 
     Serial.println("[Seed] === Seeding today's attendance: " + today + " ===");
     int seeded = 0;
 
-    // PASS 1: Raw live endpoint (always fresh)
-    int rawResult = attService.seedCsvFromRawAttendance(today);
-    if (rawResult > 0) {
-        seeded += rawResult;
-        Serial.printf("[Seed] PASS 1: %d new row(s) seeded\n", rawResult);
-    } else if (rawResult == 0) {
-        Serial.println("[Seed] PASS 1: 0 new rows (up-to-date or no data)");
-    } else {
-        Serial.println("[Seed] PASS 1: network error");
-    }
+    // Suspend SDLogger's per-line SD_MMC file write for the duration of the
+    // three passes below — see SDLogger::suspendSDWrite() for why. Serial
+    // output (and the CSV/reconcile results themselves) are unaffected;
+    // this only skips writing the noisy per-employee trace lines to the SD
+    // debug log file. Always resumed via the RAII-style guard so an early
+    // return (e.g. PASS 1 issues) can't leave it stuck suspended.
+    SDLogger::suspendSDWrite(true);
+    struct ResumeSDWriteOnExit {
+        ~ResumeSDWriteOnExit() { SDLogger::suspendSDWrite(false); }
+    } resumeSDWriteGuard;
 
-    // PASS 2: ESP32-sync snapshot (keeps JSON file current for portal fallback)
+    // PASS 1: ESP32-sync snapshot (fetches the CURRENT server picture and
+    // refreshes /attendance/esp32_<date>.json). This MUST run before PASS 2
+    // below — PASS 2 seeds the CSV from that same snapshot file, and running
+    // it first (as this used to) meant PASS 2 seeded from LAST cycle's
+    // snapshot, i.e. from data that could already be stale/deleted on the
+    // server. Fetching fresh first means a server-side deletion is already
+    // reflected in the snapshot before anything reads it, so a fully-deleted
+    // record (an employee's only row for the day) never gets re-seeded in
+    // the first place instead of relying entirely on reconciliation to undo it.
     int syncResult = attService.fetchTodayAttendanceEsp32(today);
     if (syncResult > 0) {
         seeded += syncResult;
-        Serial.printf("[Seed] PASS 2: %d additional row(s) from esp32-sync\n", syncResult);
+        Serial.printf("[Seed] PASS 1: %d row(s) from esp32-sync\n", syncResult);
     }
 
-    updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
-                          max(0, SDDatabase::countTodayCheckOuts()));
-    Serial.printf("[Seed] === Seed complete: %d total new row(s) ===\n", seeded);
+    // PASS 2: Local SD snapshot seeder — NOT a network call. Reads the
+    // snapshot PASS 1 just refreshed and seeds any missing CSV rows from it.
+    // A -1 here means that local file was empty/corrupt (e.g. PASS 1 above
+    // failed, offline) — NOT a WiFi/server failure — so it must never abort
+    // PASS 3/3B or count against the poller's backoff.
+    int rawResult = attService.seedCsvFromRawAttendance(today);
+    if (rawResult > 0) {
+        seeded += rawResult;
+        Serial.printf("[Seed] PASS 2: %d new row(s) seeded\n", rawResult);
+    } else if (rawResult == 0) {
+        Serial.println("[Seed] PASS 2: 0 new rows (up-to-date or no data)");
+    } else {
+        Serial.println("[Seed] PASS 2: local snapshot not ready yet (normal if PASS 1 failed) — continuing");
+    }
+
+    // PASS 3: Reconciliation — removes local rows the server no longer has.
+    // PASS 1/2 above are purely additive (seed-if-missing); neither one ever
+    // notices when a record was deleted server-side, so the local CSV would
+    // otherwise keep phantom rows forever. This pass diffs local vs. server
+    // and drops anything stale. Only touches employees the server actually
+    // responded about this call, so it never wipes out a tap that's just
+    // waiting to upload (see reconcileTodayAttendance() doc comment).
+    int removedResult = attService.reconcileTodayAttendance(today);
+    if (removedResult > 0) {
+        Serial.printf("[Seed] PASS 3: %d stale row(s) removed (deleted server-side)\n",
+                      removedResult);
+        // A row was deleted on the portal — the last-scan name strip on the
+        // TFT may currently be showing that person even though the stats
+        // card above it is about to update. Clear it on the next tick.
+        g_pendingLastScanClear = true;
+    }
+
+    // PASS 3B: Live-record reconciliation — makes the server the absolute
+    // source of truth for today's CSV, catching what PASS 3 misses.
+    // PASS 3 only checks employees the esp32-sync AGGREGATION endpoint still
+    // returns for today; if a deleted record was an employee's ONLY row for
+    // the day (or was a SNAP_SEED/SERVER_SEED row, which never gets a
+    // server-ID map entry), PASS 3 (and the old ID-map-only pass) can't see
+    // it, so it survives every cycle and every reboot. This pass instead
+    // diffs the ENTIRE CSV against the server's live, non-aggregated record
+    // list — see reconcileAgainstLiveRecords()'s doc comment for the full
+    // explanation and the safety rule that still protects a local NFC tap
+    // that hasn't uploaded yet.
+    int removedById = attService.reconcileAgainstLiveRecords(today);
+    if (removedById > 0) {
+        Serial.printf("[Seed] PASS 3B: %d stale row(s) removed (live-record diff)\n",
+                      removedById);
+        g_pendingLastScanClear = true;
+    }
+
+    // Don't touch the TFT from here — this function now runs on Core 0
+    // (see seedWorkerTask) and loop() on Core 1 may be mid-repaint. Just
+    // flag it; loop() picks this up on its next DASHBOARD tick, same
+    // mechanism already used for post-scan stats refresh.
+    g_pendingStatsRefresh = true;
+    Serial.printf("[Seed] === Seed complete: %d new, %d removed ===\n",
+                  seeded, max(0, removedResult) + max(0, removedById));
+    return true;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// purgeSyncedAttendanceDate  — midnight cleanup for a PAST date only
+//
+// Deletes the CSV + server_id map + esp32-sync snapshot for a date that has
+// already rolled over (never "today"). Only called once the caller has
+// confirmed pendingCount == 0 — i.e. nothing from that date is still
+// waiting to reach the server. If a record failed to upload, it stays in
+// pendingQueue (see flushPending()'s RETRY-later path), so pendingCount==0
+// is a true "everything from that date made it out" signal, not a guess.
+// ════════════════════════════════════════════════════════════════════════════
+static void purgeSyncedAttendanceDate(const String& dateToPurge) {
+    if (dateToPurge.length() != 10) return;  // guard against a malformed/empty date
+
+    String csvPath  = "/attendance/" + dateToPurge + ".csv";
+    String mapPath  = "/attendance/server_ids_" + dateToPurge + ".json";
+    String snapPath = "/attendance/esp32_" + dateToPurge + ".json";
+
+    bool csvRemoved  = SD_MMC.exists(csvPath)  ? SD_MMC.remove(csvPath)  : true;
+    bool mapRemoved  = SD_MMC.exists(mapPath)  ? SD_MMC.remove(mapPath)  : true;
+    bool snapRemoved = SD_MMC.exists(snapPath) ? SD_MMC.remove(snapPath) : true;
+
+    Serial.printf("[Rollover] Purged %s — csv=%s map=%s snap=%s\n",
+                  dateToPurge.c_str(),
+                  csvRemoved  ? "OK" : "FAIL",
+                  mapRemoved  ? "OK" : "FAIL",
+                  snapRemoved ? "OK" : "FAIL");
+}
+
+// ── Seed worker — runs seedTodayAttendanceFromServer() on Core 0 ──────────────
+// seedTodayAttendanceFromServer() does 2-3 paginated HTTP calls and was
+// measured taking 5-10s against ~43 employees. Called directly from loop()
+// (Core 1) it used to freeze NFC polling and the clock for that whole
+// window — exactly when a WiFi hiccup-then-reconnect during a busy rush
+// would trigger it. This task moves it off Core 1, same pattern as
+// uploadWorkerTask. Skipped entirely during peak hour, matching every
+// other background job in this codebase (upload flush, photo sync, etc).
+static TaskHandle_t      g_seedTask    = nullptr;
+static SemaphoreHandle_t g_seedTrigger = nullptr;  // binary — signaled to request a seed run
+volatile bool            g_lastSeedOk  = true;      // read by the reconcile poller for backoff
+volatile bool            g_seedRunning = false;      // true while a seed pass is in flight
+volatile unsigned long   g_seedFinishedAtMs = 0;      // millis() when the last pass completed
+
+static void seedWorkerTask(void* /*param*/) {
+    for (;;) {
+        if (xSemaphoreTake(g_seedTrigger, portMAX_DELAY) == pdTRUE) {
+            if (isPeakHour()) {
+                Serial.println("[Seed] Skipped — peak hour rush in progress");
+                continue;
+            }
+            g_seedRunning     = true;
+            g_lastSeedOk      = seedTodayAttendanceFromServer();
+            g_seedFinishedAtMs = millis();
+            g_seedRunning     = false;
+        }
+    }
+}
+
+// Request a seed run without blocking the caller. Before the worker task
+// exists (i.e. the one-time boot call in setup(), before task creation),
+// falls back to running it synchronously — safe at that point since NFC
+// scanning isn't active yet.
+static void requestSeedToday() {
+    if (g_seedRunning) {
+        Serial.println("[Seed] Request skipped — a seed pass is already in flight");
+        return;
+    }
+    if (g_seedTrigger) {
+        xSemaphoreGive(g_seedTrigger);
+    } else {
+        g_seedRunning = true;
+        seedTodayAttendanceFromServer();
+        g_seedRunning = false;
+    }
 }
 
 // ─── triggerInitialSync ───────────────────────────────────────────────────────
@@ -561,8 +863,10 @@ static void triggerInitialSync() {
         Serial.println("[Sync] SD cache present — skipping auto employee sync");
     }
 
-    // Seed today's attendance from server
-    seedTodayAttendanceFromServer();
+    // Seed today's attendance from server — async once the seed worker task
+    // exists (runtime reconnects); synchronous on the one-time boot call,
+    // before any task or NFC scanning is up yet.
+    requestSeedToday();
 
     // Broadcast stats to portal
     {
@@ -865,6 +1169,11 @@ void setup() {
     showLoadingAnimation(20, "SD...");
     if (SDDatabase::begin()) {
         Serial.println("[Boot] SD OK");
+        // Restore any records that hadn't reached the server before the
+        // last shutdown/reboot — see loadPendingQueueFromSD() for details.
+        // Must happen before the NFC worker task starts (step 7 below) so
+        // nothing new can enqueue ahead of the restored records.
+        loadPendingQueueFromSD();
     } else {
         showLoadingAnimation(20, "SD FAILED");
         Serial.println("[Boot] SD FAILED");
@@ -893,6 +1202,11 @@ void setup() {
     // ── 5. Web portal ─────────────────────────────────────────────────────
     showLoadingAnimation(80, "Portal...");
     wifiManager.init(deviceId, &wifiConfig, SERVER_URL, &attService);
+
+    // Let the portal's "Delete row" action purge a matching not-yet-uploaded
+    // record from the pending upload queue too (see g_pendingQueueRemover's
+    // doc comment in WiFiManager.h for why this is needed).
+    g_pendingQueueRemover = removeFromPendingQueue;
 
     // ── 6. Ready — draw dashboard immediately, THEN sync in background ────
     showLoadingAnimation(100, "READY!");
@@ -947,6 +1261,22 @@ void setup() {
     );
     Serial.println("[Ready] Upload worker task started on Core 0");
 
+    // ── 9. Seed worker task (Core 0) ──────────────────────────────────────────
+    // Runs seedTodayAttendanceFromServer() (2-3 paginated HTTP calls, 5-10s)
+    // off Core 1 so a WiFi-reconnect mid-rush or a portal "Reseed Today"
+    // click never freezes NFC polling. loop() signals via g_seedTrigger.
+    g_seedTrigger = xSemaphoreCreateBinary();
+    xTaskCreatePinnedToCore(
+        seedWorkerTask,    // task function
+        "seedWorker",      // name
+        8192,              // stack — enough for HTTP + JSON
+        nullptr,           // parameter
+        1,                 // priority (same as uploadWorker)
+        &g_seedTask,       // handle
+        0                  // Core 0 — keeps HTTP off Core 1
+    );
+    Serial.println("[Ready] Seed worker task started on Core 0");
+
     Serial.println("[Ready] NFC scanning active");
     Serial.printf("[Ready] Portal: http://%s:8080\n",
                   wifiConfig.isConnected()
@@ -962,6 +1292,8 @@ void loop() {
     static unsigned long lastWifiRetry   = 0;
     static unsigned long lastUploadFlush = 0;
     static unsigned long lastSocketPoll  = 0;
+    static unsigned long reconcilePollRateMs = RECONCILE_POLL_BASE_MS;
+    static int            reconcileErrorCount = 0;
     static uint8_t       tick            = 0;
     unsigned long now = millis();
 
@@ -1003,12 +1335,24 @@ void loop() {
     }
     bool isConnected = wifiConfig.isConnected();
     if (isConnected && !wasConnectedGlobal) {
-        // WiFi reconnected after a drop — re-sync time and re-seed only
+        // WiFi reconnected after a drop — re-sync time and re-seed only.
+        // Debounced: a marginal signal can make WiFi.status() flap connected/
+        // disconnected repeatedly within seconds (each flap re-enters this
+        // block), which was re-triggering a full 5-10s seed back-to-back with
+        // no gap — the "log never stops" symptom. A genuine reconnect after
+        // being offline a while still fires immediately the first time; only
+        // rapid re-flapping within the cooldown gets skipped.
+        static unsigned long lastReconnectResyncMs = 0;
         wasConnectedGlobal = true;
-        Serial.println("[WiFi] Reconnected");
-        syncNTPTime();
-        initialSyncDone = false;   // allow re-seed after reconnect
-        triggerInitialSync();
+        if (now - lastReconnectResyncMs >= WIFI_RECONNECT_RESYNC_COOLDOWN_MS) {
+            lastReconnectResyncMs = now;
+            Serial.println("[WiFi] Reconnected");
+            syncNTPTime();
+            initialSyncDone = false;   // allow re-seed after reconnect
+            triggerInitialSync();
+        } else {
+            Serial.println("[WiFi] Reconnected (flap within cooldown — skipping re-seed)");
+        }
     }
     if (!isConnected && wasConnectedGlobal) {
         wasConnectedGlobal = false;
@@ -1020,6 +1364,56 @@ void loop() {
     if (!isConnected && (now - lastWifiRetry >= WIFI_RETRY_MS)) {
         lastWifiRetry = now;
         WiFi.reconnect();
+    }
+
+    // ── Midnight rollover: detect the date changing ────────────────────────
+    // dateStr() flips the instant the clock crosses 00:00:00, so this fires
+    // once per day. We don't purge anything here — just mark yesterday's
+    // date as "pending cleanup" and (on Mondays) flag a weekly employee
+    // re-sync. Both are carried out below, gated on being safe to do so.
+    {
+        String todayStr = dateStr();
+        if (todayStr.length() == 10) {
+            if (g_lastSeenDate.length() == 0) {
+                g_lastSeenDate = todayStr;   // first time the clock is synced — just anchor, no rollover yet
+            } else if (todayStr != g_lastSeenDate) {
+                Serial.printf("[Rollover] Date changed %s -> %s\n",
+                              g_lastSeenDate.c_str(), todayStr.c_str());
+                g_cleanupPendingDate = g_lastSeenDate;  // yesterday — purge once fully synced
+                g_lastSeenDate = todayStr;
+
+                time_t t = (time_t)clkEpoch;
+                struct tm* tmNow = gmtime(&t);
+                if (tmNow->tm_wday == 1) {  // Monday
+                    Serial.println("[Rollover] Monday — weekly employee re-sync flagged");
+                    g_weeklyRefreshPending = true;
+                }
+            }
+        }
+    }
+
+    // ── Midnight rollover: carry out the purge once safe ───────────────────
+    // "Safe" = pendingCount reached 0, i.e. everything queued from that date
+    // got a successful server response (flushPending() keeps failed uploads
+    // in the queue for retry — see its RETRY-later path — so this never
+    // fires while something from that date is still unconfirmed). If uploads
+    // are still trickling in, this simply re-checks every tick — cheap, just
+    // a string + int compare — until the queue drains, then purges once.
+    if (g_cleanupPendingDate.length() == 10 && pendingCount == 0) {
+        purgeSyncedAttendanceDate(g_cleanupPendingDate);
+        g_cleanupPendingDate = "";
+    }
+
+    // ── Weekly employee/profile re-sync — runs once the dashboard is idle ──
+    // Uses the same force-sync path as the portal's manual "Sync Employees"
+    // button, so it inherits the same on-screen progress UI. That's why it
+    // waits for STATE_DASHBOARD rather than running silently mid-scan.
+    if (g_weeklyRefreshPending && isConnected && currentState == STATE_DASHBOARD) {
+        g_weeklyRefreshPending = false;
+        Serial.println("[Rollover] Running weekly employee re-sync");
+        EmployeeSync::fullSyncIfNeeded(attService, true);
+        drawStaticUI();
+        updateStatusDots(isConnected, SDDatabase::isReady(), true);
     }
 
     // ── Manual action triggers from web portal ────────────────────────────
@@ -1036,9 +1430,8 @@ void loop() {
         g_triggerReseedToday = false;
         if (isConnected && currentState == STATE_DASHBOARD) {
             Serial.println("[Action] Manual reseed triggered");
-            seedTodayAttendanceFromServer();
-            updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
-                                  max(0, SDDatabase::countTodayCheckOuts()));
+            requestSeedToday();   // runs on Core 0 — loop() isn't blocked, stats
+                                   // refresh automatically via g_pendingStatsRefresh
         }
     }
     if (g_triggerPhotoSync) {
@@ -1085,6 +1478,38 @@ void loop() {
         lastSocketPoll = now;
         if (ESP.getFreeHeap() > 40000) {
             pollSocketEvents();
+        }
+    }
+
+    // ── Reconcile poller (server-side deletions, portal edits) ─────────────
+    // Every reconcilePollRateMs (base 15s) AFTER THE PREVIOUS RUN FINISHED,
+    // asks the seed worker to re-run PASS 1-3 so a row deleted on the portal
+    // disappears from the device without needing a reboot/WiFi-blip/manual
+    // Reseed. Gated on g_seedFinishedAtMs (not dispatch time) and !g_seedRunning
+    // because a full pass can take 30-50s+ with verbose per-employee logging —
+    // longer than the 15s base interval. Gating on dispatch time let 2-3 poll
+    // ticks land mid-run; each queued a semaphore give, so the worker started
+    // its next pass with zero gap the instant the current one finished — the
+    // "log never stops" symptom. Same idle/peak/heap guards as the socket
+    // poller above; the request itself runs on Core 0 (seedWorkerTask) so it
+    // never blocks NFC polling on Core 1.
+    if (isConnected && currentState == STATE_DASHBOARD &&
+        !isPeakHour() && !g_seedRunning &&
+        (now - g_seedFinishedAtMs >= reconcilePollRateMs)) {
+        if (ESP.getFreeHeap() > 40000) {
+            requestSeedToday();
+
+            if (g_lastSeedOk) {
+                reconcileErrorCount  = 0;
+                reconcilePollRateMs  = RECONCILE_POLL_BASE_MS;
+            } else {
+                reconcileErrorCount++;
+                reconcilePollRateMs = min(
+                    (unsigned long)(RECONCILE_POLL_BASE_MS * (1UL << min(reconcileErrorCount, 4))),
+                    (unsigned long)RECONCILE_POLL_MAX_MS);
+                Serial.printf("[Reconcile] Backed off to %lus (error #%d)\n",
+                              reconcilePollRateMs / 1000, reconcileErrorCount);
+            }
         }
     }
 
@@ -1226,6 +1651,11 @@ void loop() {
         lastStats = now;   // reset the periodic timer so we don't double-count
         updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
                               max(0, SDDatabase::countTodayCheckOuts()));
+    }
+
+    if (g_pendingLastScanClear && currentState == STATE_DASHBOARD && !screenIsOff) {
+        g_pendingLastScanClear = false;
+        clearLastScan("both");
     }
 
     if (currentState == STATE_DASHBOARD && !screenIsOff &&

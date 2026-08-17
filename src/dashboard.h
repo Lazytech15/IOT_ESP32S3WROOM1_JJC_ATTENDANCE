@@ -50,6 +50,7 @@ void updateClock(uint8_t h, uint8_t m, uint8_t s);
 void updateDate(const String& dateStr);
 void updateAttendanceStats(int checkIns, int checkOuts);
 void updateLastScan(const String& name, const String& eventType, const String& timeStr);
+void clearLastScan(const String& eventType);  // "check-in" | "check-out" | "both"
 void updateStatusDots(bool wifiOk, bool sdOk, bool nfcOk);
 void pulseStatus(bool state);
 TFT_eSPI* dashboardGetTFT();
