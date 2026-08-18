@@ -37,6 +37,7 @@
 #include <SPI.h>
 #include <SD.h>
 #include <esp_system.h>   // esp_register_shutdown_handler
+#include <time.h>         // wall-clock timestamp for crash logs
 
 class SDLogger {
 public:
@@ -62,15 +63,18 @@ public:
     }
 
     // ── suspendSDWrite ───────────────────────────────────────────────────────
-    // Skips the per-line SD_MMC.open/append/flush/close in log() while
-    // suspended (Serial output is unaffected). Each SD file open/close is
-    // several ms; a seed pass fires ~60 trace lines per employee, so across
-    // 44 employees that overhead alone was a large chunk of the 50-67s a
-    // single pass was taking. These are debug traces, not audit data (the
-    // actual attendance CSV/reconcile results are unaffected either way), so
-    // the seed passes suspend SD writes for just their noisy per-employee
-    // loops and resume afterward. Nest-safe via a counter, not a bool, so a
-    // pass calling another logged helper doesn't accidentally re-enable mid-way.
+    // Skips the per-line SD_MMC.open/append/flush/close AND the Serial.println
+    // in log() while suspended, for DEBUG/INFO/WARN (ERROR always still goes
+    // to both — see log()). Each SD file open/close is several ms, and each
+    // Serial.println is CPU time on Core 0 shared with the higher-priority
+    // nfcWorker task; a seed pass fires ~60 trace lines per employee, so
+    // across 44-47 employees that's ~2800+ lines of overhead on both fronts.
+    // These are debug traces, not audit data (the actual attendance
+    // CSV/reconcile results are unaffected either way — they're written via
+    // separate SD_MMC calls, not through this logger), so the seed passes
+    // suspend both outputs for just their noisy per-employee loops and
+    // resume afterward. Nest-safe via a counter, not a bool, so a pass
+    // calling another logged helper doesn't accidentally re-enable mid-way.
     static void suspendSDWrite(bool suspend) {
         if (suspend) _sdWriteSuspendDepth++;
         else if (_sdWriteSuspendDepth > 0) _sdWriteSuspendDepth--;
@@ -101,8 +105,16 @@ public:
     // Registers an ESP-IDF shutdown handler that writes a final log entry
     // before the chip resets on any fatal error (abort, stack overflow, WDT).
     // Call once near the top of setup().
+    //
+    // IMPORTANT: esp_register_shutdown_handler() callbacks run on EVERY
+    // esp_restart() — including deliberate ones (portal reboot button, OTA,
+    // etc.) — not only on genuine crashes. Any code path that calls
+    // ESP.restart() intentionally MUST call markIntentionalRestart() first,
+    // or this handler will mislabel a normal reboot as "SYSTEM PANIC" in
+    // last_crash.log.
     static void installPanicHandler() {
         esp_register_shutdown_handler([]() {
+            if (_intentionalRestart) return;   // deliberate reboot — not a crash, skip
             if (!_sdReady) return;
             _ensureDir();
             File f = SD_MMC.open(_logPath(), FILE_APPEND);
@@ -118,10 +130,19 @@ public:
             f.flush();
             f.close();
 
-            // Also write last_crash.log so it survives and prints on next boot
+            // Also write last_crash.log so it survives and prints on next boot.
+            // Include a wall-clock timestamp (when available) so a reader can
+            // tell at a glance whether this crash is from tonight or from
+            // three weeks ago, instead of only a millis()-since-boot value
+            // that resets to near-zero on every restart.
+            String wallTime = _wallClockStr();
             File cf = SD_MMC.open("/logs/last_crash.log", FILE_WRITE);
             if (cf) {
                 cf.println("=== LAST FATAL EVENT ===");
+                if (wallTime.length())
+                    cf.printf("Crash time: %s\n", wallTime.c_str());
+                else
+                    cf.println("Crash time: unknown (clock not yet synced at crash time)");
                 cf.printf("%s[ERR][PANIC   ] SYSTEM PANIC at uptime %lums"
                           "  heap=%u psram=%u\n",
                           ts, ms, ESP.getFreeHeap(), ESP.getFreePsram());
@@ -133,33 +154,130 @@ public:
     }
 
     // ── log ───────────────────────────────────────────────────────────────────
+    // MAX_LOG_BYTES caps a single log file before it's rotated. Previously
+    // unbounded — _logPath() is keyed off days-since-boot, so a device that
+    // rarely reboots kept appending to the SAME file forever (observed at
+    // 3.54MB and climbing with no ceiling). One rotated backup (.1) is kept;
+    // anything older is discarded — these are diagnostic logs, not records
+    // that need indefinite retention (attendance data has its own separate
+    // purge path in main.cpp).
+    static const uint32_t MAX_LOG_BYTES = 2UL * 1024 * 1024;   // 2MB per file
+
+    static void _rotateIfNeeded(const String& path) {
+        if (!SD_MMC.exists(path)) return;
+        File chk = SD_MMC.open(path, FILE_READ);
+        if (!chk) return;
+        size_t sz = chk.size();
+        chk.close();
+        if (sz < MAX_LOG_BYTES) return;
+
+        String oldPath = path + ".1";
+        if (SD_MMC.exists(oldPath)) SD_MMC.remove(oldPath);
+        SD_MMC.rename(path, oldPath);
+    }
+
     static void log(const char* tag, Level level, const String& msg) {
         String line = _prefix(tag, level) + msg;
 
-        if (_serialReady) {
-            Serial.println(line);
-            // NOTE: Serial.flush() removed — it blocked until every byte was
-            // physically clocked out over the 115200-baud UART before this
-            // call could return. With ~60 log lines fired per employee across
-            // a 44-employee seed pass, that blocking wait (not the actual SD
-            // write below) was the single biggest contributor to a seed pass
-            // taking 50-67s instead of a few seconds. The UART's own buffer
-            // still drains asynchronously in the background — nothing is lost,
-            // it just no longer stalls the caller.
-        } else {
-            // Serial not yet ready — buffer the line
-            if (_earlyCount < EARLY_BUF_SIZE) {
-                _earlyBuf[_earlyCount++] = line;
+        // ── Suspend-aware output ─────────────────────────────────────────
+        // suspendSDWrite() marks a burst of noisy per-employee DEBUG/INFO
+        // tracing (seed/reconcile passes: ~60 lines x each employee). Serial
+        // used to still print every one of those lines even while suspended
+        // — only the SD file write was skipped. Two costs from that:
+        //   1. ~2800+ Serial.println() calls back-to-back on a 47-employee
+        //      pass, each consuming CPU time on Core 0 — the same core (and
+        //      lower priority) as nfcWorker, which is what actually wakes
+        //      the screen and answers an NFC tap. That competition is a
+        //      real, if usually small, source of tap-to-wake latency during
+        //      exactly the moments a seed/reconcile pass is mid-flight.
+        //   2. A terminal reading that much UART traffic that fast visibly
+        //      garbles/truncates lines (interleaved writes, dropped bytes).
+        // DEBUG/INFO/WARN are now silenced on both Serial and SD together
+        // while suspended — ERROR always gets through on both, unchanged
+        // from before, since a real failure must never go unseen.
+        bool suspended = (_sdWriteSuspendDepth > 0 && level != ERROR);
+
+        if (!suspended) {
+            if (_serialReady) {
+                Serial.println(line);
+                // NOTE: Serial.flush() removed — it blocked until every byte was
+                // physically clocked out over the 115200-baud UART before this
+                // call could return. With ~60 log lines fired per employee across
+                // a 44-employee seed pass, that blocking wait (not the actual SD
+                // write below) was the single biggest contributor to a seed pass
+                // taking 50-67s instead of a few seconds. The UART's own buffer
+                // still drains asynchronously in the background — nothing is lost,
+                // it just no longer stalls the caller.
+            } else {
+                // Serial not yet ready — buffer the line
+                if (_earlyCount < EARLY_BUF_SIZE) {
+                    _earlyBuf[_earlyCount++] = line;
+                }
+                // Still write to SD even without Serial
             }
-            // Still write to SD even without Serial
         }
 
-        if (!_sdReady || _sdWriteSuspendDepth > 0) return;
+        // ── ERROR priority bypass ────────────────────────────────────────
+        // ERROR always reaches the SD log regardless of suspend state, and
+        // is additionally mirrored to a small dedicated priority file (see
+        // _writePriorityError) so a fatal reboot moments later can't take
+        // the only copy of the error with it.
+        if (level == ERROR) {
+            _writePriorityError(line);
+        }
 
-        File f = SD_MMC.open(_logPath(), FILE_APPEND);
+        if (!_sdReady) return;
+        if (suspended) return;
+
+        String path = _logPath();
+        _rotateIfNeeded(path);
+
+        File f = SD_MMC.open(path, FILE_APPEND);
         if (!f) return;
         f.println(line);
         f.flush();
+        f.close();
+    }
+
+    // ── _writePriorityError ─────────────────────────────────────────────────
+    // Every ERROR-level log() call lands here immediately, independent of
+    // suspendSDWrite() and independent of the main rotating log file. Purpose:
+    // a device that panics/reboots shortly after an error should still have
+    // that error recoverable on the next boot, even if the main log write for
+    // that same line got skipped for some other reason, or the panic happened
+    // before the main log's rotate/flush completed. Kept small (256KB cap,
+    // one .1 backup) since real errors should be rare — this is meant to be
+    // opened and read by a human debugging a specific incident, not scanned
+    // programmatically like the main log.
+    static void _writePriorityError(const String& line) {
+        if (!_sdReady) return;
+        _ensureDir();
+
+        const char* path = "/logs/priority_errors.log";
+        const uint32_t MAX_PRIORITY_BYTES = 256UL * 1024;   // 256KB
+
+        if (SD_MMC.exists(path)) {
+            File chk = SD_MMC.open(path, FILE_READ);
+            if (chk) {
+                size_t sz = chk.size();
+                chk.close();
+                if (sz >= MAX_PRIORITY_BYTES) {
+                    String oldPath = String(path) + ".1";
+                    if (SD_MMC.exists(oldPath)) SD_MMC.remove(oldPath);
+                    SD_MMC.rename(path, oldPath);
+                }
+            }
+        }
+
+        File f = SD_MMC.open(path, FILE_APPEND);
+        if (!f) return;
+        String wallTime = _wallClockStr();
+        f.printf("[%s] uptime=%lums heap=%u psram=%u\n",
+                  wallTime.length() ? wallTime.c_str() : "clock not synced",
+                  millis(), ESP.getFreeHeap(), ESP.getFreePsram());
+        f.println(line);
+        f.flush();   // always flushed immediately — this file exists
+                     // specifically to survive a crash moments later
         f.close();
     }
 
@@ -193,6 +311,11 @@ public:
         File f = SD_MMC.open("/logs/last_crash.log", FILE_WRITE);
         if (!f) return;
         f.println("=== LAST FATAL EVENT ===");
+        String wallTime = _wallClockStr();
+        if (wallTime.length())
+            f.printf("Crash time: %s\n", wallTime.c_str());
+        else
+            f.println("Crash time: unknown (clock not yet synced at crash time)");
         f.println(_prefix(tag, ERROR) + "FATAL: " + msg);
         f.printf("heap=%u psram=%u uptime_ms=%lu\n",
                  ESP.getFreeHeap(), ESP.getFreePsram(), millis());
@@ -206,10 +329,41 @@ public:
         }
     }
 
+    // ── resetReasonStr ───────────────────────────────────────────────────────
+    // esp_reset_reason() is only meaningful AFTER a reboot (it reads a value
+    // latched in RTC memory), which is why installPanicHandler()'s shutdown
+    // callback can't log it — at that point the chip hasn't reset yet. This
+    // is the missing half: called on the NEXT boot, it says *why* the
+    // previous session ended (task watchdog, brownout, panic/exception,
+    // etc.) instead of the old crash log's bare "SYSTEM PANIC" with no cause.
+    static const char* resetReasonStr() {
+        switch (esp_reset_reason()) {
+            case ESP_RST_POWERON:   return "POWERON (cold boot)";
+            case ESP_RST_EXT:       return "EXT (external reset pin)";
+            case ESP_RST_SW:        return "SW (esp_restart() called)";
+            case ESP_RST_PANIC:     return "PANIC (unhandled exception / abort)";
+            case ESP_RST_INT_WDT:   return "INT_WDT (interrupt watchdog — ISR ran too long)";
+            case ESP_RST_TASK_WDT:  return "TASK_WDT (task watchdog — a task blocked/looped too long)";
+            case ESP_RST_WDT:       return "WDT (other watchdog)";
+            case ESP_RST_DEEPSLEEP: return "DEEPSLEEP wake";
+            case ESP_RST_BROWNOUT:  return "BROWNOUT (voltage dip — check power supply)";
+            case ESP_RST_SDIO:      return "SDIO";
+            default:                return "UNKNOWN";
+        }
+    }
+
     // ── bootDump ─────────────────────────────────────────────────────────────
     // Print previous crash log to Serial.  Called from begin() but also safe to
     // call manually after Serial is ready to guarantee visibility.
     static void bootDump() {
+        // Log the cause of THIS boot regardless of whether a crash log exists —
+        // e.g. TASK_WDT/BROWNOUT/PANIC vs a normal POWERON/SW restart. This is
+        // buffered like any other log() call, so it shows up in the early
+        // buffer dump even though Serial may not be ready yet.
+        log("BOOT", (esp_reset_reason() == ESP_RST_POWERON ||
+                     esp_reset_reason() == ESP_RST_SW) ? INFO : ERROR,
+            String("Reset reason: ") + resetReasonStr());
+
         if (!SD_MMC.exists("/logs/last_crash.log")) return;
 
         File f = SD_MMC.open("/logs/last_crash.log", FILE_READ);
@@ -228,7 +382,7 @@ public:
         } else {
             // Buffer each line individually so it appears in flushEarlyBuffer()
             if (_earlyCount < EARLY_BUF_SIZE)
-                _earlyBuf[_earlyCount++] = "=== PREVIOUS SESSION CRASH ===";
+                _earlyBuf[_earlyCount++] = "=== CRASH LOG FROM A PREVIOUS BOOT SESSION ===";
             int pos = 0;
             while (pos < (int)content.length() && _earlyCount < EARLY_BUF_SIZE) {
                 int nl = content.indexOf('\n', pos);
@@ -321,17 +475,45 @@ public:
     static bool isReady()       { return _sdReady; }
     static bool isSerialReady() { return _serialReady; }
 
+    // ── markIntentionalRestart ──────────────────────────────────────────────
+    // Call this immediately before any deliberate ESP.restart() (portal
+    // reboot button, OTA, config-apply, etc.) so installPanicHandler()'s
+    // shutdown callback can tell "the user asked for this" apart from a
+    // genuine abort/panic/watchdog reset — both fire the same shutdown
+    // handler, since esp_register_shutdown_handler() runs on ANY
+    // esp_restart(), not only fatal ones. Without this, every normal reboot
+    // was being mislabeled as "SYSTEM PANIC" in last_crash.log.
+    static void markIntentionalRestart() { _intentionalRestart = true; }
+
 private:
     static const int EARLY_BUF_SIZE = 64;
 
     inline static bool   _sdReady     = false;
     inline static bool   _serialReady = false;
+    inline static bool   _intentionalRestart = false;
     inline static int    _sdWriteSuspendDepth = 0;
     inline static String _earlyBuf[EARLY_BUF_SIZE];
     inline static int    _earlyCount  = 0;
 
     static void _ensureDir() {
         if (!SD_MMC.exists("/logs")) SD_MMC.mkdir("/logs");
+    }
+
+    // ── _wallClockStr ─────────────────────────────────────────────────────────
+    // Returns "YYYY-MM-DD HH:MM:SS" if the system clock has been set (NTP/RTC
+    // sync completed at least once since power-on), or "" otherwise. Used to
+    // stamp crash records with an actual date instead of only millis()-since-
+    // boot, so a stale crash log from days ago isn't mistaken for a fresh one.
+    // Threshold of 1600000000 (Sep 2020) is a cheap "has this clock ever been
+    // set" check — an un-synced ESP32 clock starts at/near epoch 0.
+    static String _wallClockStr() {
+        time_t now = time(nullptr);
+        if (now < 1600000000) return "";
+        struct tm tmInfo;
+        localtime_r(&now, &tmInfo);
+        char buf[24];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmInfo);
+        return String(buf);
     }
 
     static String _logPath(int dayOffset = 0) {
@@ -362,8 +544,13 @@ private:
     static void _printCrashBox(const String& content) {
         Serial.println();
         Serial.println("╔══════════════════════════════════════════╗");
-        Serial.println("║        PREVIOUS SESSION CRASH LOG        ║");
+        Serial.println("║   CRASH LOG FROM A PREVIOUS BOOT SESSION ║");
+        Serial.println("║   (persists on SD until the next crash)  ║");
         Serial.println("╠══════════════════════════════════════════╣");
+        // content already contains its own "Crash time: ..." line (or the
+        // "unknown (clock not yet synced)" fallback) written at crash time,
+        // so the box itself carries enough info to tell whether this is
+        // fresh or stale — no need to re-derive it here.
         int pos = 0;
         while (pos < (int)content.length()) {
             int nl = content.indexOf('\n', pos);

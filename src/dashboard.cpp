@@ -23,6 +23,14 @@ static String _lastInTime  = "--:--";
 static String _lastOutName = "";
 static String _lastOutTime = "--:--";
 
+// ── Change notice (toast) state ─────────────────────────────────────────────
+static bool     _lastWifiOk   = false;
+static bool     _lastSdOk     = false;
+static bool     _lastNfcOk    = false;
+static bool     _noticeActive = false;
+static uint32_t _noticeShownAt = 0;
+static const uint32_t NOTICE_DURATION_MS = 5000;
+
 // ── Z8 layout ─────────────────────────────────────────────────────────────────
 // Z8_H = 64px total
 //   4px  — label row top padding
@@ -347,6 +355,15 @@ void clearLastScan(const String& eventType) {
 
 // ── updateStatusDots ──────────────────────────────────────────────────────────
 void updateStatusDots(bool wifiOk, bool sdOk, bool nfcOk) {
+    // Always remember the latest values, even while a notice is covering the
+    // row — tickChangeNotice() uses these to repaint the real status once
+    // the notice times out, instead of whatever was current when it opened.
+    _lastWifiOk = wifiOk;
+    _lastSdOk   = sdOk;
+    _lastNfcOk  = nfcOk;
+
+    if (_noticeActive) return;  // don't paint over an active toast
+
     TFT_eSPI* t = tft();
     if (!t) return;
     t->fillRect(0, Z2_Y, SCREEN_W, Z2_H, TFTColors::BG_DARK);
@@ -363,6 +380,36 @@ void updateStatusDots(bool wifiOk, bool sdOk, bool nfcOk) {
 
 void pulseStatus(bool state) {
     _colonVisible = state;
+}
+
+// ── showChangeNotice ────────────────────────────────────────────────────────
+// Paints a 5-second toast over the status-dots row (Z2) to flag that
+// something on the dashboard just changed for a reason OTHER than a live
+// NFC tap (portal delete/edit, server-side reconciliation, etc). Auto-clears
+// via tickChangeNotice() — call that once per loop() iteration.
+void showChangeNotice(const String& message) {
+    TFT_eSPI* t = tft();
+    if (!t) return;
+
+    _noticeActive  = true;
+    _noticeShownAt = millis();
+
+    t->fillRect(0, Z2_Y, SCREEN_W, Z2_H, TFTColors::ACCENT_ORANGE);
+    t->setTextDatum(MC_DATUM);
+    t->setTextColor(TFTColors::BG_DARK, TFTColors::ACCENT_ORANGE);
+    t->drawString(message, SCREEN_W / 2, Z2_Y + Z2_H / 2, 1);
+    t->setTextDatum(TL_DATUM);
+}
+
+// ── tickChangeNotice ─────────────────────────────────────────────────────────
+// Call once per loop() tick. No-op unless a notice is showing; once
+// NOTICE_DURATION_MS has elapsed it restores the real status row.
+void tickChangeNotice() {
+    if (!_noticeActive) return;
+    if (millis() - _noticeShownAt < NOTICE_DURATION_MS) return;
+
+    _noticeActive = false;
+    updateStatusDots(_lastWifiOk, _lastSdOk, _lastNfcOk);
 }
 
 TFT_eSPI* dashboardGetTFT() { return TFTDisplayManager::getTFT(); }

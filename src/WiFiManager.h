@@ -31,6 +31,7 @@
 #include "sd_database.h"
 #include "sd_file_manager.h" // Ensure file manager tools are included
 #include "attendance_http_service.h"
+#include "dashboard.h"   // clearLastScan/updateAttendanceStats/showChangeNotice for the TFT
 #include <functional>
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -321,6 +322,7 @@ label{font-size:.8rem;color:var(--dim);display:block;margin-bottom:4px}
         _srv.on("/api/wifi/connect",    HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiConnect(); });
         _srv.on("/api/wifi/disconnect", HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiDisconnect(); });
         _srv.on("/api/reboot",     HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiReboot(); });
+        _srv.on("/api/log/clearcrash", HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiClearCrashLog(); });
         _srv.on("/api/sync/employees", HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiSyncEmployees(); });
         _srv.on("/api/sync/photos",    HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiSyncPhotos(); });
         _srv.on("/api/sync/reseed",    HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiReseedToday(); });
@@ -707,16 +709,41 @@ function toLastFirst(fullName) {
 (function(){
   var _sseAtt = new EventSource('/api/events');
   var _refreshTimer = null;
+  var _refreshPending = false;
   function _scheduleRefresh(){
+    // Don't interrupt someone mid-search: re-rendering the whole table out
+    // from under a focused search box (and re-fetching from the ESP32's
+    // single-threaded web server on every single tap building-wide) is what
+    // was causing the "freeze" — the input would lose its value/focus and
+    // the page would visibly stutter back to the loading spinner while
+    // someone was typing. Defer instead, and catch up once they're done.
+    var input = document.getElementById('searchInput');
+    if (input && document.activeElement === input) {
+      _refreshPending = true;
+      return;
+    }
     if(_refreshTimer) clearTimeout(_refreshTimer);
     _refreshTimer = setTimeout(function(){
       var sel = document.getElementById('dateSelect');
-      if(sel) loadCsv(sel.value || 'today');
+      if(sel) loadCsv(sel.value || 'today', true /* background */);
     }, 1500);
   }
   _sseAtt.addEventListener('scan',  function(){ _scheduleRefresh(); });
   _sseAtt.addEventListener('stats', function(){ _scheduleRefresh(); });
   _sseAtt.onerror = function(){ /* silent reconnect */ };
+
+  // Run the deferred refresh once the user leaves the search box.
+  document.addEventListener('DOMContentLoaded', function(){
+    var input = document.getElementById('searchInput');
+    if (!input) return;
+    input.addEventListener('blur', function(){
+      if (_refreshPending) {
+        _refreshPending = false;
+        var sel = document.getElementById('dateSelect');
+        if (sel) loadCsv(sel.value || 'today', true);
+      }
+    });
+  });
 })();
  
 fetch('/api/attendance/dates').then(r=>r.json()).then(function(d){
@@ -736,8 +763,23 @@ fetch('/api/attendance/dates').then(r=>r.json()).then(function(d){
 });
  
 var _autoRetryTimer = null;
- 
-function loadCsv(val){
+var _csvLoadInFlight = false;   // guards against overlapping fetches piling up
+                                 // on the ESP32's single-threaded WebServer —
+                                 // each one blocks handleClient() in loop(),
+                                 // which is what froze NFC scanning + the TFT
+                                 // dashboard when requests stacked up.
+var _csvLoadQueuedVal = null;   // remembers the latest request made while busy
+
+function loadCsv(val, background){
+  if (_csvLoadInFlight) {
+    // A fetch is already in progress — don't fire another one on top of it.
+    // Just remember we owe a refresh for this value once the current one
+    // finishes (coalesces bursts of SSE events into a single trailing call).
+    _csvLoadQueuedVal = val;
+    return;
+  }
+  _csvLoadInFlight = true;
+
   currentFile = (val==='today') ? '__today__' : '/attendance/'+val;
   var url = '/api/attendance?f='+encodeURIComponent(val);
   document.getElementById('dlCsvBtn').href = '/api/sd/dl?f='+encodeURIComponent(currentFile);
@@ -745,13 +787,19 @@ function loadCsv(val){
   var selText = sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].textContent : '';
   document.getElementById('dateLabel').textContent = selText ? ('Showing records for: '+selText) : '';
  
-  document.getElementById('tableArea').innerHTML =
-    '<div style="display:flex;align-items:center;gap:10px;padding:12px 0;color:#64748b;font-size:.82rem">'
-    +'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#22d3ee" stroke-width="2"'
-    +' style="animation:spin 1s linear infinite"><circle cx="12" cy="12" r="10" stroke-opacity=".25"/>'
-    +'<path d="M12 2a10 10 0 0 1 10 10"/></svg>'
-    +'Fetching attendance data...</div>'
-    +'<style>@keyframes spin{to{transform:rotate(360deg)}}</style>';
+  // Background (SSE-triggered) refreshes keep showing the current table
+  // instead of blanking it out to a spinner — that flash-to-spinner on every
+  // tap building-wide was the visible part of the "freeze". Manual date
+  // switches and the very first load still show the spinner as before.
+  if (!background || _allDisplayRows.length === 0) {
+    document.getElementById('tableArea').innerHTML =
+      '<div style="display:flex;align-items:center;gap:10px;padding:12px 0;color:#64748b;font-size:.82rem">'
+      +'<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#22d3ee" stroke-width="2"'
+      +' style="animation:spin 1s linear infinite"><circle cx="12" cy="12" r="10" stroke-opacity=".25"/>'
+      +'<path d="M12 2a10 10 0 0 1 10 10"/></svg>'
+      +'Fetching attendance data...</div>'
+      +'<style>@keyframes spin{to{transform:rotate(360deg)}}</style>';
+  }
  
   fetch(url).then(r=>r.json()).then(function(d){
     if(_autoRetryTimer){ clearTimeout(_autoRetryTimer); _autoRetryTimer=null; }
@@ -818,6 +866,13 @@ function loadCsv(val){
   }).catch(function(e){
     document.getElementById('tableArea').innerHTML=
       '<p style="color:#ef4444;font-size:.82rem">Fetch error: '+e+'</p>';
+  }).finally(function(){
+    _csvLoadInFlight = false;
+    if (_csvLoadQueuedVal !== null) {
+      var v = _csvLoadQueuedVal;
+      _csvLoadQueuedVal = null;
+      loadCsv(v, true);
+    }
   });
 }
  
@@ -1226,6 +1281,23 @@ loadCsv('today');
   </div>
 </div>
 
+<div class="card">
+  <div class="card-title">Crash Log
+    <span style="font-size:.72rem;color:#64748b;margin-left:8px;font-weight:400">(use after confirming a fix)</span>
+  </div>
+  <p style="font-size:.82rem;color:#64748b;margin:0 0 12px">
+    A past crash stays logged and reprints on every boot until cleared, so it
+    doesn't get mistaken for a fresh one. Once you've confirmed a fix held,
+    clear it here — the boot banner will only reappear if a new crash happens.
+  </p>
+  <div style="background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:8px;padding:14px;display:inline-block;min-width:200px">
+    <div style="font-size:1.4rem;margin-bottom:6px">&#128465;</div>
+    <div style="font-size:.82rem;font-weight:600;margin-bottom:4px">Clear Crash Log</div>
+    <div style="font-size:.75rem;color:#64748b;margin-bottom:10px">Deletes last_crash.log so the next boot only reports a new panic.</div>
+    <button class="btn btn-ghost btn-sm" onclick="doClearCrashLog()">Clear Crash Log</button>
+  </div>
+</div>
+
 <div id="actionMsg" class="alert" style="display:none"></div>
 <script>
 function doReboot(){
@@ -1233,6 +1305,10 @@ function doReboot(){
   var m=document.getElementById('actionMsg');
   m.className='alert alert-ok';m.textContent='Rebooting...';m.style.display='block';
   fetch('/api/reboot',{method:'POST'});
+}
+function doClearCrashLog(){
+  if(!confirm('Clear the crash log? This cannot be undone.'))return;
+  doAction('/api/log/clearcrash','Clearing crash log...');
 }
 function doAction(url,msg){
   var m=document.getElementById('actionMsg');
@@ -2089,10 +2165,20 @@ loadStatus();loadNets();
         //    (unlike the periodic reconcile passes) would otherwise leave a
         //    deleted employee's name on screen indefinitely since nothing
         //    else ever re-touches it.
-        if (fileArg == "today") {
+        //
+        // NOTE: the editor's JS sends file:"__today__" (see loadCsv()'s
+        // currentFile assignment), not the literal string "today" — this
+        // check used to only match "today", so it silently never fired for
+        // a normal in-portal delete of today's log. That's why the stat
+        // counts (which also get refreshed periodically by the 30s
+        // STATS_REFRESH_MS timer in main.cpp's loop()) appeared to update
+        // fine, while the Clock-In/Clock-Out name strip — only ever touched
+        // here or by a fresh tap — kept showing the deleted person forever.
+        if (fileArg == "today" || fileArg == "__today__") {
             updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
                                   max(0, SDDatabase::countTodayCheckOuts()));
             clearLastScan("both");
+            showChangeNotice("ATTENDANCE UPDATED");
         }
 
         DynamicJsonDocument resp(128);
@@ -2250,6 +2336,16 @@ loadStatus();loadNets();
                     DynamicJsonDocument* _lDoc = psramFound()
                         ? new DynamicJsonDocument(131072)
                         : new DynamicJsonDocument(32768);
+                    if (!_lDoc) {
+                        // Allocation failure under memory pressure (this handler can run
+                        // concurrently with the seed/reconcile passes, which request the
+                        // same 131072-byte size) previously fell straight through to
+                        // dereferencing a null pointer below — a LoadProhibited-class
+                        // exception with no diagnostic trail, matching the SYSTEM PANIC
+                        // in last_crash.log. Bail out cleanly instead.
+                        Serial.println("[WM] Live-fetch: OOM allocating JSON doc — skipping");
+                        _lhc.end();
+                    } else {
 
                     bool _ldec = false;
                     if (_attSvc) _ldec = _attSvc->decryptBody(_lbody, *_lDoc);
@@ -2310,6 +2406,7 @@ loadStatus();loadNets();
                                        _lbody.substring(0, min(200, (int)_lbody.length())));
                     }
                     delete _lDoc;
+                    }
                 } else {
                     _lhc.end();
                     Serial.printf("[WM] Live-fetch failed (HTTP %d) — table will be empty\n",
@@ -2498,6 +2595,12 @@ loadStatus();loadNets();
         // ── Build serverIds: SD map first, network lookup as fallback ─────────
         // Key format: "empUid|clockType|HH:MM:SS"  — includes time so duplicate
         // clock_type records (e.g. two morning_in rows) get different IDs.
+        //
+        // HEAP INSTRUMENTATION (temporary — for tracking down the panics that
+        // correlate with rapid repeated dashboard/SSE hits on this handler):
+        // logging free heap/PSRAM at entry and around each big allocation below
+        // so a crash log shows exactly which allocation ran when memory was
+        // already low, instead of only the panic's final heap/psram snapshot.
         bool wifiUp = (_cfg && _cfg->isConnected());
 
         // Derive YYYY-MM-DD from the resolved file path
@@ -2527,6 +2630,19 @@ loadStatus();loadNets();
         // ⚠ Heap-allocate — 128 Strings on the stack overflows with everything else in this function
         String* sKeys = new String[MAP_SZ];
         int*    sIds  = new int[MAP_SZ];
+        if (!sKeys || !sIds) {
+            // Same class of bug as the _lDoc fix above: this handler runs on
+            // every portal/dashboard poll (see the repeated _apiAttendance
+            // ENTRY lines whenever the SSE client is connected), concurrently
+            // with the seed/reconcile passes' own large allocations — so an
+            // allocation failure here, however rare, is a real possibility.
+            // memset()/array access on a null pointer would otherwise be an
+            // immediate crash with no diagnostic trail.
+            Serial.println("[WM][mem] OOM allocating sKeys/sIds — aborting this request");
+            delete[] sKeys; delete[] sIds;
+            _srv.send(503, "application/json", "{\"success\":false,\"error\":\"OOM\"}");
+            return;
+        }
         memset(sIds, 0, sizeof(int) * MAP_SZ);
         int  sCount = 0;
         bool serverFetchOk = false;  // true only if we got a valid HTTP 200 + parsed response
@@ -2543,7 +2659,7 @@ loadStatus();loadNets();
                 String rbody = hc.getString();
                 hc.end();
 
-                DynamicJsonDocument srvDoc(16384);
+                DynamicJsonDocument srvDoc(psramFound() ? 131072 : 24576);
                 bool ok = false;
                 if (_attSvc) ok = _attSvc->decryptBody(rbody, srvDoc);
                 if (!ok) ok = (deserializeJson(srvDoc, rbody) == DeserializationError::Ok);
@@ -2603,6 +2719,11 @@ loadStatus();loadNets();
                 // Find stale keys: in SD map but server_id not in active sIds[]
                 const int MAX_STALE = 32;
                 String* staleKeys = new String[MAX_STALE];
+                if (!staleKeys) {
+                    // Same OOM-guard gap as sKeys/sIds above — this loop
+                    // dereferences staleKeys[] immediately below.
+                    Serial.println("[WM][mem] OOM allocating staleKeys — skipping stale-detection this pass");
+                } else {
                 int staleCount = 0;
 
                 for (JsonPair kv : reconcileMap.as<JsonObject>()) {
@@ -2711,6 +2832,7 @@ loadStatus();loadNets();
                     }
                 }
                 delete[] staleKeys;
+                }
             }
         }
 
@@ -2820,7 +2942,31 @@ loadStatus();loadNets();
 
     void _apiReboot() {
         _srv.send(200,"application/json","{\"success\":true,\"message\":\"Rebooting...\"}");
+        SDLogger::markIntentionalRestart();  // this is a deliberate reboot, not a crash — don't log it as SYSTEM PANIC
         delay(500); ESP.restart();
+    }
+
+    // ── Clear the persisted crash log ───────────────────────────────────────
+    // last_crash.log survives reboots by design (see SDLogger::installPanicHandler)
+    // so a real panic stays visible until someone deals with it — but that also
+    // means it keeps reprinting on every boot after the issue has already been
+    // fixed, with no way to tell "old crash, already patched" from "just crashed
+    // again" at a glance. This lets the portal clear it once a fix is confirmed,
+    // so the next boot banner (if any) is guaranteed to be a fresh crash.
+    void _apiClearCrashLog() {
+        if (!SD_MMC.exists("/logs/last_crash.log")) {
+            _srv.send(200,"application/json",
+                "{\"success\":true,\"message\":\"No crash log present.\"}");
+            return;
+        }
+        bool ok = SD_MMC.remove("/logs/last_crash.log");
+        if (ok) {
+            _srv.send(200,"application/json",
+                "{\"success\":true,\"message\":\"Crash log cleared.\"}");
+        } else {
+            _srv.send(500,"application/json",
+                "{\"success\":false,\"error\":\"Failed to delete crash log.\"}");
+        }
     }
 
     // ── Manual employee sync (downloads all profiles from server) ──────────

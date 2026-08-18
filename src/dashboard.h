@@ -54,3 +54,13 @@ void clearLastScan(const String& eventType);  // "check-in" | "check-out" | "bot
 void updateStatusDots(bool wifiOk, bool sdOk, bool nfcOk);
 void pulseStatus(bool state);
 TFT_eSPI* dashboardGetTFT();
+
+// ── Change notice (toast) ───────────────────────────────────────────────────
+// Small 5-second banner shown over the status-dots row (Z2) whenever the
+// attendance shown on screen changes from something OTHER than a live local
+// NFC tap — e.g. a row deleted from the web portal, or a record removed by
+// the background server-reconciliation pass. Call showChangeNotice() the
+// moment such a change is applied, then call tickChangeNotice() once per
+// loop() iteration; it auto-restores the normal status row after ~5s.
+void showChangeNotice(const String& message);
+void tickChangeNotice();

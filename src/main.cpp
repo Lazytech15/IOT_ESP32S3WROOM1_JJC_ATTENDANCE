@@ -65,8 +65,42 @@
 // without waiting for boot / WiFi-reconnect / manual "Reseed Today". Modeled on
 // the web portal's PollingManager (websocket/polling-manager.jsx): fixed base
 // interval, exponential backoff on failure, reset to base on success.
-#define RECONCILE_POLL_BASE_MS     15000    // 15s, same cadence as the portal poller
-#define RECONCILE_POLL_MAX_MS     120000    // cap backoff at 2 minutes
+// Idle reconcile burst — fires only while the screen is blanked (nobody is
+// actively using the device, so it's a safe moment to pull server-side
+// edits/deletes without disrupting a tap). Runs IDLE_RECONCILE_BURST_COUNT
+// polls spaced IDLE_RECONCILE_INTERVAL_MS apart, then rests
+// IDLE_RECONCILE_REST_MS before starting another burst — so a long idle
+// stretch (e.g. overnight) doesn't hammer the device or the server. A tap
+// always wins: wakeScreen() resets the burst state immediately, and the
+// burst loop itself is gated on screenIsOff so it simply stops firing the
+// instant the screen wakes. Also gated on isAdminWorkingHours() (08:00–
+// 17:00) — see that function's comment.
+//
+// IDLE_RECONCILE_INTERVAL_MS was tried at 15s and measured on-device: a
+// single seed pass (esp32-sync fetch + CSV reseed + PASS 3 + PASS 3B, each
+// doing multi-chunk encrypted HTTP round-trips) routinely took 1-4 minutes
+// on its own. Since !g_seedRunning blocks overlap, a 15s interval never
+// actually got to space anything out — passes just chained back-to-back
+// with heap sitting around 53-59KB free (uncomfortably close to the 40000
+// floor) for minutes at a stretch. 2 min is long enough to exceed a single
+// pass's duration, so it produces genuine idle time between passes instead
+// of continuous back-to-back network/heap churn.
+#define IDLE_RECONCILE_INTERVAL_MS   120000     // 2 min between polls within a burst
+#define IDLE_RECONCILE_BURST_COUNT   10         // polls per burst (~20 min of polling)
+#define IDLE_RECONCILE_REST_MS       1800000    // 30 min rest between bursts
+
+// Admin working hours — the portal is only actively edited/updated during
+// this window, so outside of it there's nothing new for the idle burst to
+// pull. Polling past 17:00 or before 08:00 would just be waking up WiFi/SD
+// for no reason until the admin is back at their desk.
+#define ADMIN_HOURS_START_MIN   (8 * 60)    // 08:00
+#define ADMIN_HOURS_END_MIN     (17 * 60)   // 17:00
+
+#define RECONCILE_POLL_BASE_MS   1800000    // 30 min — was 15s; 15s was hammering the ESP32's
+                                             // heap with HTTP/JSON churn and freezing the UI
+                                             // during busy tap lines (morning/noon/afternoon out)
+#define RECONCILE_POLL_MAX_MS    1800000    // cap backoff at 30 min too (was 2 min, now irrelevant
+                                             // since base == max, but kept for the min()/backoff math)
 #define SCREEN_TIMEOUT_MS     300000   // 5 minutes of inactivity → backlight off
 
 // ── PROFILE DISPLAY ───────────────────────────────────────────────────────────
@@ -195,6 +229,17 @@ static bool isPeakHour() {
     return false;
 }
 
+// isAdminWorkingHours — true only within the admin's 08:00–17:00 window.
+// The idle reconcile burst is gated on this: outside working hours nothing
+// on the server is being edited, so there's nothing new to pull, and
+// polling would just be waking WiFi/SD for no reason until the admin is
+// back. NOT used by isPeakHour()/uploads — those stay on their own
+// always-on schedule regardless of admin hours.
+static bool isAdminWorkingHours() {
+    uint16_t nowMin = (uint16_t)clkH * 60 + clkM;
+    return nowMin >= ADMIN_HOURS_START_MIN && nowMin <= ADMIN_HOURS_END_MIN;
+}
+
 // ─── Globals ─────────────────────────────────────────────────────────────────
 WiFiConfig             wifiConfig(AP_SSID, AP_PASSWORD);
 WiFiManager            wifiManager;
@@ -231,6 +276,15 @@ static void resyncClockFromRTC() {
     }
 }
 
+// Idle reconcile burst state — declared up here (file scope, not inside
+// loop()) so both wakeScreen() and loop() can see/reset it. A tap must be
+// able to cancel an in-progress idle burst immediately, which means the
+// state can't be local static to loop() alone.
+static int           g_idlePollCount       = 0;
+static bool          g_idleResting         = false;
+static unsigned long g_idleRestStartedAtMs = 0;
+static unsigned long g_lastIdlePollMs      = 0;
+
 static void wakeScreen() {
     if (screenIsOff) {
         screenIsOff = false;
@@ -247,6 +301,13 @@ static void wakeScreen() {
         updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
                               max(0, SDDatabase::countTodayCheckOuts()));
         Serial.println("[Screen] Wake — screen restored");
+
+        // A tap always wins — cancel any idle burst in progress so the next
+        // screen-off period starts a fresh burst of 10 rather than resuming
+        // mid-burst or mid-rest.
+        g_idlePollCount       = 0;
+        g_idleResting         = false;
+        g_idleRestStartedAtMs = 0;
     }
     lastActivityMs = millis();
 }
@@ -352,11 +413,27 @@ static String resolveClockType(const String& empUid) {
     }
 
     int cur = _currentSessionIndex();
+
+    // BUG FIX: an earlier session left open (e.g. "morning_in" logged but no
+    // "morning_out") used to get silently skipped once the clock rolled into
+    // the next session's window — the old logic only ever looked at hasIn/
+    // hasOut for `cur`, saw the current session had no "_in" yet, and handed
+    // back "<cur>_in" (e.g. "afternoon_in") even though the employee still
+    // had an open morning session. That's exactly the SERVER_SEED case: a
+    // morning_in exists with no morning_out, and the very next tap — already
+    // past noon — jumped straight to afternoon_in instead of closing morning
+    // out. Now we check every earlier session first and close the oldest
+    // still-open one before ever considering starting the current session.
+    for (int si = 0; si < cur; si++) {
+        if (hasIn[si] && !hasOut[si]) return String(SESSIONS[si]) + "_out";
+    }
+
     if (hasIn[cur] && !hasOut[cur]) return String(SESSIONS[cur]) + "_out";
     if (!hasIn[cur])                 return String(SESSIONS[cur]) + "_in";
 
     // Current session already fully clocked (duplicate tap) — fall back
-    // to the first genuinely open slot elsewhere in the day.
+    // to the first genuinely open slot elsewhere in the day (this also
+    // covers a LATER session left open by a manual edit).
     for (int si = 0; SESSIONS[si]; si++) {
         if (hasIn[si] && !hasOut[si]) return String(SESSIONS[si]) + "_out";
     }
@@ -387,6 +464,13 @@ static String resolveClockType(const String& empUid) {
     }
 
     int cur = _currentSessionIndex();
+
+    // Same fix as above, applied to the non-SDDB_HAS_LOAD_TODAY_CLOCK_TYPES
+    // build: close out any earlier still-open session before opening `cur`.
+    for (int si = 0; si < cur; si++) {
+        if (hasIn[si] && !hasOut[si]) return String(SESSIONS[si]) + "_out";
+    }
+
     if (hasIn[cur] && !hasOut[cur]) return String(SESSIONS[cur]) + "_out";
     if (!hasIn[cur])                 return String(SESSIONS[cur]) + "_in";
 
@@ -419,19 +503,26 @@ static String resolveClockType(const String& empUid) {
 // ════════════════════════════════════════════════════════════════════════════
 #define PENDING_QUEUE_PATH "/attendance/pending_queue.json"
 
+// Sized to match MAX_PENDING (offline_sync.h) so the in-RAM/SD-mirrored
+// sync queue can't fall behind that limit and start silently dropping
+// records during a rush of taps (e.g. a busy clock-out window) while
+// uploads are paused by isPeakHour().
+#define PENDING_QUEUE_CAP 200
+
 struct PendingRecord {
     String empUid, nfcUid, clockType, timestamp, date;
+    int retryCount = 0;   // consecutive upload failures — see flushPending()'s quarantine cap
 };
-static PendingRecord pendingQueue[32];
+static PendingRecord pendingQueue[PENDING_QUEUE_CAP];
 static int           pendingCount = 0;
 
 // Overwrites PENDING_QUEUE_PATH with the current in-memory queue.
-// Called after every change so the SD copy never falls behind. 32 short
-// records is a small write (well under a second) — fine to do inline.
+// Called after every change so the SD copy never falls behind. Up to
+// PENDING_QUEUE_CAP short records is still a small write — fine to do inline.
 static void savePendingQueueToSD() {
     if (!SDDatabase::isReady()) return;
 
-    DynamicJsonDocument doc(4096);
+    DynamicJsonDocument doc(PENDING_QUEUE_CAP * 160);
     JsonArray arr = doc.to<JsonArray>();
     for (int i = 0; i < pendingCount; i++) {
         JsonObject o = arr.createNestedObject();
@@ -440,6 +531,7 @@ static void savePendingQueueToSD() {
         o["clockType"] = pendingQueue[i].clockType;
         o["timestamp"] = pendingQueue[i].timestamp;
         o["date"]      = pendingQueue[i].date;
+        o["retryCount"] = pendingQueue[i].retryCount;
     }
 
     File f = SD_MMC.open(PENDING_QUEUE_PATH, FILE_WRITE);
@@ -460,7 +552,7 @@ static void loadPendingQueueFromSD() {
     File f = SD_MMC.open(PENDING_QUEUE_PATH, FILE_READ);
     if (!f) return;
 
-    DynamicJsonDocument doc(4096);
+    DynamicJsonDocument doc(PENDING_QUEUE_CAP * 160);
     DeserializationError err = deserializeJson(doc, f);
     f.close();
     if (err) {
@@ -472,13 +564,14 @@ static void loadPendingQueueFromSD() {
     JsonArray arr = doc.as<JsonArray>();
     pendingCount = 0;
     for (JsonObject o : arr) {
-        if (pendingCount >= 32) break;
+        if (pendingCount >= PENDING_QUEUE_CAP) break;
         pendingQueue[pendingCount++] = {
             String((const char*)(o["empUid"]    | "")),
             String((const char*)(o["nfcUid"]    | "")),
             String((const char*)(o["clockType"] | "")),
             String((const char*)(o["timestamp"] | "")),
-            String((const char*)(o["date"]      | ""))
+            String((const char*)(o["date"]      | "")),
+            (int)(o["retryCount"] | 0)   // absent in files saved before this field existed — defaults to 0
         };
     }
     if (pendingCount > 0) {
@@ -490,14 +583,17 @@ static void loadPendingQueueFromSD() {
 static void enqueuePending(const String& empUid, const String& nfcUid,
                            const String& clockType, const String& ts,
                            const String& dt) {
-    if (pendingCount < 32) {
+    if (pendingCount < PENDING_QUEUE_CAP) {
         pendingQueue[pendingCount++] = {empUid, nfcUid, clockType, ts, dt};
-        Serial.printf("[Queue] +1 pending (%d/32): %s %s\n",
-                      pendingCount, empUid.c_str(), clockType.c_str());
+        Serial.printf("[Queue] +1 pending (%d/%d): %s %s\n",
+                      pendingCount, PENDING_QUEUE_CAP, empUid.c_str(), clockType.c_str());
     } else {
-        Serial.println("[Queue] FULL — dropping oldest");
-        for (int i = 0; i < 31; i++) pendingQueue[i] = pendingQueue[i+1];
-        pendingQueue[31] = {empUid, nfcUid, clockType, ts, dt};
+        // Should only be reachable if PENDING_QUEUE_CAP is ever exceeded by a
+        // single day's rush — logged loudly since a drop here means a tap
+        // never reaches the server until someone notices and re-enters it.
+        Serial.println("[Queue] FULL — dropping oldest (raise PENDING_QUEUE_CAP)");
+        for (int i = 0; i < PENDING_QUEUE_CAP - 1; i++) pendingQueue[i] = pendingQueue[i+1];
+        pendingQueue[PENDING_QUEUE_CAP - 1] = {empUid, nfcUid, clockType, ts, dt};
     }
     savePendingQueueToSD();   // mirror to SD immediately — survives reboot from here on
 }
@@ -546,8 +642,23 @@ static void flushPending() {
     int toSend = min(pendingCount, UPLOAD_BATCH_SIZE);
     Serial.printf("[Flush] Uploading %d/%d queued record(s)...\n", toSend, pendingCount);
 
+    // Safety net: a record that fails this many times in a row is quarantined
+    // (dropped from the active queue + logged to quarantined_records.log for
+    // manual review) instead of retried forever. Without this, ANY server
+    // response that recordAttendance() doesn't recognize as a permanent
+    // failure — not just the 409 case already handled — would sit at the
+    // head of the queue with UPLOAD_BATCH_SIZE=1, retried every ~200-350ms
+    // indefinitely, hammering the server and starving every other pending
+    // record behind it. 20 tries at the ~200ms loop cadence is well past
+    // "give the network a moment," so anything still failing after that is
+    // treated as needing a human, not another retry.
+    static const int MAX_RETRIES_BEFORE_QUARANTINE = 20;
+
     int remaining = 0;
-    PendingRecord keep[32];
+    // static, not stack-local: at PENDING_QUEUE_CAP=200 * 5 Strings/record
+    // this is too big for the uploadWorker task's 12KB stack. flushPending()
+    // only ever runs on that one task, so reusing a static buffer is safe.
+    static PendingRecord keep[PENDING_QUEUE_CAP];
 
     for (int i = 0; i < pendingCount; i++) {
         if (i < toSend) {
@@ -557,10 +668,36 @@ static void flushPending() {
                 pendingQueue[i].timestamp, pendingQueue[i].date);
 
             if (!ok) {
-                keep[remaining++] = pendingQueue[i];
-                Serial.printf("[Flush] RETRY later: %s %s\n",
-                              pendingQueue[i].empUid.c_str(),
-                              pendingQueue[i].clockType.c_str());
+                pendingQueue[i].retryCount++;
+                if (pendingQueue[i].retryCount >= MAX_RETRIES_BEFORE_QUARANTINE) {
+                    Serial.printf("[Flush] ⚠ QUARANTINED after %d failed attempts: %s %s "
+                                  "— dropped from active queue, see quarantined_records.log\n",
+                                  pendingQueue[i].retryCount,
+                                  pendingQueue[i].empUid.c_str(),
+                                  pendingQueue[i].clockType.c_str());
+                    File qf = SD_MMC.open("/logs/quarantined_records.log", FILE_APPEND);
+                    if (qf) {
+                        char nowStr[24];
+                        snprintf(nowStr, sizeof(nowStr), "%s %02d:%02d:%02d",
+                                 dateStr().c_str(), clkH, clkM, clkS);
+                        qf.printf("[%s] empUid=%s clockType=%s timestamp=%s date=%s "
+                                  "retries=%d\n",
+                                  nowStr,
+                                  pendingQueue[i].empUid.c_str(),
+                                  pendingQueue[i].clockType.c_str(),
+                                  pendingQueue[i].timestamp.c_str(),
+                                  pendingQueue[i].date.c_str(),
+                                  pendingQueue[i].retryCount);
+                        qf.close();
+                    }
+                    // not added to keep[] — intentionally dropped from the retry queue
+                } else {
+                    keep[remaining++] = pendingQueue[i];
+                    Serial.printf("[Flush] RETRY later (%d/%d): %s %s\n",
+                                  pendingQueue[i].retryCount, MAX_RETRIES_BEFORE_QUARANTINE,
+                                  pendingQueue[i].empUid.c_str(),
+                                  pendingQueue[i].clockType.c_str());
+                }
             } else {
                 Serial.printf("[Flush] OK: %s %s\n",
                               pendingQueue[i].empUid.c_str(),
@@ -677,12 +814,13 @@ static bool seedTodayAttendanceFromServer() {
     Serial.println("[Seed] === Seeding today's attendance: " + today + " ===");
     int seeded = 0;
 
-    // Suspend SDLogger's per-line SD_MMC file write for the duration of the
-    // three passes below — see SDLogger::suspendSDWrite() for why. Serial
-    // output (and the CSV/reconcile results themselves) are unaffected;
-    // this only skips writing the noisy per-employee trace lines to the SD
-    // debug log file. Always resumed via the RAII-style guard so an early
-    // return (e.g. PASS 1 issues) can't leave it stuck suspended.
+    // Suspend SDLogger's per-line SD_MMC file write AND Serial.println for the
+    // duration of the three passes below — see SDLogger::suspendSDWrite() for
+    // why. The CSV/reconcile results themselves are unaffected (those are
+    // separate SD_MMC calls, not routed through the logger); this only skips
+    // the noisy per-employee DEBUG/INFO trace lines on both outputs. Always
+    // resumed via the RAII-style guard so an early return (e.g. PASS 1
+    // issues) can't leave it stuck suspended.
     SDLogger::suspendSDWrite(true);
     struct ResumeSDWriteOnExit {
         ~ResumeSDWriteOnExit() { SDLogger::suspendSDWrite(false); }
@@ -791,6 +929,34 @@ static void purgeSyncedAttendanceDate(const String& dateToPurge) {
                   snapRemoved ? "OK" : "FAIL");
 }
 
+// ── Last-seen-date persistence ──────────────────────────────────────────────
+// g_lastSeenDate used to be RAM-only, so a reboot around midnight (e.g. the
+// SYSTEM PANIC seen in /logs/last_crash.log) meant the device never
+// "witnessed" the date rollover live and the previous day's CSV/map/snapshot
+// were orphaned on the SD card forever — nothing else ever re-checks them.
+// We now mirror the last-seen date to a 10-byte SD file on every rollover,
+// and on boot compare the saved value against today: if it's stale, treat
+// it exactly like a missed rollover and queue that date for purge once the
+// queue is confirmed empty, same as the live-detection path.
+#define LAST_SEEN_DATE_PATH "/attendance/last_seen_date.txt"
+
+static void saveLastSeenDateToSD(const String& d) {
+    File f = SD_MMC.open(LAST_SEEN_DATE_PATH, FILE_WRITE);
+    if (!f) return;
+    f.print(d);
+    f.close();
+}
+
+static String loadLastSeenDateFromSD() {
+    if (!SD_MMC.exists(LAST_SEEN_DATE_PATH)) return "";
+    File f = SD_MMC.open(LAST_SEEN_DATE_PATH, FILE_READ);
+    if (!f) return "";
+    String d = f.readString();
+    f.close();
+    d.trim();
+    return (d.length() == 10) ? d : "";
+}
+
 // ── Seed worker — runs seedTodayAttendanceFromServer() on Core 0 ──────────────
 // seedTodayAttendanceFromServer() does 2-3 paginated HTTP calls and was
 // measured taking 5-10s against ~43 employees. Called directly from loop()
@@ -816,6 +982,15 @@ static void seedWorkerTask(void* /*param*/) {
             g_lastSeedOk      = seedTodayAttendanceFromServer();
             g_seedFinishedAtMs = millis();
             g_seedRunning     = false;
+            // Stack headroom check — logs a warning if this task's worst-case
+            // remaining stack drops low, so a near-overflow shows up in the
+            // log BEFORE it becomes a silent PANIC/TASK_WDT reset like the
+            // one in last_crash.log, instead of after.
+            UBaseType_t hwm = uxTaskGetStackHighWaterMark(nullptr);
+            if (hwm < 512) {
+                Serial.printf("[Seed] ⚠ low stack headroom: %u bytes free (task stack may be too small)\n",
+                              (unsigned)(hwm * sizeof(StackType_t)));
+            }
         }
     }
 }
@@ -939,6 +1114,11 @@ static void uploadWorkerTask(void* /*param*/) {
             while (wifiConfig.isConnected() && pendingCount > 0 && !isPeakHour()) {
                 flushPending();
                 if (pendingCount > 0) delay(200);  // brief pause between HTTP calls
+            }
+            UBaseType_t hwm = uxTaskGetStackHighWaterMark(nullptr);
+            if (hwm < 512) {
+                Serial.printf("[Upload] ⚠ low stack headroom: %u bytes free (task stack may be too small)\n",
+                              (unsigned)(hwm * sizeof(StackType_t)));
             }
         }
     }
@@ -1102,6 +1282,11 @@ static void nfcWorkerTask(void* /*param*/) {
         char buf[64] = {0};
         if (xQueueReceive(g_nfcQueue, buf, portMAX_DELAY) == pdTRUE) {
             nfcWorkerBody(String(buf));
+            UBaseType_t hwm = uxTaskGetStackHighWaterMark(nullptr);
+            if (hwm < 512) {
+                Serial.printf("[NFC] ⚠ low stack headroom: %u bytes free (task stack may be too small)\n",
+                              (unsigned)(hwm * sizeof(StackType_t)));
+            }
         }
         // Signal loop() that we are idle and ready for the next card
         xSemaphoreGive(g_nfcDone);
@@ -1136,6 +1321,26 @@ static void handleNFCDetected(const String& cardIdentifier) {
 
     xQueueSend(g_nfcQueue, g_nfcCardBuf, 0);
     Serial.println("[NFC] Card posted to worker: " + cardIdentifier);
+}
+
+// ─── loopTask stack size override ──────────────────────────────────────────
+// The Arduino-ESP32 core sizes and creates the main "loopTask" (which runs
+// setup()+loop()) INSIDE app_main(), before setup() ever executes — by
+// calling this exact weak function. The default is only 8192 bytes, which
+// is too tight for seedTodayAttendanceFromServer()'s HTTPClient +
+// ArduinoJson + AES decrypt of large JSON payloads — the same stack-overflow
+// class already fixed for nfcWorker/uploadWorker/seedWorker (see their
+// xTaskCreatePinnedToCore stack sizes below), but triggerInitialSync() calls
+// seedTodayAttendanceFromServer() synchronously on THIS task at boot, before
+// the seedWorker task (and its 16KB stack) exists yet — leaving this one
+// call still running on the thin 8KB stack. Matches the last_crash.log
+// panic: uptime ~121s (mid initial sync/AES-decrypt window), heap/psram
+// healthy — consistent with a stack overflow, not an OOM.
+// NOTE: overriding the weak function is the only way to change this — by
+// the time setup() runs, the task (and its stack) already exists, so a
+// runtime "setter" call from inside setup() would be too late.
+size_t getArduinoLoopTaskStackSize(void) {
+    return 16384;
 }
 
 // ─── setup ───────────────────────────────────────────────────────────────────
@@ -1238,7 +1443,12 @@ void setup() {
     xTaskCreatePinnedToCore(
         nfcWorkerTask,   // task function
         "nfcWorker",     // name
-        8192,            // stack (bytes) — enough for JSON + HTTP
+        // 8192 was tight for HTTPClient + ArduinoJson + String concatenation
+        // on ESP32 (a common source of an unexplained PANIC/TASK_WDT reset
+        // with otherwise-healthy heap/PSRAM, like the one in last_crash.log —
+        // see resetReasonStr() in sd_logger.h for how to confirm the cause
+        // next time). Bumped for headroom; watch stack high-water marks.
+        12288,           // stack (bytes) — enough for JSON + HTTP
         nullptr,         // parameter
         2,               // priority (higher than loop's 1)
         &g_nfcTask,      // handle
@@ -1253,7 +1463,7 @@ void setup() {
     xTaskCreatePinnedToCore(
         uploadWorkerTask,  // task function
         "uploadWorker",    // name
-        8192,              // stack — enough for HTTP + JSON
+        12288,             // stack — enough for HTTP + JSON (see nfcWorker note above)
         nullptr,           // parameter
         1,                 // priority (same as loop, lower than nfcWorker)
         &g_uploadTask,     // handle
@@ -1269,7 +1479,10 @@ void setup() {
     xTaskCreatePinnedToCore(
         seedWorkerTask,    // task function
         "seedWorker",      // name
-        8192,              // stack — enough for HTTP + JSON
+        // This task does the heaviest work of the three — paginated HTTP +
+        // AES decrypt of ~40KB+ JSON payloads (see [AES] PASS 1 in the boot
+        // log) — so it gets the most headroom (see nfcWorker note above).
+        16384,             // stack — enough for HTTP + JSON
         nullptr,           // parameter
         1,                 // priority (same as uploadWorker)
         &g_seedTask,       // handle
@@ -1317,6 +1530,61 @@ void loop() {
             Serial.println("[Screen] Screen off — triggering immediate background upload");
             lastUploadFlush = now;   // reset the timer so the next fire is a full 10 min later
             if (g_uploadTrigger) xSemaphoreGive(g_uploadTrigger);
+        }
+
+        // Idle burst starts clean the moment the screen goes dark.
+        g_idlePollCount  = 0;
+        g_idleResting    = false;
+        g_lastIdlePollMs = now;   // first poll fires after one full interval, not instantly
+    }
+
+    // ── Idle reconcile burst (screen-off polling for portal edits/deletes) ─
+    // Only runs while the screen is actually off — an NFC tap calls
+    // wakeScreen(), which flips screenIsOff back to false and resets the
+    // burst state, so this block simply stops firing on the very next loop()
+    // iteration. No separate "cancel" check needed.
+    //
+    // Behavior: poll up to IDLE_RECONCILE_BURST_COUNT times, spaced
+    // IDLE_RECONCILE_INTERVAL_MS apart, then rest IDLE_RECONCILE_REST_MS
+    // before starting the next burst — so a device left idle for hours
+    // (overnight, weekends) doesn't hammer itself or the server forever.
+    // Also gated on isAdminWorkingHours() (08:00–17:00): the admin only
+    // edits/deletes on the portal during that window, so there's nothing to
+    // pull outside it — the whole block simply goes dormant once the clock
+    // passes 17:00 (even mid-burst or mid-rest) and picks back up at 08:00
+    // the next day, no separate reset logic needed since the check runs
+    // live every loop() iteration.
+    // Same isConnected/isPeakHour/heap/g_seedRunning guards as the existing
+    // 30-min "away" reconcile poller below, since this shares the same
+    // requestSeedToday() -> seedWorkerTask() pipeline; requestSeedToday()
+    // already stamps g_seedFinishedAtMs on completion, which also keeps the
+    // 30-min poller's timer from double-firing moments later.
+    if (screenIsOff &&
+        wifiConfig.isConnected() && currentState == STATE_DASHBOARD &&
+        isAdminWorkingHours() && !isPeakHour() && !g_seedRunning) {
+
+        if (g_idleResting) {
+            if (now - g_idleRestStartedAtMs >= IDLE_RECONCILE_REST_MS) {
+                g_idleResting    = false;
+                g_idlePollCount  = 0;
+                g_lastIdlePollMs = now;   // next burst's first poll after one interval
+                Serial.println("[IdlePoll] Rest complete — starting next burst");
+            }
+        } else if (g_idlePollCount < IDLE_RECONCILE_BURST_COUNT &&
+                   (now - g_lastIdlePollMs >= IDLE_RECONCILE_INTERVAL_MS)) {
+            g_lastIdlePollMs = now;
+            if (ESP.getFreeHeap() > 40000) {
+                g_idlePollCount++;
+                Serial.printf("[IdlePoll] Poll %d/%d (screen idle)\n",
+                              g_idlePollCount, IDLE_RECONCILE_BURST_COUNT);
+                requestSeedToday();
+
+                if (g_idlePollCount >= IDLE_RECONCILE_BURST_COUNT) {
+                    g_idleResting         = true;
+                    g_idleRestStartedAtMs = now;
+                    Serial.println("[IdlePoll] Burst complete — resting 30 min before next burst");
+                }
+            }
         }
     }
 
@@ -1375,12 +1643,25 @@ void loop() {
         String todayStr = dateStr();
         if (todayStr.length() == 10) {
             if (g_lastSeenDate.length() == 0) {
-                g_lastSeenDate = todayStr;   // first time the clock is synced — just anchor, no rollover yet
+                // First time the clock is synced this boot. Check the SD-
+                // persisted date from before the last shutdown/reboot — if
+                // it's stale (a prior day), that rollover was missed live
+                // (e.g. the device rebooted overnight) and its files were
+                // never queued for purge. Catch up on it now.
+                String savedDate = loadLastSeenDateFromSD();
+                if (savedDate.length() == 10 && savedDate != todayStr) {
+                    Serial.printf("[Rollover] Boot catch-up: stale date %s found on SD (today=%s) — queuing purge\n",
+                                  savedDate.c_str(), todayStr.c_str());
+                    g_cleanupPendingDate = savedDate;
+                }
+                g_lastSeenDate = todayStr;   // anchor for live rollover detection going forward
+                saveLastSeenDateToSD(todayStr);
             } else if (todayStr != g_lastSeenDate) {
                 Serial.printf("[Rollover] Date changed %s -> %s\n",
                               g_lastSeenDate.c_str(), todayStr.c_str());
                 g_cleanupPendingDate = g_lastSeenDate;  // yesterday — purge once fully synced
                 g_lastSeenDate = todayStr;
+                saveLastSeenDateToSD(todayStr);
 
                 time_t t = (time_t)clkEpoch;
                 struct tm* tmNow = gmtime(&t);
@@ -1482,17 +1763,20 @@ void loop() {
     }
 
     // ── Reconcile poller (server-side deletions, portal edits) ─────────────
-    // Every reconcilePollRateMs (base 15s) AFTER THE PREVIOUS RUN FINISHED,
+    // Every reconcilePollRateMs (base 30 min) AFTER THE PREVIOUS RUN FINISHED,
     // asks the seed worker to re-run PASS 1-3 so a row deleted on the portal
     // disappears from the device without needing a reboot/WiFi-blip/manual
     // Reseed. Gated on g_seedFinishedAtMs (not dispatch time) and !g_seedRunning
-    // because a full pass can take 30-50s+ with verbose per-employee logging —
-    // longer than the 15s base interval. Gating on dispatch time let 2-3 poll
-    // ticks land mid-run; each queued a semaphore give, so the worker started
-    // its next pass with zero gap the instant the current one finished — the
-    // "log never stops" symptom. Same idle/peak/heap guards as the socket
-    // poller above; the request itself runs on Core 0 (seedWorkerTask) so it
-    // never blocks NFC polling on Core 1.
+    // because a full pass can take 30-50s+ with verbose per-employee logging.
+    // Gating on dispatch time let 2-3 poll ticks land mid-run; each queued a
+    // semaphore give, so the worker started its next pass with zero gap the
+    // instant the current one finished — the "log never stops" symptom.
+    // Same idle/peak/heap guards as the socket poller above; the request
+    // itself runs on Core 0 (seedWorkerTask) so it never blocks NFC polling
+    // on Core 1. Base bumped from 15s → 30 min: at 15s the repeated HTTP+JSON
+    // churn was eating into the ESP32's free heap and freezing the dashboard
+    // UI, especially when NFC taps were also coming in rapid-fire during
+    // morning/noon/afternoon "out" lines.
     if (isConnected && currentState == STATE_DASHBOARD &&
         !isPeakHour() && !g_seedRunning &&
         (now - g_seedFinishedAtMs >= reconcilePollRateMs)) {
@@ -1656,7 +1940,12 @@ void loop() {
     if (g_pendingLastScanClear && currentState == STATE_DASHBOARD && !screenIsOff) {
         g_pendingLastScanClear = false;
         clearLastScan("both");
+        showChangeNotice("ATTENDANCE UPDATED");
     }
+
+    // Auto-hides the 5s toast started by showChangeNotice() (portal delete,
+    // or a background reconcile pass removing a server-deleted row above).
+    tickChangeNotice();
 
     if (currentState == STATE_DASHBOARD && !screenIsOff &&
         (now - lastStats >= STATS_REFRESH_MS)) {

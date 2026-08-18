@@ -181,7 +181,13 @@ bool SDDatabase::logAttendance(const String& timestamp,
     f.println(row);
     f.close();
 
-    Serial.println("[SD] Logged: " + row);
+    // Routed through SDLogger so it's automatically silenced during bulk
+    // SERVER_SEED catch-up writes (which happen inside seedTodayAttendance-
+    // FromServer()'s suspendSDWrite() window — see that function) while
+    // staying fully visible for a real live NFC tap, which logs outside
+    // that window. No extra condition needed: the suspend flag already
+    // lines up with exactly the case we want quieted.
+    SDLogger::logf("SD", SDLogger::INFO, "Logged: %s", row.c_str());
     return true;
 }
 
@@ -587,7 +593,16 @@ String SDDatabase::loadAttendanceToday(const String& empUid) {
     }
     f.close();
 
-    Serial.println("[SD] loadAttendanceToday uid=" + empUid + " -> '" + result + "'");
+    // Routed through SDLogger (not a raw Serial.println) so this respects
+    // suspendSDWrite() during a seed/reconcile pass. This is the single
+    // highest-volume trace line in the whole codebase — called once per
+    // employee per pass, 3 passes per cycle, so ~140+ times per seed cycle
+    // against a ~48-employee roster. Left as a raw Serial call, it was the
+    // main remaining source of garbled/interleaved terminal output during a
+    // seed pass even after suspendSDWrite() was made Serial-aware, since it
+    // never went through the logger to begin with.
+    SDLogger::logf("SD", SDLogger::INFO, "loadAttendanceToday uid=%s -> '%s'",
+                    empUid.c_str(), result.c_str());
     return result;
 }
 

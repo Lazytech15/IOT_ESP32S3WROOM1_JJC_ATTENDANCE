@@ -8,6 +8,26 @@
 
 #define AES_KEY_B64 "wSDp34MhW1pp7RJ8V01ovioEMYKI2hJceZ91VzZcA7s="
 
+// ── SEED_DEBUG_VERBOSE ────────────────────────────────────────────────────────
+// The Esp32Sync/SnapSeed seeding passes emit a per-employee, per-session-column
+// trace line at every step (SeedCheck/Processing, isNull, rawTime, existingCSV,
+// SKIP/QUEUED/WRITING/SEEDED, ...). That's dozens of lines per employee and,
+// across a full roster, thousands of lines per sync — useful when actively
+// debugging the seed/reconcile logic, but it drowns out everything else on a
+// normal boot. Off by default; flip to 1 locally to restore full trace detail.
+// Summary lines (page counts, "=== DONE: ... ===") and actual warnings/errors
+// (SD not ready, WRITE FAIL, SEED FAIL) are NOT gated by this — those stay
+// visible regardless, since they indicate something worth seeing.
+#ifndef SEED_DEBUG_VERBOSE
+#define SEED_DEBUG_VERBOSE 0
+#endif
+
+#if SEED_DEBUG_VERBOSE
+#define SEED_LOGF(tag, level, ...) SDLogger::logf(tag, level, __VA_ARGS__)
+#else
+#define SEED_LOGF(tag, level, ...) do {} while (0)
+#endif
+
 class AttendanceHTTPService {
 private:
     String       serverURL;
@@ -236,7 +256,8 @@ private:
 
     bool postAndDecrypt(const String& url,
                         const String& payload,
-                        DynamicJsonDocument& outDoc) {
+                        DynamicJsonDocument& outDoc,
+                        int* outHttpCode = nullptr) {
         Serial.println("[HTTP] POST " + url);
         Serial.println("[HTTP] Payload: " + payload);
         Serial.flush();
@@ -252,6 +273,7 @@ private:
         int code = http.POST(payload);
         Serial.println("[HTTP] Response code: " + String(code));
         Serial.flush();
+        if (outHttpCode) *outHttpCode = code;
 
         if (code <= 0) {
             Serial.println("[HTTP] ❌ Connection error: " + http.errorToString(code));
@@ -267,7 +289,12 @@ private:
         Serial.println("[HTTP] Body (first 200): " + body.substring(0, min(200, (int)body.length())));
         Serial.flush();
 
-        if (code != 200 && code != 403) {
+        // 409 = Conflict, almost always "this record already exists on the
+        // server" for a POST like this — let it fall through to decrypt so
+        // the caller (e.g. recordAttendance) can read the response body
+        // instead of only seeing a bare failure. Still not a "success" code
+        // on its own; callers decide what 409 means for their endpoint.
+        if (code != 200 && code != 403 && code != 409) {
             Serial.println("[HTTP] ❌ Unexpected HTTP code: " + String(code));
             Serial.flush();
             return false;
@@ -670,13 +697,34 @@ public:
         String payload;
         serializeJson(doc, payload);
 
-        Serial.println("[HTTP] Payload: " + payload);
-        Serial.flush();
-
+        // NOTE: payload is intentionally NOT printed here — postAndDecrypt()
+        // below prints "[HTTP] Payload: " itself right before POSTing. This
+        // used to print twice back-to-back (once here, once inside
+        // postAndDecrypt), which on a busy UART could interleave into one
+        // garbled line in the serial log (e.g. the employee_uid getting cut
+        // mid-string). The actual POST body was always correct either way —
+        // this only ever affected what showed up in the log.
         DynamicJsonDocument respDoc(1024);
-        bool ok = postAndDecrypt(serverURL + "/api/attendance/record", payload, respDoc);
+        int httpCode = 0;
+        bool ok = postAndDecrypt(serverURL + "/api/attendance/record", payload, respDoc, &httpCode);
         if (ok && respDoc.containsKey("success"))
             ok = respDoc["success"].as<bool>();
+
+        // 409 Conflict on a record-creation POST means the server already
+        // has this exact record — retrying it will NEVER succeed, since the
+        // condition that caused the 409 (a duplicate) doesn't go away.
+        // Previously this fell through to the generic failure path and got
+        // re-queued forever by flushPending() — with UPLOAD_BATCH_SIZE=1,
+        // that pinned this one record at the head of the queue and starved
+        // every other employee's pending record behind it, while also
+        // hammering the server with retries every ~200-350ms indefinitely.
+        // Treat it as resolved (server-confirmed) so it's removed from the
+        // queue instead of retried.
+        if (!ok && httpCode == 409) {
+            Serial.println("[HTTP] 409 Conflict — record already exists on server, "
+                            "treating as synced (not retrying)");
+            ok = true;
+        }
 
         Serial.println("[HTTP] Attendance " + String(ok ? "recorded OK" : "FAILED"));
         if (!ok && respDoc.containsKey("message"))
@@ -1765,7 +1813,7 @@ public:
                 String dept = row["department"] | "";
 
                 // ── DEBUG 7: Show each employee being processed ───────────────
-                SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                SEED_LOGF("Esp32Sync", SDLogger::INFO,
                                "SeedCheck uid=%s name='%s' dept='%s'",
                                empUid.c_str(), empName.c_str(), dept.c_str());
 
@@ -1775,7 +1823,7 @@ public:
                     // ── DEBUG 8: Show each session column value ───────────────
                     bool colIsNull = row[col].isNull();
                     String colVal  = colIsNull ? "(null)" : (row[col] | "(empty)");
-                    SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                    SEED_LOGF("Esp32Sync", SDLogger::INFO,
                                    "  col=%s  isNull=%d  val='%s'",
                                    col, (int)colIsNull, colVal.c_str());
 
@@ -1784,7 +1832,7 @@ public:
                     String rawTime = row[col] | "";
                     if (rawTime.length() == 0 || rawTime == "null" ||
                         rawTime == "0000-00-00 00:00:00") {
-                        SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                        SEED_LOGF("Esp32Sync", SDLogger::INFO,
                                        "  col=%s SKIP — empty/null rawTime", col);
                         yield(); continue;
                     }
@@ -1793,7 +1841,7 @@ public:
                     int sp = timeOnly.indexOf(' ');
                     if (sp >= 0) timeOnly = timeOnly.substring(sp + 1);
 
-                    SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                    SEED_LOGF("Esp32Sync", SDLogger::INFO,
                                    "  col=%s rawTime='%s' timeOnly='%s'",
                                    col, rawTime.c_str(), timeOnly.c_str());
 
@@ -1806,7 +1854,7 @@ public:
                     String& existingTypes = getCsvTypes(empUid);
                     bool alreadyInCsv = (("," + existingTypes + ",").indexOf("," + String(col) + ",") >= 0);
 
-                    SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                    SEED_LOGF("Esp32Sync", SDLogger::INFO,
                                    "  col=%s existingCSV='%s' alreadyIn=%d",
                                    col, existingTypes.c_str(), (int)alreadyInCsv);
 
@@ -1814,7 +1862,7 @@ public:
 
                     if (seedQueueLen < MAX_SEED) {
                         seedQueue[seedQueueLen++] = {empUid, String(col), timeOnly, empName, dept};
-                        SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                        SEED_LOGF("Esp32Sync", SDLogger::INFO,
                                        "  col=%s QUEUED for seed @ %s",
                                        col, timeOnly.c_str());
                     }
@@ -1850,14 +1898,14 @@ public:
                 seedEmp.department = e.dept;
                 seedEmp.hasData    = true;
 
-                SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                SEED_LOGF("Esp32Sync", SDLogger::INFO,
                                "WRITING uid=%s col=%s time=%s name='%s'",
                                e.empUid.c_str(), e.col.c_str(),
                                e.timeOnly.c_str(), e.empName.c_str());
 
                 bool wrote = SDDatabase::logAttendance(e.timeOnly, "", seedEmp, e.col, "SERVER_SEED");
 
-                SDLogger::logf("Esp32Sync", SDLogger::INFO,
+                SEED_LOGF("Esp32Sync", SDLogger::INFO,
                                "WRITE result=%s uid=%s col=%s",
                                wrote ? "OK" : "FAIL",
                                e.empUid.c_str(), e.col.c_str());
@@ -2262,11 +2310,31 @@ public:
             return code > 0 ? 0 : -1;   // HTTP error (e.g. offline) — try again next cycle
         }
 
-        String rbody = readHttpBodyReliable(hc, 32768);
+        // This is the ONE call in the codebase that fetches ALL of today's
+        // rows in a single unpaginated shot (every other sync/reconcile path
+        // pages at a fixed 10-20 rows/page, so it can never outgrow its cap
+        // as headcount grows). 32768 → 98304 fixed the crash at 45 employees,
+        // but 98304 is still just "big enough for today's roster" — the next
+        // headcount bump breaks it again the same way. Sized to match the
+        // 256KB hard ceiling the AES self-sizing guard already uses
+        // (aes_decryptor.h) so THIS read is never the bottleneck; PSRAM has
+        // 8MB+ free per the boot log, so 256KB is negligible. At ~1.27KB/
+        // employee on the wire (measured from the 45-employee/57KB log),
+        // this comfortably covers 150-200+ employees before either this cap
+        // or the AES ceiling would need revisiting.
+        const size_t RANGE_FETCH_CAP = psramFound() ? 262144 : 98304;
+        String rbody = readHttpBodyReliable(hc, RANGE_FETCH_CAP);
         hc.end();
         if (rbody.length() == 0) return 0;
+        if (rbody.length() >= RANGE_FETCH_CAP) {
+            SDLogger::logf("Reconcile", SDLogger::ERROR,
+                           "reconcileAgainstLiveRecords: response hit the %u-byte cap — "
+                           "roster has likely outgrown it again, this pass was skipped",
+                           (unsigned)RANGE_FETCH_CAP);
+            return 0;
+        }
 
-        DynamicJsonDocument srvDoc(24576);
+        DynamicJsonDocument srvDoc(psramFound() ? 131072 : 49152);
         bool ok = decryptBody(rbody, srvDoc);
         if (!ok) ok = (deserializeJson(srvDoc, rbody) == DeserializationError::Ok);
         if (!ok) {
@@ -2713,7 +2781,7 @@ public:
                     if (srvId > 0) {
                         SDDatabase::saveServerIdMapping(date, empUid, clockType, timeOnly, srvId);
                     }
-                    SDLogger::logf("EmpWalk", SDLogger::INFO,
+                    SEED_LOGF("EmpWalk", SDLogger::INFO,
                                    "SEEDED uid=%s %s @ %s",
                                    empUid.c_str(), clockType.c_str(), timeOnly.c_str());
                 } else {
@@ -2948,7 +3016,7 @@ public:
             }
             if (empName.length() == 0) empName = empUid;
 
-            SDLogger::logf("SnapSeed", SDLogger::INFO,
+            SEED_LOGF("SnapSeed", SDLogger::INFO,
                            "Processing uid=%s name='%s' dept='%s'",
                            empUid.c_str(), empName.c_str(), dept.c_str());
 
@@ -2976,7 +3044,7 @@ public:
                 String& existingTypes = getCsvTypes(empUid);
                 String  needle        = "," + String(col) + ",";
                 if (("," + existingTypes + ",").indexOf(needle) >= 0) {
-                    SDLogger::logf("SnapSeed", SDLogger::INFO,
+                    SEED_LOGF("SnapSeed", SDLogger::INFO,
                                    "SKIP  uid=%s %s (already in CSV)",
                                    empUid.c_str(), col);
                     totalSkipped++;
@@ -3004,7 +3072,7 @@ public:
                     // employee object are correctly deduped without an SD read.
                     existingTypes = SDDatabase::loadAttendanceToday(empUid);
 
-                    SDLogger::logf("SnapSeed", SDLogger::INFO,
+                    SEED_LOGF("SnapSeed", SDLogger::INFO,
                                    "SEEDED uid=%s %s @ %s",
                                    empUid.c_str(), col, timeVal.c_str());
                 } else {
