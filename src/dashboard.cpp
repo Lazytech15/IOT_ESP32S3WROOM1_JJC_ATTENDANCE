@@ -244,7 +244,9 @@ void drawStaticUI() {
     t->setTextDatum(TC_DATUM);
     t->drawString("24H LOCAL TIME", SCREEN_W / 2, Z3_Y + 4, 1);
     t->setTextColor(TFTColors::TEXT_DIM, TFTColors::BG_DARK);
-    t->drawString("AWAITING SYNC", SCREEN_W / 2, Z3_Y + Z3_H / 2 - 10, 4);
+    t->setTextDatum(MC_DATUM);
+    t->drawString("AWAITING SYNC", SCREEN_W / 2, Z3_CLOCK_CY, 4);
+    t->drawString("HRS", SCREEN_W / 2, Z3_HRS_Y, 1);
 
     // ── Z5: Divider ───────────────────────────────────────────────────────────
     for (int i = 0; i < SCREEN_W; i += 10)
@@ -267,37 +269,27 @@ void drawStaticUI() {
 }
 
 // ── 24H Military Clock ────────────────────────────────────────────────────────
+// Redraws ONLY the digit row every tick — the borders, "HRS"/"24H LOCAL TIME"
+// labels, and corner brackets are drawn once in drawStaticUI() and never
+// touched again here.
+//
+// No separate fillRect() before drawString(): a full-width fillRect() followed
+// by a second, separate drawString() call is two back-to-back SPI writes with
+// a visible all-black gap between them, which is what caused the flicker (a
+// black flash across the whole clock row every second). Font 7 is fixed-pitch
+// and "HH:MM:SS" is always exactly 8 characters, so drawString() with a
+// background colour erases the previous digits in place, in a single pass —
+// the same technique the screensaver's clock already uses without flicker.
 void updateClock(uint8_t h, uint8_t m, uint8_t s) {
     TFT_eSPI* t = tft();
     if (!t) return;
 
-    t->fillRect(0, Z3_Y, SCREEN_W, Z3_H, TFTColors::BG_DARK);
-
     char buf[12];
     snprintf(buf, sizeof(buf), "%02d:%02d:%02d", h, m, s);
 
-    t->setTextSize(2);
     t->setTextColor(TFTColors::WHITE, TFTColors::BG_DARK);
     t->setTextDatum(MC_DATUM);
-    t->drawString(buf, SCREEN_W / 2, Z3_Y + (Z3_H / 2) + 4, 4);
-    t->setTextSize(1);
-
-    t->setTextColor(TFTColors::TEXT_DIM, TFTColors::BG_DARK);
-    t->setTextDatum(MC_DATUM);
-    t->drawString("HRS", SCREEN_W / 2, Z3_Y + Z3_H - 10, 1);
-
-    t->setTextColor(TFTColors::SUCCESS, TFTColors::BG_DARK);
-    t->setTextDatum(TC_DATUM);
-    t->drawString("24H LOCAL TIME", SCREEN_W / 2, Z3_Y + 4, 1);
-
-    t->drawFastHLine(20,            Z3_Y,              30, TFTColors::TEXT_DIM);
-    t->drawFastVLine(20,            Z3_Y,              20, TFTColors::TEXT_DIM);
-    t->drawFastHLine(SCREEN_W - 50, Z3_Y,              30, TFTColors::TEXT_DIM);
-    t->drawFastVLine(SCREEN_W - 21, Z3_Y,              20, TFTColors::TEXT_DIM);
-    t->drawFastHLine(20,            Z3_Y + Z3_H - 1,   30, TFTColors::TEXT_DIM);
-    t->drawFastVLine(20,            Z3_Y + Z3_H - 20,  20, TFTColors::TEXT_DIM);
-    t->drawFastHLine(SCREEN_W - 50, Z3_Y + Z3_H - 1,   30, TFTColors::TEXT_DIM);
-    t->drawFastVLine(SCREEN_W - 21, Z3_Y + Z3_H - 20,  20, TFTColors::TEXT_DIM);
+    t->drawString(buf, SCREEN_W / 2, Z3_CLOCK_CY, 7);
 
     t->setTextDatum(TL_DATUM);
 }

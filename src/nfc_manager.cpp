@@ -74,7 +74,50 @@ static String parseNTAG(Adafruit_PN532& reader) {
 
     for (int pg = START_PAGE; pg <= END_PAGE; pg++) {
         uint8_t pageData[4];
-        if (!reader.mifareultralight_ReadPage(pg, pageData)) break;
+        uint8_t prevData[4];
+        bool    gotStable = false;
+        bool    gotAny    = false;   // true once ANY read of this page succeeded
+
+        // A single mifareultralight_ReadPage() call is one SPI/RF transaction;
+        // any RF noise or slight card movement mid-read can silently return
+        // corrupted or partial bytes with no error from the driver — that's
+        // what caused the same physical card to decode to a different,
+        // garbled string on almost every tap (e.g. '2404141283567' misread
+        // as '2400!41283567', '24041412835', etc). Try for two consecutive
+        // reads to agree, but this must stay best-effort: requiring
+        // consensus on EVERY page across up to 12 pages costs enough extra
+        // RF time that a normal brief tap started losing coupling before
+        // later pages were ever read, causing "No NDEF text found" outright
+        // — worse than the garbled-string problem this was meant to fix,
+        // since a wrong string just fails auth safely server-side anyway,
+        // while an aborted read fails locally with no server round trip at
+        // all. So: prefer a confirmed-stable read, but if attempts run out,
+        // use the last successful read instead of discarding the page.
+        for (int attempt = 0; attempt < 3 && !gotStable; attempt++) {
+            if (!reader.mifareultralight_ReadPage(pg, pageData)) continue;
+            gotAny = true;
+            if (attempt > 0 && memcmp(pageData, prevData, 4) == 0) {
+                gotStable = true;
+            } else {
+                memcpy(prevData, pageData, 4);
+                if (attempt == 0) {
+                    // Try once more immediately to compare against — most
+                    // glitches are transient, so a second read a beat later
+                    // usually agrees with a correct first read too.
+                    uint8_t confirm[4];
+                    if (reader.mifareultralight_ReadPage(pg, confirm) &&
+                        memcmp(confirm, pageData, 4) == 0) {
+                        gotStable = true;
+                    }
+                }
+            }
+        }
+
+        if (!gotAny) break;   // every attempt failed outright — nothing to use, stop here
+        // gotStable or not: pageData holds the most recent successful read —
+        // use it either way instead of aborting the whole card on a page
+        // that never reached consensus.
+        if (!gotStable) break;   // couldn't get a stable read for this page — stop here
         memcpy(raw + rawLen, pageData, 4);
         rawLen += 4;
     }

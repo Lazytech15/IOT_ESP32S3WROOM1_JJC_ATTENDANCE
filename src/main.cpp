@@ -39,6 +39,7 @@
 #include <time.h>
 #include "TFTDisplayManager.h"
 #include "dashboard.h"
+#include "screensaver.h"
 #include "nfc_manager.h"
 #include "WiFiConfig.h"
 #include "WiFiManager.h"
@@ -101,7 +102,7 @@
                                              // during busy tap lines (morning/noon/afternoon out)
 #define RECONCILE_POLL_MAX_MS    1800000    // cap backoff at 30 min too (was 2 min, now irrelevant
                                              // since base == max, but kept for the min()/backoff math)
-#define SCREEN_TIMEOUT_MS     300000   // 5 minutes of inactivity → backlight off
+#define SCREEN_TIMEOUT_MS     300000   // 5 minutes of inactivity → show screensaver
 
 // ── PROFILE DISPLAY ───────────────────────────────────────────────────────────
 // How long the employee photo/badge stays on screen after a scan.
@@ -252,6 +253,17 @@ static bool initialSyncDone = false;
 static unsigned long lastActivityMs  = 0;   // last time the screen was "touched"
 static bool          screenIsOff     = false;
 
+// ─── Screensaver burn-in protection ────────────────────────────────────────────
+// A second, shorter timer that fires only while the screensaver is already
+// showing: after DIM_AFTER_SCREENSAVER_MS at full brightness, fade the
+// backlight down so a static logo/clock doesn't sit at full brightness
+// indefinitely (LCD panels can still develop image persistence, just more
+// slowly than OLED). Restored to full brightness by wakeScreen().
+#define DIM_AFTER_SCREENSAVER_MS   10000   // 10 seconds into the screensaver
+#define SCREENSAVER_DIM_LEVEL      60      // ~24% brightness — still readable
+static unsigned long g_screensaverEnteredMs = 0;
+static bool          g_screensaverDimmed    = false;
+
 static bool          wasConnectedGlobal = false;  // tracks WiFi state across loop()
 
 // Set true by wakeScreen() so loop()'s clock branch resets lastClock to now,
@@ -288,6 +300,7 @@ static unsigned long g_lastIdlePollMs      = 0;
 static void wakeScreen() {
     if (screenIsOff) {
         screenIsOff = false;
+        g_screensaverDimmed = false;   // next screensaver entry starts at full brightness
 
         // Resync software clock from RTC so the display jumps to the correct
         // time immediately rather than catching up second-by-second.
@@ -317,6 +330,8 @@ static void resetScreenTimer() { lastActivityMs = millis(); }
 volatile bool g_triggerEmployeeSync = false;   // download employees from server
 volatile bool g_triggerPhotoSync    = false;   // download missing photos
 volatile bool g_triggerReseedToday  = false;   // fetch today's attendance from server
+volatile bool g_triggerScreenWake   = false;   // portal "Wake Screen" button
+volatile bool g_triggerScreenSleep  = false;   // portal "Sleep Screen" button
 
 // ─── State machine ────────────────────────────────────────────────────────────
 enum SystemState : uint8_t {
@@ -724,7 +739,10 @@ static void pollSocketEvents() {
     int empChanges = EmployeeSync::pollChanges(attService, String(SERVER_URL));
     if (empChanges > 0) {
         Serial.printf("[Socket] %d employee change(s) applied to SD cache\n", empChanges);
-        if (currentState == STATE_DASHBOARD) {
+        // Screensaver-corruption guard (see the sync-trigger blocks in loop()
+        // for the full explanation): only repaint the status row if the
+        // dashboard — not the screensaver — currently owns the display.
+        if (currentState == STATE_DASHBOARD && !screenIsOff) {
             updateStatusDots(wifiConfig.isConnected(), SDDatabase::isReady(), true);
         }
     }
@@ -1383,6 +1401,7 @@ void setup() {
         showLoadingAnimation(20, "SD FAILED");
         Serial.println("[Boot] SD FAILED");
     }
+    screensaverInit();   // checks for /logo.jpg — safe to call even if SD failed
 
     // ── 3. NFC ────────────────────────────────────────────────────────────
     showLoadingAnimation(35, "NFC...");
@@ -1412,6 +1431,21 @@ void setup() {
     // record from the pending upload queue too (see g_pendingQueueRemover's
     // doc comment in WiFiManager.h for why this is needed).
     g_pendingQueueRemover = removeFromPendingQueue;
+
+    // Portal delete/edit handlers (WiFiManager.h) can't see this file's
+    // `screenIsOff` (it's static/file-local) and must never draw to the TFT
+    // directly from an HTTP handler — see g_requestDashboardRefresh's doc
+    // comment in WiFiManager.h. Route them through the same deferred-flag
+    // mechanism loop() already uses for every other sync-trigger.
+    g_requestDashboardRefresh = []() {
+        g_pendingLastScanClear = true;
+        g_pendingStatsRefresh  = true;
+    };
+
+    // Lets the Actions tab's Awake/Asleep toggle poll /api/status and stay
+    // in sync with reality — including timeouts/wakes that didn't originate
+    // from the portal (an NFC tap, the normal 5-min idle timeout, etc.).
+    g_isScreenOff = []() { return screenIsOff; };
 
     // ── 6. Ready — draw dashboard immediately, THEN sync in background ────
     showLoadingAnimation(100, "READY!");
@@ -1513,14 +1547,52 @@ void loop() {
     wifiConfig.handleClient();
     wifiManager.handleClient();
 
+    // ── Portal-triggered wake/sleep ─────────────────────────────────────────
+    // Set by the Actions tab's "Wake Screen" / "Sleep Screen" buttons
+    // (WiFiManager.h's _apiScreenWake()/_apiScreenSleep()), checked here once
+    // per loop so the actual TFT/state work stays on the same core/loop as
+    // everything else that touches the display.
+    if (g_triggerScreenWake) {
+        g_triggerScreenWake = false;
+        if (screenIsOff) {
+            wakeScreen();
+            Serial.println("[Screen] Portal — manual wake");
+        }
+    }
+    if (g_triggerScreenSleep) {
+        g_triggerScreenSleep = false;
+        // Only forces the screensaver from the live dashboard — never fights
+        // an in-progress NFC tap/profile display, wifi setup, etc.
+        if (!screenIsOff && currentState == STATE_DASHBOARD) {
+            lastActivityMs = now - SCREEN_TIMEOUT_MS;   // let the block below fire this tick
+            Serial.println("[Screen] Portal — manual sleep");
+        }
+    }
+
+    // wakeScreen()/the sleep branch above both just touched lastActivityMs
+    // using a *fresh* millis() call — `now` above was captured before that,
+    // so it can be < lastActivityMs. Since both are unsigned long, the
+    // timeout check just below (now - lastActivityMs) would then underflow
+    // into a huge number and immediately re-trigger sleep on this same
+    // tick — which is exactly why "Wake" used to flash on for ~0.5s and
+    // instantly go back to the screensaver. Re-sampling now here keeps the
+    // subtraction below always non-negative.
+    now = millis();
+
     // ── Screen timeout ────────────────────────────────────────────────────
     if (!screenIsOff &&
         currentState == STATE_DASHBOARD &&
         (now - lastActivityMs >= SCREEN_TIMEOUT_MS)) {
         screenIsOff = true;
-        TFTDisplayManager::backlightOff();
-        TFTDisplayManager::clearScreen(0x0000);
-        Serial.println("[Screen] Timeout — screen blanked");
+        // Backlight stays ON: on this board TFT_BL only gates the LED, the
+        // ST7789 panel itself keeps a faint glow visible either way, so a
+        // "blanked" screen actually looked like a dim gray rectangle. Showing
+        // the logo/clock screensaver instead is strictly better and costs no
+        // extra power over the old dim-gray state.
+        drawScreensaver();
+        g_screensaverEnteredMs = now;
+        g_screensaverDimmed    = false;
+        Serial.println("[Screen] Timeout — showing screensaver");
 
         // ── Trigger upload immediately on screen-off ──────────────────────
         // Instead of waiting up to 10 minutes for the upload timer, kick off
@@ -1536,6 +1608,14 @@ void loop() {
         g_idlePollCount  = 0;
         g_idleResting    = false;
         g_lastIdlePollMs = now;   // first poll fires after one full interval, not instantly
+    }
+
+    // ── Screensaver burn-in protection: dim after N seconds ────────────────
+    if (screenIsOff && !g_screensaverDimmed &&
+        (now - g_screensaverEnteredMs >= DIM_AFTER_SCREENSAVER_MS)) {
+        g_screensaverDimmed = true;
+        TFTDisplayManager::fadeBacklight(SCREENSAVER_DIM_LEVEL, 400);
+        Serial.println("[Screen] Screensaver dimmed (burn-in protection)");
     }
 
     // ── Idle reconcile burst (screen-off polling for portal edits/deletes) ─
@@ -1625,7 +1705,10 @@ void loop() {
     if (!isConnected && wasConnectedGlobal) {
         wasConnectedGlobal = false;
         Serial.println("[WiFi] Lost — SD-only mode");
-        updateStatusDots(false, SDDatabase::isReady(), true);
+        // Screensaver-corruption guard — see loop()'s sync-trigger blocks.
+        if (!screenIsOff) {
+            updateStatusDots(false, SDDatabase::isReady(), true);
+        }
     }
 
     // ── WiFi reconnect retry ──────────────────────────────────────────────
@@ -1693,8 +1776,19 @@ void loop() {
         g_weeklyRefreshPending = false;
         Serial.println("[Rollover] Running weekly employee re-sync");
         EmployeeSync::fullSyncIfNeeded(attService, true);
-        drawStaticUI();
-        updateStatusDots(isConnected, SDDatabase::isReady(), true);
+        // Only repaint the dashboard chrome if the dashboard is actually what's
+        // on screen right now. drawStaticUI()/updateStatusDots() draw directly
+        // onto whatever is currently displayed — if the screensaver is showing
+        // (screenIsOff == true), calling them here paints dashboard labels and
+        // status badges straight on top of the screensaver, corrupting it into
+        // a hybrid mess that never gets cleaned up (the screensaver only ever
+        // repaints its own small clock/date regions, never a full fillScreen).
+        // wakeScreen() already does a full drawStaticUI()+refresh the moment
+        // the screensaver ends, so it's safe to just skip the repaint here.
+        if (!screenIsOff) {
+            drawStaticUI();
+            updateStatusDots(isConnected, SDDatabase::isReady(), true);
+        }
     }
 
     // ── Manual action triggers from web portal ────────────────────────────
@@ -1703,8 +1797,11 @@ void loop() {
         if (isConnected && currentState == STATE_DASHBOARD) {
             Serial.println("[Action] Manual employee sync triggered");
             EmployeeSync::fullSyncIfNeeded(attService, true);
-            drawStaticUI();
-            updateStatusDots(isConnected, SDDatabase::isReady(), true);
+            // Same screensaver-corruption guard as the weekly re-sync above.
+            if (!screenIsOff) {
+                drawStaticUI();
+                updateStatusDots(isConnected, SDDatabase::isReady(), true);
+            }
         }
     }
     if (g_triggerReseedToday) {
@@ -1811,7 +1908,10 @@ void loop() {
         if (currentState == STATE_DASHBOARD) {
             int ins  = max(0, SDDatabase::countTodayCheckIns());
             int outs = max(0, SDDatabase::countTodayCheckOuts());
-            updateAttendanceStats(ins, outs);
+            // Screensaver-corruption guard — see loop()'s sync-trigger blocks.
+            // The portal still gets the real numbers below either way; only
+            // the on-screen stat cards are skipped while the screensaver is up.
+            if (!screenIsOff) updateAttendanceStats(ins, outs);
             uint64_t freeMB = SDDatabase::freeBytes() / 1048576;
             String statsJson = "{\"ins\":" + String(ins)
                              + ",\"outs\":" + String(outs)
@@ -1907,21 +2007,32 @@ void loop() {
         int ticked = catchUpClock(lastClock);
         if (ticked > 0) {
             tick += (uint8_t)ticked;
-            if (!screenIsOff) {                          // skip TFT writes when off
+            if (!screenIsOff) {
                 pulseStatus(tick % 2);
                 updateClock(clkH, clkM, clkS);
                 if (tick % 60   == 0) updateDate(buildDateStr());
+            } else {                                      // screensaver is showing
+                updateScreensaverClock(clkH, clkM, clkS);
+                if (tick % 60   == 0) updateScreensaverDate(buildDateStr());
             }
             if (tick % 3600 == 0 && isConnected) syncNTPTime();
 
             if (clkH == 0 && clkM == 0 && clkS == 0) {
                 Serial.println("[Midnight] New day — resetting stats");
                 peakEndMin = 0xFFFF;  // reset peak tracking at midnight
-                drawStaticUI();
-                updateStatusDots(isConnected, SDDatabase::isReady(), true);
-                updateAttendanceStats(0, 0);
-                updateDate(buildDateStr());
                 SDDatabase::setDateProvider([]() -> String { return dateStr(); });
+                // Same screensaver-corruption guard as the sync triggers above —
+                // don't paint the dashboard chrome over an active screensaver.
+                // The data reset (stats, date provider) still happens either way;
+                // only the on-screen repaint is conditional.
+                if (!screenIsOff) {
+                    drawStaticUI();
+                    updateStatusDots(isConnected, SDDatabase::isReady(), true);
+                    updateAttendanceStats(0, 0);
+                    updateDate(buildDateStr());
+                } else {
+                    updateScreensaverDate(buildDateStr());
+                }
             }
         }
     }
@@ -1969,9 +2080,27 @@ void loop() {
             String cardId;
             if (nfcData.length() >= MIN_CARD_ID_LEN) {
                 cardId = nfcData;
-            } else if (nfcUID.length() >= MIN_CARD_ID_LEN) {
-                cardId = nfcUID;
             } else {
+                // Card is physically present (PN532 saw it) but the NDEF
+                // payload didn't come back — nfcUID used to be sent to the
+                // server as a fallback "cardId" here, but nfcUID is the raw
+                // 7-byte hardware UID (e.g. "04:13:34:24:23:02:89"), which
+                // is never what's registered in emp_list.nfc_access (that's
+                // always the NDEF text payload, e.g. "2404141283567"). So
+                // every fallback attempt was a guaranteed-to-fail HTTPS
+                // round trip to /api/nfc-auth that showed the person
+                // "Access Denied" for what was actually just a bad read —
+                // see nfc-access.php's log: "NFC Auth Failed:
+                // UID=04:13:34:24:23:02:89" repeating on retaps of a card
+                // that authenticates fine once the NDEF read succeeds.
+                // Treat it as a failed read instead: show a local retry
+                // prompt and skip the network call entirely — no server
+                // round trip can ever succeed with the raw UID anyway.
+                if (currentState == STATE_DASHBOARD) {
+                    empDisplay->showError("Read failed\nTap again");
+                    enterState(STATE_NFC_ERROR);
+                    resetScreenTimer();
+                }
                 goto nfc_poll_end;
             }
 

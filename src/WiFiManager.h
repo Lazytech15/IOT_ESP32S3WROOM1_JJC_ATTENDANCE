@@ -32,6 +32,7 @@
 #include "sd_file_manager.h" // Ensure file manager tools are included
 #include "attendance_http_service.h"
 #include "dashboard.h"   // clearLastScan/updateAttendanceStats/showChangeNotice for the TFT
+#include "screensaver.h" // SCREENSAVER_LOGO_PATH, screensaverInit() — used by the logo upload endpoint
 #include <functional>
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -63,6 +64,46 @@
 static std::function<bool(const String& empUid, const String& clockType,
                            const String& date, const String& timeOnly)>
     g_pendingQueueRemover = nullptr;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// g_requestDashboardRefresh
+//
+// Set by main.cpp during setup() to a small lambda that flips its own
+// g_pendingLastScanClear/g_pendingStatsRefresh flags (same as the
+// screensaver-corruption guard used everywhere else in main.cpp's loop()).
+//
+// WHY THIS EXISTS:
+//   _apiAttendanceDeleteRow() (and the "today" branch of _apiAttendanceUpdate)
+//   used to call updateAttendanceStats()/clearLastScan()/showChangeNotice()
+//   directly. Those draw straight onto the TFT, and this HTTP handler runs
+//   synchronously inside WebServer::handleClient() on the SAME core/loop as
+//   the rest of main.cpp — but main.cpp's own `screenIsOff` flag is `static`
+//   (file-local), so this file had no way to check whether the screensaver
+//   was currently on screen before painting dashboard chrome over it. A
+//   portal delete/edit that landed while the screensaver was up would draw
+//   the "ATTENDANCE UPDATED" toast + stat cards straight onto the
+//   screensaver, corrupting it into a mixed dashboard/screensaver mess that
+//   never got cleaned up (the screensaver only ever repaints its own small
+//   clock/date regions).
+//
+// FIX: route through this callback instead, which only ever sets flags.
+// loop() already drains g_pendingLastScanClear/g_pendingStatsRefresh once
+// per tick, gated on `currentState == STATE_DASHBOARD && !screenIsOff` —
+// exactly the same guard every other sync-trigger path in main.cpp uses.
+// ══════════════════════════════════════════════════════════════════════════════
+static std::function<void()> g_requestDashboardRefresh = nullptr;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// g_isScreenOff
+//
+// Same problem as g_requestDashboardRefresh above: main.cpp's `screenIsOff`
+// is file-local static, so _apiStatus() has no way to report whether the
+// screensaver is currently showing. Set by main.cpp during setup() to a
+// tiny lambda returning `screenIsOff`, so the portal's Actions tab can poll
+// /api/status and keep its Awake/Asleep toggle in sync with reality (auto
+// timeout, NFC-tap wake, etc. — not just portal-triggered changes).
+// ══════════════════════════════════════════════════════════════════════════════
+static std::function<bool()> g_isScreenOff = nullptr;
 
 // Some cores don't expose WIFI_SCAN_RUNNING; ensure we have a fallback
 #ifndef WIFI_SCAN_RUNNING
@@ -144,6 +185,42 @@ private:
     String     _serverURL;
     WiFiConfig* _cfg = nullptr;
     AttendanceHTTPService* _attSvc = nullptr;
+
+    // ── Logo upload (multipart) state — see _apiLogoUploadHandler() ────────
+    File _logoUploadFile;
+    bool _logoUploadOk = false;
+
+    // ── serverIds cache (see _apiAttendance's Step B) ───────────────────────
+    // _apiAttendance was re-fetching /api/attendanceEdit/range from
+    // jjcenggworks.com — a ~50-65KB encrypted payload — on EVERY hit to this
+    // handler, including every SSE-triggered background refresh fired by a
+    // scan/stats event from ANY tap building-wide (see loadCsv()'s SSE
+    // listener above). At normal building traffic this meant several full
+    // HTTPS+AES round trips a minute, which is what exhausted TLS heap
+    // ("SSL - Memory allocation failed") and made handleClient() — which
+    // blocks the WHOLE single-threaded WebServer, and therefore this whole
+    // synchronous loop() core — hang for seconds at a time on every request
+    // that landed mid-fetch.
+    // Fix: cache the parsed sKeys/sIds/sCount/serverFetchOk result per date
+    // for CACHE_TTL_MS. A hit inside the window reuses the cache with zero
+    // network traffic; a miss (stale, different date, or explicitly
+    // invalidated by a portal edit/delete) does the real fetch as before.
+    static const uint32_t SERVERIDS_CACHE_TTL_MS = 45000;   // 45s
+    String   _sidCacheDate;
+    uint32_t _sidCacheAt        = 0;
+    bool     _sidCacheValid     = false;
+    bool     _sidCacheFetchOk   = false;
+    static const int SERVERIDS_CACHE_SZ = 128;
+    String   _sidCacheKeys[SERVERIDS_CACHE_SZ];
+    int      _sidCacheIds[SERVERIDS_CACHE_SZ];
+    int      _sidCacheCount     = 0;
+
+    // Call after any local mutation that changes server-side row IDs for
+    // `date` (portal delete/edit, a fresh NFC tap upload) so the next
+    // _apiAttendance hit does a real fetch instead of serving stale IDs.
+    void _invalidateServerIdCache(const String& date = "") {
+        if (date.length() == 0 || date == _sidCacheDate) _sidCacheValid = false;
+    }
 
     // ── Start async background scan ───────────────────────────────────────────
     void _startScan() {
@@ -312,6 +389,9 @@ label{font-size:.8rem;color:var(--dim);display:block;margin-bottom:4px}
         _srv.on("/api/sd/rename",  HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiSdRename(); });
         _srv.on("/api/sd/copy",    HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiSdCopy(); });
         _srv.on("/api/sd/write",   HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiSdWrite(); });
+        _srv.on("/api/logo/upload", HTTP_POST,
+            [this](){ _apiLogoUploadDone(); },
+            [this](){ _apiLogoUploadHandler(); });
 
         _srv.on("/api/attendance",              HTTP_GET,  [this](){ if(!_authed()){_srv.send(401);}else _apiAttendance(); });
         _srv.on("/api/attendance/dates",        HTTP_GET,  [this](){ if(!_authed()){_srv.send(401);}else _apiAttendanceDates(); });
@@ -326,6 +406,8 @@ label{font-size:.8rem;color:var(--dim);display:block;margin-bottom:4px}
         _srv.on("/api/sync/employees", HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiSyncEmployees(); });
         _srv.on("/api/sync/photos",    HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiSyncPhotos(); });
         _srv.on("/api/sync/reseed",    HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiReseedToday(); });
+        _srv.on("/api/screen/wake",    HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiScreenWake(); });
+        _srv.on("/api/screen/sleep",   HTTP_POST, [this](){ if(!_authed()){_srv.send(401);}else _apiScreenSleep(); });
     }
 
     void _redir() { _srv.sendHeader("Location","/login"); _srv.send(302); }
@@ -482,6 +564,20 @@ button:hover{background:linear-gradient(135deg,#f97316,#fbbf24)}
             String html = _head("SD Files", 1);
         html += R"HTML(
 <div class="card">
+  <div class="card-title">Company Logo (Screensaver)</div>
+  <p style="font-size:.8rem;color:#94a3b8;margin:0 0 10px">
+    Shown on the screensaver after the screen times out. Drop a new image here or click to browse —
+    it's saved as <code>/logo.jpg</code> on the SD card, automatically replacing the old one.
+  </p>
+  <div id="logoDrop" style="border:2px dashed #334155;border-radius:10px;padding:18px;text-align:center;cursor:pointer;transition:border-color .15s,background .15s">
+    <img id="logoPreview" src="/api/sd/dl?f=/logo.jpg" style="max-width:130px;max-height:141px;display:block;margin:0 auto 10px;border-radius:6px" onerror="this.style.display='none';document.getElementById('logoEmptyMsg').style.display='block'">
+    <div id="logoEmptyMsg" style="display:none;color:#64748b;font-size:.82rem;margin-bottom:10px">No logo uploaded yet</div>
+    <div style="font-size:.82rem;color:#94a3b8">Drag &amp; drop an image here, or click to choose a file</div>
+    <input id="logoFileInput" type="file" accept="image/jpeg,image/jpg" style="display:none">
+  </div>
+  <div id="logoStatus" style="font-size:.78rem;margin-top:8px;color:#64748b"></div>
+</div>
+<div class="card">
   <div class="card-title">SD Card Browser</div>
   <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
     <input id="pathInput" value="/" style="flex:1;min-width:180px" placeholder="Path (e.g. /attendance)">
@@ -501,6 +597,70 @@ button:hover{background:linear-gradient(135deg,#f97316,#fbbf24)}
   </div>
 </div>
 <script>
+// ── Logo upload (drag & drop) ────────────────────────────────────────────
+(function(){
+  var drop   = document.getElementById('logoDrop');
+  var input  = document.getElementById('logoFileInput');
+  var status = document.getElementById('logoStatus');
+  var preview = document.getElementById('logoPreview');
+
+  drop.addEventListener('click', function(){ input.click(); });
+  input.addEventListener('change', function(){
+    if (input.files && input.files[0]) uploadLogo(input.files[0]);
+  });
+  ['dragenter','dragover'].forEach(function(evt){
+    drop.addEventListener(evt, function(e){
+      e.preventDefault(); e.stopPropagation();
+      drop.style.borderColor = '#f97316';
+      drop.style.background  = 'rgba(249,115,22,0.08)';
+    });
+  });
+  ['dragleave','drop'].forEach(function(evt){
+    drop.addEventListener(evt, function(e){
+      e.preventDefault(); e.stopPropagation();
+      drop.style.borderColor = '#334155';
+      drop.style.background  = 'transparent';
+    });
+  });
+  drop.addEventListener('drop', function(e){
+    var files = e.dataTransfer.files;
+    if (files && files[0]) uploadLogo(files[0]);
+  });
+
+  function uploadLogo(file){
+    if (!/^image\/(jpe?g)$/i.test(file.type) && !/\.jpe?g$/i.test(file.name)) {
+      status.textContent = 'Please choose a .jpg / .jpeg file (the panel decoder only supports JPEG).';
+      status.style.color = '#ef4444';
+      return;
+    }
+    status.textContent = 'Uploading...';
+    status.style.color = '#64748b';
+
+    var fd = new FormData();
+    fd.append('logo', file, 'logo.jpg');
+
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/logo/upload', true);
+    xhr.onload = function(){
+      if (xhr.status === 200) {
+        status.textContent = 'Logo updated. It will appear next time the screensaver draws.';
+        status.style.color = '#22c55e';
+        preview.style.display = 'block';
+        document.getElementById('logoEmptyMsg').style.display = 'none';
+        preview.src = '/api/sd/dl?f=/logo.jpg&_=' + Date.now();
+      } else {
+        status.textContent = 'Upload failed (' + xhr.status + ').';
+        status.style.color = '#ef4444';
+      }
+    };
+    xhr.onerror = function(){
+      status.textContent = 'Upload failed — connection error.';
+      status.style.color = '#ef4444';
+    };
+    xhr.send(fd);
+  }
+})();
+
 function browseDir(){
   var p=document.getElementById('pathInput').value||'/';
   fetch('/api/sd/tree?path='+encodeURIComponent(p)).then(r=>r.json()).then(renderTree);
@@ -1238,7 +1398,22 @@ loadCsv('today');
       <div style="font-size:.82rem;font-weight:600;margin-bottom:8px">Browse SD Files</div>
       <a href="/portal/files" class="btn btn-ghost btn-sm">Browse SD</a>
     </div>
+    <div style="background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:8px;padding:14px;text-align:center">
+      <div style="font-size:1.6rem;margin-bottom:6px">&#127769;</div>
+      <div style="font-size:.82rem;font-weight:600;margin-bottom:8px">Screen</div>
+      <div style="display:flex;align-items:center;justify-content:center;gap:8px;font-size:.78rem">
+        <span id="screenLblWake" style="color:#94a3b8">Awake</span>
+        <label style="position:relative;display:inline-block;width:42px;height:23px;flex:none">
+          <input type="checkbox" id="screenSwitch" onchange="setScreenState(this.checked?'sleep':'wake')" style="opacity:0;width:0;height:0">
+          <span id="screenSwitchTrack" style="position:absolute;inset:0;background:#334155;border-radius:23px;transition:.2s;cursor:pointer">
+            <span id="screenSwitchKnob" style="position:absolute;height:17px;width:17px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s"></span>
+          </span>
+        </label>
+        <span id="screenLblSleep" style="color:#94a3b8">Asleep</span>
+      </div>
+    </div>
   </div>
+
 </div>
 
 <div class="card">
@@ -1321,6 +1496,40 @@ function doAction(url,msg){
     m.className='alert alert-err';m.textContent='Error: '+e;m.style.display='block';
   });
 }
+
+// ── Awake/Asleep toggle switch ──────────────────────────────────────────
+// Reflects the device's ACTUAL state (polled via /api/status), not just
+// what was last clicked — so it also updates when the screen goes to sleep
+// on its own 5-min timeout, or wakes from an NFC tap at the device itself.
+function paintScreenToggle(isOff){
+  var sw    = document.getElementById('screenSwitch');
+  var track = document.getElementById('screenSwitchTrack');
+  var knob  = document.getElementById('screenSwitchKnob');
+  var wakeL = document.getElementById('screenLblWake');
+  var sleepL= document.getElementById('screenLblSleep');
+  sw.checked = isOff;
+  track.style.background = isOff ? 'var(--accent,#f97316)' : '#334155';
+  knob.style.left = isOff ? '22px' : '3px';
+  wakeL.style.color  = !isOff ? '#e2e8f0' : '#94a3b8';
+  wakeL.style.fontWeight  = !isOff ? '600' : '400';
+  sleepL.style.color = isOff ? '#e2e8f0' : '#94a3b8';
+  sleepL.style.fontWeight = isOff ? '600' : '400';
+}
+function pollScreenState(){
+  fetch('/api/status').then(r=>r.json()).then(function(d){
+    paintScreenToggle(!!d.screen_off);
+  }).catch(function(){});
+}
+function setScreenState(v){
+  var url = v==='wake' ? '/api/screen/wake' : '/api/screen/sleep';
+  doAction(url, v==='wake' ? 'Waking screen...' : 'Putting screen to sleep...');
+  // Optimistic paint immediately, then confirm from the device shortly after
+  // (wake/sleep are applied on the next loop() tick, not instantly).
+  paintScreenToggle(v==='sleep');
+  setTimeout(pollScreenState, 700);
+}
+pollScreenState();
+setInterval(pollScreenState, 5000);
 </script>
 )HTML";
         html += _foot();
@@ -1524,6 +1733,7 @@ loadStatus();loadNets();
         // ins/outs used by dashboard AJAX initial stats load
         doc["ins"]     = max(0, SDDatabase::countTodayCheckIns());
         doc["outs"]    = max(0, SDDatabase::countTodayCheckOuts());
+        doc["screen_off"] = g_isScreenOff ? g_isScreenOff() : false;
         String out; serializeJson(doc,out);
         _srv.sendHeader("Access-Control-Allow-Origin","*");
         _srv.send(200,"application/json",out);
@@ -1577,6 +1787,53 @@ loadStatus();loadNets();
         String content = _srv.arg("plain"); // Raw body
         bool ok = SDFileManager::writeTextFile(path, content);
         _srv.send(200,"application/json", ok ? "{\"success\":true}" : "{\"success\":false}");
+    }
+
+    // ── LOGO UPLOAD (binary-safe, multipart/form-data) ──────────────────────
+    // Always saves to the fixed path the screensaver reads from, overwriting
+    // whatever was there before — no separate delete step needed.
+    // Two-part handler required by WebServer for file uploads:
+    //   • _apiLogoUploadHandler() fires repeatedly with upload.status ==
+    //     UPLOAD_FILE_START / WRITE / END as the multipart body streams in.
+    //   • _apiLogoUploadDone() fires once after the body is fully consumed,
+    //     and is where we send the actual HTTP response.
+    void _apiLogoUploadHandler() {
+        HTTPUpload& upload = _srv.upload();
+
+        if (upload.status == UPLOAD_FILE_START) {
+            _logoUploadOk = false;
+            if (!_authed()) { Serial.println("[Logo] Upload rejected: not authed"); return; }
+            if (!SDDatabase::isReady()) { Serial.println("[Logo] Upload rejected: SD not ready"); return; }
+
+            if (SD_MMC.exists(SCREENSAVER_LOGO_PATH)) SD_MMC.remove(SCREENSAVER_LOGO_PATH);
+            _logoUploadFile = SD_MMC.open(SCREENSAVER_LOGO_PATH, FILE_WRITE);
+            _logoUploadOk = (bool)_logoUploadFile;
+            if (!_logoUploadOk) Serial.println("[Logo] Failed to open /logo.jpg for write");
+
+        } else if (upload.status == UPLOAD_FILE_WRITE) {
+            if (_logoUploadOk && _logoUploadFile) {
+                _logoUploadFile.write(upload.buf, upload.currentSize);
+            }
+
+        } else if (upload.status == UPLOAD_FILE_END) {
+            if (_logoUploadFile) _logoUploadFile.close();
+            if (_logoUploadOk) {
+                Serial.printf("[Logo] /logo.jpg saved, %u bytes\n", upload.totalSize);
+                // Pick up the new logo immediately — re-reads dimensions from SD.
+                screensaverInit();
+            }
+
+        } else if (upload.status == UPLOAD_FILE_ABORTED) {
+            if (_logoUploadFile) _logoUploadFile.close();
+            _logoUploadOk = false;
+            Serial.println("[Logo] Upload aborted");
+        }
+    }
+
+    void _apiLogoUploadDone() {
+        if (!_authed()) { _srv.send(401,"application/json","{\"success\":false,\"error\":\"Not authed\"}"); return; }
+        _srv.send(_logoUploadOk ? 200 : 500, "application/json",
+                   _logoUploadOk ? "{\"success\":true}" : "{\"success\":false,\"error\":\"Upload failed\"}");
     }
 
     // ── READ & LIST ───────────────────────────────────────────────────────────
@@ -2000,6 +2257,10 @@ loadStatus();loadNets();
             serverErr = wifiUp ? "no server URL" : "offline";
         }
 
+        // An edit here changes clock times server-side for this date, so any
+        // cached serverIds map for it is now stale.
+        _invalidateServerIdCache(fileDateStr);
+
         DynamicJsonDocument resp(256);
         resp["success"]       = true;
         resp["rows_written"]  = written;
@@ -2121,7 +2382,17 @@ loadStatus();loadNets();
             HTTPClient hd; hd.setTimeout(6000);
             hd.begin(_serverURL + "/api/attendanceEdit/" + String(serverId));
             hd.addHeader("X-Client-Type","ESP32");
-            int dc = hd.sendRequest("DELETE", "");
+            // Send an explicit "{}" JSON body with Content-Type set, instead of
+            // an empty string with no header. The server's input parser reads
+            // php://input on every request regardless of HTTP method; when it
+            // gets a truly empty body it falls back to some non-JSON default
+            // that the server's own logging code then mishandles (a benign
+            // but noisy "Array to string conversion" PHP warning on the
+            // server for every request, delete included). Sending well-formed
+            // JSON removes the ambiguity on our end rather than relying on
+            // the server tolerating an empty body correctly.
+            hd.addHeader("Content-Type","application/json");
+            int dc = hd.sendRequest("DELETE", "{}");
             serverOk = (dc == 200 || dc == 204);
             Serial.printf("[WM] DELETE /attendanceEdit/%d → %d\n", serverId, dc);
             hd.end();
@@ -2175,11 +2446,15 @@ loadStatus();loadNets();
         // fine, while the Clock-In/Clock-Out name strip — only ever touched
         // here or by a fresh tap — kept showing the deleted person forever.
         if (fileArg == "today" || fileArg == "__today__") {
-            updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
-                                  max(0, SDDatabase::countTodayCheckOuts()));
-            clearLastScan("both");
-            showChangeNotice("ATTENDANCE UPDATED");
+            // Don't touch the TFT directly here — see g_requestDashboardRefresh's
+            // doc comment above for why (screensaver-corruption guard).
+            if (g_requestDashboardRefresh) g_requestDashboardRefresh();
         }
+
+        // This delete just changed which server IDs exist for this date —
+        // a cached serverIds map from before the delete would still list the
+        // just-removed row's ID as "active", so drop it.
+        _invalidateServerIdCache(fileDateStr);
 
         DynamicJsonDocument resp(128);
         resp["success"]   = true;
@@ -2647,13 +2922,25 @@ loadStatus();loadNets();
         int  sCount = 0;
         bool serverFetchOk = false;  // true only if we got a valid HTTP 200 + parsed response
 
+        bool sidCacheHit = _sidCacheValid
+                         && _sidCacheDate == fileDateStr
+                         && (millis() - _sidCacheAt) < SERVERIDS_CACHE_TTL_MS;
+
+        if (sidCacheHit) {
+            // Reuse the last fetch — no network call, no SSL allocation.
+            sCount = min(_sidCacheCount, MAP_SZ);
+            for (int i = 0; i < sCount; i++) { sKeys[i] = _sidCacheKeys[i]; sIds[i] = _sidCacheIds[i]; }
+            serverFetchOk = _sidCacheFetchOk;
+            Serial.printf("[WM] serverIds cache HIT (age=%lus, %d entries)\n",
+                          (unsigned long)((millis() - _sidCacheAt) / 1000), sCount);
+        } else
         if (wifiUp && _serverURL.length() > 0 && rows.size() > 0 && fileDateStr.length() == 10) {
             HTTPClient hc; hc.setTimeout(6000);
             hc.begin(_serverURL + "/api/attendanceEdit/range?start_date=" +
                      fileDateStr + "&end_date=" + fileDateStr);
             hc.addHeader("X-Client-Type","ESP32");
             int code = hc.GET();
-            Serial.printf("[WM] serverIds fetch code=%d\n", code);
+            Serial.printf("[WM] serverIds fetch code=%d (cache miss)\n", code);
 
             if (code == 200) {
                 String rbody = hc.getString();
@@ -2696,6 +2983,14 @@ loadStatus();loadNets();
                         sKeys[sCount] = k; sIds[sCount] = id; sCount++;
                     }
                     Serial.printf("[WM] Server map: %d records (time-keyed)\n", sCount);
+
+                    // Populate the cache for the next hit within the TTL window.
+                    _sidCacheDate      = fileDateStr;
+                    _sidCacheAt        = millis();
+                    _sidCacheValid     = true;
+                    _sidCacheFetchOk   = serverFetchOk;
+                    _sidCacheCount     = min(sCount, SERVERIDS_CACHE_SZ);
+                    for (int i = 0; i < _sidCacheCount; i++) { _sidCacheKeys[i] = sKeys[i]; _sidCacheIds[i] = sIds[i]; }
                 } else { hc.end(); }
             } else { hc.end(); }
         }
@@ -2991,5 +3286,21 @@ loadStatus();loadNets();
         g_triggerReseedToday = true;
         _srv.send(200,"application/json",
             "{\"success\":true,\"message\":\"Reseed queued. Today attendance will refresh from server.\"}");
+    }
+
+    // ── Manual screen wake (force out of screensaver right now) ────────────
+    void _apiScreenWake() {
+        extern volatile bool g_triggerScreenWake;
+        g_triggerScreenWake = true;
+        _srv.send(200,"application/json",
+            "{\"success\":true,\"message\":\"Wake requested.\"}");
+    }
+
+    // ── Manual screen sleep (force into screensaver right now) ─────────────
+    void _apiScreenSleep() {
+        extern volatile bool g_triggerScreenSleep;
+        g_triggerScreenSleep = true;
+        _srv.send(200,"application/json",
+            "{\"success\":true,\"message\":\"Sleep requested.\"}");
     }
 };

@@ -30,6 +30,12 @@
 #define SCREEN_HEIGHT   320
 #define TFT_ROTATION    0       // Portrait mode (0=portrait, 1=landscape)
 
+// Backlight PWM (LEDC) — lets setBacklight()/fadeBacklight() dim smoothly
+// instead of just switching the panel on/off.
+#define BACKLIGHT_PWM_FREQ      5000   // Hz, well above flicker-visible range
+#define BACKLIGHT_PWM_RES_BITS  8      // 0-255 duty range
+#define BACKLIGHT_PWM_CHANNEL   0      // only used on arduino-esp32 < 3.0
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Color Palette
 // ══════════════════════════════════════════════════════════════════════════════

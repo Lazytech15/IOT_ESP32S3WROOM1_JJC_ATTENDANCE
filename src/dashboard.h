@@ -28,6 +28,16 @@
 #define Z2_H   20   // Status badges
 #define Z3_Y   56
 #define Z3_H   80   // 24H clock
+// Sub-positions inside Z3, chosen so the font-7 clock digits (48px tall)
+// never overlap the "24H LOCAL TIME" label above or the "HRS" label below:
+//   Z3_Y+4 (60)              -- "24H LOCAL TIME" label, ~8px tall -> ends ~68
+//   Z3_CLOCK_CY (96)         -- vertical CENTER of the clock digits (48px
+//                                tall -> spans 72-120), leaves a 4px gap on
+//                                both sides
+//   Z3_HRS_Y (128)           -- "HRS" label center, ~8px tall -> spans
+//                                124-132, i.e. a 4px gap below the digits
+#define Z3_CLOCK_CY  (Z3_Y + 40)
+#define Z3_HRS_Y     (Z3_Y + Z3_H - 8)
 #define Z4_Y  136
 #define Z4_H   24   // Date
 #define Z5_Y  160

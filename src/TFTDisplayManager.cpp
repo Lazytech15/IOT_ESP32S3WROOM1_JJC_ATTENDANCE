@@ -112,12 +112,18 @@ bool TFTDisplayManager::init(uint8_t rotation, bool /*invertColors — unused*/)
 
     Serial.println("[TFT] init() start");
 
-    // ── GPIO 9 = TFT_BL (backlight) ──────────────────────────────────────────
-    // MUST be configured as OUTPUT before any digitalWrite() call, otherwise
-    // ESP32 logs: "IO 9 is not set as GPIO" and may crash / not light the panel.
-    pinMode(TFT_BL, OUTPUT);
-    digitalWrite(TFT_BL, HIGH);   // backlight ON immediately
-    Serial.println("[TFT] Backlight GPIO9 → OUTPUT HIGH");
+    // ── GPIO 9 = TFT_BL (backlight) — driven via LEDC PWM, not a plain digital
+    // pin, so setBacklight()/fadeBacklight() can actually dim the panel
+    // (screensaver burn-in protection) instead of only switching it on/off.
+#if defined(ESP_ARDUINO_VERSION) && ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+    ledcAttach(TFT_BL, BACKLIGHT_PWM_FREQ, BACKLIGHT_PWM_RES_BITS);
+    ledcWrite(TFT_BL, 255);
+#else
+    ledcSetup(BACKLIGHT_PWM_CHANNEL, BACKLIGHT_PWM_FREQ, BACKLIGHT_PWM_RES_BITS);
+    ledcAttachPin(TFT_BL, BACKLIGHT_PWM_CHANNEL);
+    ledcWrite(BACKLIGHT_PWM_CHANNEL, 255);
+#endif
+    Serial.println("[TFT] Backlight GPIO9 → PWM (ledc), full brightness");
 
     _tft = new TFT_eSPI();
     if (!_tft) {
@@ -153,11 +159,14 @@ uint8_t   TFTDisplayManager::getRotation()   { return _rotation; }
 int16_t   TFTDisplayManager::getWidth()  { return _tft ? (int16_t)_tft->width()  : SCREEN_WIDTH;  }
 int16_t   TFTDisplayManager::getHeight() { return _tft ? (int16_t)_tft->height() : SCREEN_HEIGHT; }
 
-// ── Backlight (GPIO 9 hardwired to 3V3 — no software control) ────────────────
+// ── Backlight (GPIO 9, LEDC PWM — full analog dimming, not just on/off) ──────
 void TFTDisplayManager::setBacklight(uint8_t brightness) {
     _currentBrightness = brightness;
-    // GPIO9 must have been set OUTPUT in init() — safe to call digitalWrite here.
-    digitalWrite(TFT_BL, brightness > 0 ? HIGH : LOW);
+#if defined(ESP_ARDUINO_VERSION) && ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+    ledcWrite(TFT_BL, brightness);
+#else
+    ledcWrite(BACKLIGHT_PWM_CHANNEL, brightness);
+#endif
 }
 void TFTDisplayManager::backlightOn()  { setBacklight(255); }
 void TFTDisplayManager::backlightOff() { setBacklight(0); }
