@@ -55,11 +55,17 @@ public:
     static String listAttendanceDates();
     static int    countTodayCheckIns();
     static int    countTodayCheckOuts();
+    // Drops the cached in-memory check-in/check-out counters so the next
+    // countTodayCheckIns()/countTodayCheckOuts() call re-scans the CSV from
+    // scratch and reprimes the cache. Call this on midnight rollover (new
+    // CSV file) and after any out-of-band edit to today's CSV that doesn't
+    // go through logAttendance()/removeAttendanceRow() (e.g. a restored
+    // backup file dropped onto the card).
+    static void   resetTodayCountCache();
 
     static bool saveEmployeeProfile(const String& empUid, const EmployeeProfile& emp);
     static bool loadEmployeeProfile(const String& empUid, EmployeeProfile& out);
     static bool hasEmployeeProfile(const String& empUid);
-
     static bool   savePhoto(const String& empUid, const uint8_t* data, size_t length);
     static bool   hasPhoto(const String& empUid);
     static String photoPath(const String& empUid);
@@ -82,6 +88,10 @@ public:
     static bool removeAttendanceRow(const String& empUid, const String& clockType);
     static bool   saveNfcMapping(const String& cardId, const String& empUid);
     static String loadUidForNfc(const String& cardId);
+    // Fallback for short/truncated NDEF reads: scans /employees for exactly
+    // ONE nfc_<prefix>*.json match. Returns "" (never guesses) on 0 or 2+
+    // matches so an ambiguous or unknown prefix always fails safe.
+    static String loadUidForNfcPrefix(const String& prefix);
 
     static uint64_t freeBytes();
     static void     printInfo();
@@ -105,9 +115,17 @@ public:
 private:
     static bool          _ready;
     static DateProviderFn _dateProvider;
+    // In-memory cache for countTodayCheckIns()/countTodayCheckOuts() — avoids
+    // re-scanning the whole day's CSV on every call (was measured at 50-200ms
+    // per scan, called from ~8 sites in main.cpp). -1 means "not primed yet
+    // this session", which forces one real scan on first use; after that,
+    // logAttendance()/removeAttendanceRow() keep these in sync incrementally
+    // so no further full scans happen until resetTodayCountCache() is called
+    // (midnight rollover) or the device reboots.
+    static int    _cachedIns;
+    static int    _cachedOuts;
     static bool   ensureDir(const char* path);
     static String todayFilename();
-    static int    countEventInCSV(const String& path, const String& eventType);
     static String csvEscape(const String& s);
 
     SDDatabase() = delete;

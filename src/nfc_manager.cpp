@@ -114,10 +114,20 @@ static String parseNTAG(Adafruit_PN532& reader) {
         }
 
         if (!gotAny) break;   // every attempt failed outright — nothing to use, stop here
-        // gotStable or not: pageData holds the most recent successful read —
-        // use it either way instead of aborting the whole card on a page
-        // that never reached consensus.
-        if (!gotStable) break;   // couldn't get a stable read for this page — stop here
+        // FIX: this used to `break` here whenever a page never reached
+        // consensus, which silently truncated the string at that exact page
+        // — the actual cause of the '2404141' / '240414128' / '24041412835'
+        // garbled-length reads (a good ID cut short, not a wrong ID). The
+        // comment above always said to use the last successful read instead
+        // of discarding the page; now the code actually does that. A page
+        // that never stabilized just carries slightly more risk of being
+        // wrong than a stable one — but a wrong string still fails the exact
+        // match against SD/server safely, whereas a truncated string was
+        // failing every single time by construction. Log it either way so a
+        // truncation from persistent RF noise is still visible in Serial.
+        if (!gotStable) {
+            Serial.printf("[NFC] Page %d: no stable read after retries — using last read\n", pg);
+        }
         memcpy(raw + rawLen, pageData, 4);
         rawLen += 4;
     }

@@ -48,6 +48,7 @@
 #include "attendance_http_service.h"
 #include "sd_database.h"
 #include "employee_sync.h"
+#include "sd_mutex.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -129,9 +130,37 @@
 #define PEAK_DEFER_MIN          10      // minutes of post-peak upload hold (reduced from 20)
 
 // ─── NFC scan-gate constants ─────────────────────────────────────────────────
-#define MIN_CARD_ID_LEN          8
+// Employee IDs on these tags are fixed-format numeric strings (e.g.
+// "2404141283567", 13 digits). MIN_CARD_ID_LEN=8 used to let obviously-
+// truncated reads like "240414128" (9 digits) or "24041412835" (11 digits)
+// through to a full SD lookup / HTTP auth call that was guaranteed to fail
+// (wrong string, safely denied) — costing a wasted round trip and forcing a
+// re-tap. Raised to 12 so a read has to be nearly complete before it's even
+// considered a candidate; combined with isAllDigits() below (rejects reads
+// with a glitched byte turning a digit into punctuation, e.g. the
+// '2400!41283567' case in nfc_manager.cpp), this filters out bad reads
+// locally in under a millisecond instead of round-tripping to find out.
+#define MIN_CARD_ID_LEN         12
+// Fallback threshold for a SHORT read (card left the RF field before the
+// full ID was captured — see nfc_manager.cpp / SDDatabase::loadUidForNfcPrefix).
+// A read this long or longer, but still short of MIN_CARD_ID_LEN, is allowed
+// to try a *local* prefix lookup against the cached employee list instead of
+// being rejected outright. loadUidForNfcPrefix() only ever returns a hit when
+// exactly one cached employee's ID starts with the read prefix, so this is
+// safe as long as MIN_PREFIX_LEN digits is actually enough to be unique
+// across your roster — verify with:
+//   cut -c1-6 id_numbers.txt | sort | uniq -c | sort -rn | head
+// and raise this value if any prefix at that length is shared by 2+ people.
+#define MIN_PREFIX_LEN           6
 #define SCAN_COOLDOWN_MS       3500    // same-card lockout
-#define CARD_CONFIRM_NEEDED      1
+// Raised 1 -> 2: with the poll cadence at NFC_POLL_INTERVAL_MS (30ms), this
+// costs ~30-60ms of extra wait on a card that's actually being held on the
+// reader (negligible to a person's tap), but means a single-poll glitch can
+// no longer be acted on immediately — the very next poll has to agree
+// first. This is a distinct safety net from the nfc_manager.cpp page-level
+// consensus check: that one guards against a bad single page transaction,
+// this one guards against a bad read of the whole tag (e.g. mid-lift-off).
+#define CARD_CONFIRM_NEEDED      2
 
 #define AP_SSID     "JJC_Attendance_Config"
 #define AP_PASSWORD "ilovejjcenggworks"
@@ -188,30 +217,47 @@ static String buildDateStr() {
     return "--- AWAITING SYNC ---";
 }
 
+// ── RUSH-MODE CONFIGURATION ───────────────────────────────────────────────────
+// Long employee lines form at the "major" clock-out taps — 2 of the 3
+// session outs from resolveClockType()'s SESSIONS (morning_out/noon,
+// afternoon_out/5pm) happen at a fixed, known time; evening_out is
+// overtime and has no fixed schedule, so it isn't listed here — add a
+// third { center, ... } row below if your site adopts a fixed OT cutoff.
+//
+// One table drives BOTH behaviors so the numbers can't drift apart:
+//   blockLeadMin — minutes before `center` background HTTP work (STEP-3
+//                  cache-miss server auth, idle-reconcile seed polling)
+//                  is shut off. isPeakHour() uses this.
+//   wakeLeadMin  — minutes before `center` the screen is FORCE-WOKEN (even
+//                  if nobody has tapped yet) and held awake, so the first
+//                  person in line finds an already-on reader instead of
+//                  spending their tap waking it from the screensaver.
+//                  Always <= blockLeadMin, so the wake window sits inside
+//                  the background-block window. isRushPrewakeActive() uses
+//                  this.
+//   tailMin      — minutes AFTER `center` both windows stay open, to catch
+//                  the tail of the line.
+struct RushWindow { uint16_t center; uint16_t blockLeadMin; uint16_t wakeLeadMin; uint16_t tailMin; };
+static const RushWindow RUSH_WINDOWS[] = {
+    { 12*60,  10, 5, 10 },   // noon out       — block 11:50, wake 11:55, end 12:10
+    { 17*60,  10, 5, 15 },   // afternoon out  — block 16:50, wake 16:55, end 17:15
+};
+
 // ── PEAK HOUR DETECTION ───────────────────────────────────────────────────────
 // Returns true if clock is currently inside a peak upload-defer window OR
-// within PEAK_DEFER_MIN minutes after one ended.
-//
-// Peak windows (device-local 24h):
-//   11:55–12:05 = noon out rush    (centred on 12:00)
-//   16:55–17:05 = afternoon out rush (centred on 17:00)
-//
-// Stores the minute at which the last peak window ended (peakEndMin) so that
-// the post-peak hold is counted in wall-clock minutes, not milliseconds.
+// within PEAK_DEFER_MIN minutes after one ended. Windows come from
+// RUSH_WINDOWS above (blockLeadMin/tailMin) — see that table's comment for
+// why the lead-in is as wide as it is.
 static uint16_t peakEndMin = 0xFFFF;  // 0xFFFF = no peak seen yet
 
 static bool isPeakHour() {
     uint16_t nowMin = (uint16_t)clkH * 60 + clkM;
 
-    // Define peak windows [startMin, endMin] inclusive
-    struct { uint16_t s, e; } windows[] = {
-        { 11*60+55, 12*60+ 5 },   // noon out    (centred on 12:00)
-        { 16*60+55, 17*60+ 5 },   // afternoon out (centred on 17:00)
-    };
-
-    for (auto& w : windows) {
-        if (nowMin >= w.s && nowMin <= w.e) {
-            peakEndMin = w.e;     // update so post-peak hold works
+    for (auto& w : RUSH_WINDOWS) {
+        uint16_t s = w.center - w.blockLeadMin;
+        uint16_t e = w.center + w.tailMin;
+        if (nowMin >= s && nowMin <= e) {
+            peakEndMin = e;     // update so post-peak hold works
             return true;
         }
     }
@@ -227,6 +273,23 @@ static bool isPeakHour() {
         }
     }
 
+    return false;
+}
+
+// isRushPrewakeActive — true from wakeLeadMin minutes before a major
+// clock-out through tailMin minutes after it. Always a subset of (or equal
+// to) isPeakHour()'s window for the same entry, since wakeLeadMin <=
+// blockLeadMin. Used by loop() to force-wake the screen ahead of the line
+// and to suspend the normal screen/screensaver timeout for the duration,
+// so the reader is already lit and ready for every tap in the rush instead
+// of the first person's tap having to wake it.
+static bool isRushPrewakeActive() {
+    uint16_t nowMin = (uint16_t)clkH * 60 + clkM;
+    for (auto& w : RUSH_WINDOWS) {
+        uint16_t s = w.center - w.wakeLeadMin;
+        uint16_t e = w.center + w.tailMin;
+        if (nowMin >= s && nowMin <= e) return true;
+    }
     return false;
 }
 
@@ -377,6 +440,20 @@ static bool   g_weeklyRefreshPending = false; // set on a Monday rollover; run o
 // process it the instant the display clears — zero idle gap between employees.
 static String        _nextPendingCard   = "";   // buffered while in NFC_PROFILE/ERROR
 
+// Employee IDs on these tags are pure numeric strings (see MIN_CARD_ID_LEN
+// comment above). A single flipped bit during a noisy RF read can turn a
+// digit into punctuation (the '2400!41283567' case in nfc_manager.cpp's
+// comments) without changing the length — so the length check alone
+// doesn't catch every bad read. This is a cheap O(n) scan, safe to run on
+// every poll.
+static bool isAllDigits(const String& s) {
+    if (s.length() == 0) return false;
+    for (unsigned int i = 0; i < s.length(); i++) {
+        if (!isDigit(s.charAt(i))) return false;
+    }
+    return true;
+}
+
 static bool cardConfirmed(const String& cardId) {
     if (cardId == _lastRawCard) {
         if (_cardConfirmCt < 255) _cardConfirmCt++;
@@ -518,15 +595,21 @@ static String resolveClockType(const String& empUid) {
 // ════════════════════════════════════════════════════════════════════════════
 #define PENDING_QUEUE_PATH "/attendance/pending_queue.json"
 
-// Sized to match MAX_PENDING (offline_sync.h) so the in-RAM/SD-mirrored
-// sync queue can't fall behind that limit and start silently dropping
-// records during a rush of taps (e.g. a busy clock-out window) while
-// uploads are paused by isPeakHour().
+// Sized generously so the in-RAM/SD-mirrored sync queue can absorb a rush
+// of taps (e.g. a busy clock-out window) without silently dropping records
+// while uploads are paused by isPeakHour().
 #define PENDING_QUEUE_CAP 200
+
+// Safety net: a record that fails this many times in a row (whether via
+// flushPending()'s single-record path or the bulk upload path) is
+// quarantined (dropped from the active queue + logged to
+// quarantined_records.log for manual review) instead of retried forever.
+// File-scope (not local to one function) so both paths share one cap.
+#define MAX_RETRIES_BEFORE_QUARANTINE 20
 
 struct PendingRecord {
     String empUid, nfcUid, clockType, timestamp, date;
-    int retryCount = 0;   // consecutive upload failures — see flushPending()'s quarantine cap
+    int retryCount = 0;   // consecutive upload failures — see MAX_RETRIES_BEFORE_QUARANTINE
 };
 static PendingRecord pendingQueue[PENDING_QUEUE_CAP];
 static int           pendingCount = 0;
@@ -536,6 +619,7 @@ static int           pendingCount = 0;
 // PENDING_QUEUE_CAP short records is still a small write — fine to do inline.
 static void savePendingQueueToSD() {
     if (!SDDatabase::isReady()) return;
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
 
     DynamicJsonDocument doc(PENDING_QUEUE_CAP * 160);
     JsonArray arr = doc.to<JsonArray>();
@@ -562,6 +646,7 @@ static void savePendingQueueToSD() {
 // whatever didn't make it to the server before the last shutdown/reboot.
 static void loadPendingQueueFromSD() {
     if (!SDDatabase::isReady()) return;
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
     if (!SD_MMC.exists(PENDING_QUEUE_PATH)) return;
 
     File f = SD_MMC.open(PENDING_QUEUE_PATH, FILE_READ);
@@ -657,17 +742,15 @@ static void flushPending() {
     int toSend = min(pendingCount, UPLOAD_BATCH_SIZE);
     Serial.printf("[Flush] Uploading %d/%d queued record(s)...\n", toSend, pendingCount);
 
-    // Safety net: a record that fails this many times in a row is quarantined
-    // (dropped from the active queue + logged to quarantined_records.log for
-    // manual review) instead of retried forever. Without this, ANY server
-    // response that recordAttendance() doesn't recognize as a permanent
-    // failure — not just the 409 case already handled — would sit at the
-    // head of the queue with UPLOAD_BATCH_SIZE=1, retried every ~200-350ms
-    // indefinitely, hammering the server and starving every other pending
-    // record behind it. 20 tries at the ~200ms loop cadence is well past
-    // "give the network a moment," so anything still failing after that is
-    // treated as needing a human, not another retry.
-    static const int MAX_RETRIES_BEFORE_QUARANTINE = 20;
+    // MAX_RETRIES_BEFORE_QUARANTINE (file scope, near PendingRecord above):
+    // without this, ANY server response that recordAttendance() doesn't
+    // recognize as a permanent failure — not just the 409 case already
+    // handled — would sit at the head of the queue with UPLOAD_BATCH_SIZE=1,
+    // retried every ~200-350ms indefinitely, hammering the server and
+    // starving every other pending record behind it. 20 tries at the
+    // ~200ms loop cadence is well past "give the network a moment," so
+    // anything still failing after that is treated as needing a human,
+    // not another retry.
 
     int remaining = 0;
     // static, not stack-local: at PENDING_QUEUE_CAP=200 * 5 Strings/record
@@ -690,6 +773,7 @@ static void flushPending() {
                                   pendingQueue[i].retryCount,
                                   pendingQueue[i].empUid.c_str(),
                                   pendingQueue[i].clockType.c_str());
+                    SDLockGuard _sdLock;   // see sd_mutex.h
                     File qf = SD_MMC.open("/logs/quarantined_records.log", FILE_APPEND);
                     if (qf) {
                         char nowStr[24];
@@ -784,6 +868,7 @@ static String getPhotoPath(const EmployeeProfile& emp) {
     if (!SDDatabase::isReady() || emp.uid.length() == 0) return "";
     if (SDDatabase::hasPhoto(emp.uid)) {
         String cand = SDDatabase::photoPath(emp.uid);
+        SDLockGuard _sdLock;   // see sd_mutex.h
         if (SD_MMC.exists(cand)) {
             File f = SD_MMC.open(cand, FILE_READ);
             if (f && f.size() >= 100) { f.close(); return cand; }
@@ -931,6 +1016,7 @@ static bool seedTodayAttendanceFromServer() {
 // ════════════════════════════════════════════════════════════════════════════
 static void purgeSyncedAttendanceDate(const String& dateToPurge) {
     if (dateToPurge.length() != 10) return;  // guard against a malformed/empty date
+    SDLockGuard _sdLock;   // see sd_mutex.h
 
     String csvPath  = "/attendance/" + dateToPurge + ".csv";
     String mapPath  = "/attendance/server_ids_" + dateToPurge + ".json";
@@ -959,6 +1045,7 @@ static void purgeSyncedAttendanceDate(const String& dateToPurge) {
 #define LAST_SEEN_DATE_PATH "/attendance/last_seen_date.txt"
 
 static void saveLastSeenDateToSD(const String& d) {
+    SDLockGuard _sdLock;   // see sd_mutex.h
     File f = SD_MMC.open(LAST_SEEN_DATE_PATH, FILE_WRITE);
     if (!f) return;
     f.print(d);
@@ -966,6 +1053,7 @@ static void saveLastSeenDateToSD(const String& d) {
 }
 
 static String loadLastSeenDateFromSD() {
+    SDLockGuard _sdLock;   // see sd_mutex.h
     if (!SD_MMC.exists(LAST_SEEN_DATE_PATH)) return "";
     File f = SD_MMC.open(LAST_SEEN_DATE_PATH, FILE_READ);
     if (!f) return "";
@@ -983,6 +1071,22 @@ static String loadLastSeenDateFromSD() {
 // would trigger it. This task moves it off Core 1, same pattern as
 // uploadWorkerTask. Skipped entirely during peak hour, matching every
 // other background job in this codebase (upload flush, photo sync, etc).
+// ── Cross-task network mutex ────────────────────────────────────────────────
+// Upload worker and seed worker are separate FreeRTOS tasks on Core 0, each
+// woken independently by its own binary semaphore — nothing previously
+// stopped both from being active at the same moment (e.g. a queued upload
+// firing right as a WiFi-reconnect reseed kicks off). Neither corrupts the
+// other's data (each uses its own local HTTPClient), but running two
+// heap-heavy, WiFi-heavy HTTP passes at once on an already memory-tight
+// device is exactly the kind of overlap we want to avoid. This mutex makes
+// them mutually exclusive: whichever wins the race runs to completion while
+// the other simply waits (blocked, not spin-polling) instead of proceeding
+// in parallel. NFC's own server-fallback call is intentionally NOT gated by
+// this — that path runs while a person is standing at the reader, and making
+// it wait behind a 5-10s seed pass would recreate the exact freezing this
+// whole task-based design was built to avoid.
+static SemaphoreHandle_t g_networkMutex = nullptr;
+
 static TaskHandle_t      g_seedTask    = nullptr;
 static SemaphoreHandle_t g_seedTrigger = nullptr;  // binary — signaled to request a seed run
 volatile bool            g_lastSeedOk  = true;      // read by the reconcile poller for backoff
@@ -997,7 +1101,13 @@ static void seedWorkerTask(void* /*param*/) {
                 continue;
             }
             g_seedRunning     = true;
+            // Wait for the upload worker to finish if it's mid-flush, then
+            // hold the mutex for the whole seed pass so upload can't start
+            // underneath us either. portMAX_DELAY here is safe — the upload
+            // worker always releases (it never blocks forever on its own).
+            if (g_networkMutex) xSemaphoreTake(g_networkMutex, portMAX_DELAY);
             g_lastSeedOk      = seedTodayAttendanceFromServer();
+            if (g_networkMutex) xSemaphoreGive(g_networkMutex);
             g_seedFinishedAtMs = millis();
             g_seedRunning     = false;
             // Stack headroom check — logs a warning if this task's worst-case
@@ -1119,20 +1229,140 @@ static char g_nfcCardBuf[64] = {0};
 static TaskHandle_t      g_uploadTask   = nullptr;
 static SemaphoreHandle_t g_uploadTrigger = nullptr;  // binary — loop() signals, task wakes
 
+// ── flushPendingBulk ─────────────────────────────────────────────────────────
+// Sends the ENTIRE pending queue in ONE HTTP POST via
+// AttendanceHTTPService::postBulkAttendance(), instead of flushPending()'s
+// one-record-per-call loop. Cuts N HTTP round trips (TLS handshake + headers
+// each) down to 1 — the win that matters most on a slow/high-latency link,
+// where per-record overhead dominates actual upload time.
+//
+// Server-side this batch is delegated to the existing syncAttendanceRecords()
+// (see bulk-record-endpoint.php), so it also gets that function's existing
+// duplicate handling and post-commit email notifications for free — nothing
+// extra needed here for either.
+//
+// Same retry/quarantine contract as flushPending(): a record only leaves
+// pendingQueue[] when it does NOT show up in the response's errors[] list
+// (i.e. it was either inserted or recognized as a duplicate — either way
+// the server already has it, so retrying is pointless, same reasoning as
+// recordAttendance()'s 409 handling). Anything listed in errors[] stays
+// queued and its retryCount increments, hitting MAX_RETRIES_BEFORE_QUARANTINE
+// the same as the single-record path.
+static void flushPendingBulk() {
+    if (!wifiConfig.isConnected() || pendingCount == 0) return;
+    if (isPeakHour()) {
+        Serial.printf("[Bulk] PEAK HOUR — deferring upload (%d queued)\n", pendingCount);
+        return;
+    }
+
+    Serial.printf("[Bulk] Uploading %d queued record(s) in one request...\n", pendingCount);
+
+    DynamicJsonDocument doc(pendingCount * 200 + 256);
+    doc["device_id"] = deviceId;
+    JsonArray arr = doc.createNestedArray("records");
+    for (int i = 0; i < pendingCount; i++) {
+        JsonObject o = arr.createNestedObject();
+        o["employee_uid"] = pendingQueue[i].empUid;
+        o["nfc_uid"]      = pendingQueue[i].nfcUid;
+        o["clock_type"]   = pendingQueue[i].clockType;
+        o["clock_time"]   = pendingQueue[i].timestamp;
+        o["date"]         = pendingQueue[i].date;
+    }
+    String payload;
+    serializeJson(doc, payload);
+
+    DynamicJsonDocument resp(pendingCount * 150 + 512);
+    bool ok = attService.postBulkAttendance(payload, resp);
+
+    if (!ok) {
+        // Whole batch failed (network drop mid-request, server error, etc.)
+        // — nothing confirmed, so leave the queue exactly as-is for the next
+        // trigger. No blanket retryCount bump here: a transport-level failure
+        // isn't any one record's fault, so it shouldn't count against them
+        // individually the way a per-record server rejection does below.
+        Serial.println("[Bulk] Upload failed — queue unchanged, will retry next trigger");
+        return;
+    }
+
+    // Server delegates this whole batch to syncAttendanceRecords() (see
+    // bulk-record-endpoint.php), so the response shape is THAT function's:
+    //   { processed_count, duplicate_count, error_count, errors: [{index,...}] }
+    // — not a per-record status list. Only failures are individually
+    // indexed; anything NOT in errors[] was either inserted OR recognized
+    // as a duplicate, and either way the server already has it, so it's
+    // safe to drop from the local queue (duplicate == pointless to retry,
+    // same reasoning as recordAttendance()'s 409 handling elsewhere).
+    //
+    // static, not stack-local — same reasoning as flushPending()'s `keep[]`:
+    // at PENDING_QUEUE_CAP=200 * 5 Strings/record this is too big for the
+    // uploadWorker task's 12KB stack, and this function only ever runs on
+    // that one task, so a static buffer is safe to reuse.
+    static PendingRecord keep[PENDING_QUEUE_CAP];
+    static bool          failedIdx[PENDING_QUEUE_CAP];
+    for (int i = 0; i < pendingCount; i++) failedIdx[i] = false;
+
+    if (resp.containsKey("errors") && !resp["errors"].isNull()) {
+        for (JsonObject e : resp["errors"].as<JsonArray>()) {
+            int idx = e["index"] | -1;
+            if (idx >= 0 && idx < pendingCount) failedIdx[idx] = true;
+        }
+    }
+
+    int kept = 0, resolved = 0, quarantined = 0;
+    for (int i = 0; i < pendingCount; i++) {
+        if (!failedIdx[i]) { resolved++; continue; }   // inserted or duplicate — drop
+
+        // Failed — keep it, bump retryCount, same cap as flushPending()
+        pendingQueue[i].retryCount++;
+        if (pendingQueue[i].retryCount >= MAX_RETRIES_BEFORE_QUARANTINE) {
+            quarantined++;
+            Serial.printf("[Bulk] ⚠ QUARANTINED after %d failed attempts: %s %s\n",
+                          pendingQueue[i].retryCount,
+                          pendingQueue[i].empUid.c_str(),
+                          pendingQueue[i].clockType.c_str());
+            SDLockGuard _sdLock;   // see sd_mutex.h
+            File qf = SD_MMC.open("/logs/quarantined_records.log", FILE_APPEND);
+            if (qf) {
+                char nowStr[24];
+                snprintf(nowStr, sizeof(nowStr), "%s %02d:%02d:%02d",
+                         dateStr().c_str(), clkH, clkM, clkS);
+                qf.printf("[%s] empUid=%s clockType=%s timestamp=%s date=%s retries=%d\n",
+                          nowStr, pendingQueue[i].empUid.c_str(),
+                          pendingQueue[i].clockType.c_str(),
+                          pendingQueue[i].timestamp.c_str(),
+                          pendingQueue[i].date.c_str(),
+                          pendingQueue[i].retryCount);
+                qf.close();
+            }
+            continue;   // dropped, not kept
+        }
+        keep[kept++] = pendingQueue[i];
+    }
+
+    for (int i = 0; i < kept; i++) pendingQueue[i] = keep[i];
+    pendingCount = kept;
+    savePendingQueueToSD();
+
+    Serial.printf("[Bulk] Done: %d resolved (inserted/duplicate), %d quarantined, %d remain\n",
+                  resolved, quarantined, pendingCount);
+}
+
 static void uploadWorkerTask(void* /*param*/) {
     for (;;) {
         // Wait for loop() to signal that an upload is needed
         if (xSemaphoreTake(g_uploadTrigger, portMAX_DELAY) == pdTRUE) {
-            // Drain the ENTIRE queue, not just one record.
-            // UPLOAD_BATCH_SIZE = 1 means flushPending() sends one record per
-            // call, so we loop here until all pending records are uploaded.
-            // This is critical when screen-off fires with multiple queued scans
-            // (e.g. morning_in + morning_out) — the binary semaphore would
-            // otherwise only wake us once and leave the 2nd record stranded.
-            while (wifiConfig.isConnected() && pendingCount > 0 && !isPeakHour()) {
-                flushPending();
-                if (pendingCount > 0) delay(200);  // brief pause between HTTP calls
+            // One bulk POST drains the whole queue in a single request — see
+            // flushPendingBulk() above. Replaces the old one-record-per-call
+            // loop (flushPending() is still available/used elsewhere as a
+            // single-record fallback, just no longer the hot path here).
+            // Wait for the seed worker to finish if it's mid-pass, then hold
+            // the mutex for the whole drain so seed can't start underneath us
+            // either — see g_networkMutex comment above uploadWorkerTask.
+            if (g_networkMutex) xSemaphoreTake(g_networkMutex, portMAX_DELAY);
+            if (wifiConfig.isConnected() && pendingCount > 0 && !isPeakHour()) {
+                flushPendingBulk();
             }
+            if (g_networkMutex) xSemaphoreGive(g_networkMutex);
             UBaseType_t hwm = uxTaskGetStackHighWaterMark(nullptr);
             if (hwm < 512) {
                 Serial.printf("[Upload] ⚠ low stack headroom: %u bytes free (task stack may be too small)\n",
@@ -1188,6 +1418,22 @@ static void nfcWorkerBody(const String& cardIdentifier) {
     if (empUid.length() == 0 && SDDatabase::hasEmployeeProfile(cardIdentifier))
         empUid = cardIdentifier;
 
+    // STEP 1b: Short-read fallback. cardIdentifier can be a truncated ID
+    // (card left the RF field mid-read — see nfc_manager.cpp) when it's
+    // shorter than MIN_CARD_ID_LEN but still passed isAllDigits() and
+    // MIN_PREFIX_LEN in the NFC poll gate. Only try this if the exact
+    // lookup above missed; loadUidForNfcPrefix() itself refuses to guess
+    // (returns "" unless exactly one cached employee matches the prefix),
+    // so this never risks clocking in the wrong person — it only rescues
+    // reads that are unambiguous against what's already cached on SD.
+    if (empUid.length() == 0 && cardIdentifier.length() < MIN_CARD_ID_LEN) {
+        empUid = SDDatabase::loadUidForNfcPrefix(cardIdentifier);
+        if (empUid.length() > 0) {
+            Serial.println("[NFC] Short read '" + cardIdentifier +
+                            "' accepted via unique prefix match → uid=" + empUid);
+        }
+    }
+
     // ── STEP 2: Load from SD ──────────────────────────────────────────────
     if (empUid.length() > 0 && SDDatabase::hasEmployeeProfile(empUid)) {
         if (SDDatabase::loadEmployeeProfile(empUid, emp)) {
@@ -1199,6 +1445,20 @@ static void nfcWorkerBody(const String& cardIdentifier) {
 
     // ── STEP 3: Server fallback (only if SD miss, WiFi up, not peak) ──────
     if (!fromCache) {
+        // A short read (< MIN_CARD_ID_LEN) that didn't uniquely match a
+        // cached employee in STEP 1b has no full ID to send — the server
+        // compares against the full id_number, so a truncated string is a
+        // guaranteed-fail round trip (this is exactly what MIN_CARD_ID_LEN
+        // was raised to avoid). Fail locally instead and let the person
+        // re-tap; this only affects employees not yet cached on this
+        // device (e.g. their very first scan here).
+        if (cardIdentifier.length() < MIN_CARD_ID_LEN) {
+            Serial.println("[NFC] Short read '" + cardIdentifier +
+                            "' — no unique local match, refusing server round trip");
+            empDisplay->showError("Read failed\nTap again");
+            enterState(STATE_NFC_ERROR);
+            return;
+        }
         if (!wifiConfig.isConnected()) {
             empDisplay->showError("Unknown Card\n(Offline)");
             enterState(STATE_NFC_ERROR);
@@ -1366,7 +1626,16 @@ size_t getArduinoLoopTaskStackSize(void) {
 // one is as tight as possible. Target: ready for NFC taps within 4 seconds.
 void setup() {
     Serial.begin(115200);
-    delay(100);   // minimal: just enough for USB CDC to settle
+    // Wait for the host to actually attach to the USB-CDC port (up to 3s),
+    // instead of a fixed 100ms — on ESP32-S3 native USB, 100ms often isn't
+    // enough for the monitor to reopen the port after enumeration, so the
+    // earliest Serial.println() calls in setup() were getting dropped
+    // before anything was listening. If nothing ever attaches (e.g. no
+    // monitor open, running on battery), this still falls through after
+    // 3s so boot isn't blocked forever.
+    uint32_t _serialWaitStart = millis();
+    while (!Serial && millis() - _serialWaitStart < 3000) delay(10);
+    delay(200); // small settle margin after the host connects
 
     SDLogger::beginSerial();
     SDLogger::flushEarlyBuffer();
@@ -1389,6 +1658,11 @@ void setup() {
     empDisplay = new EmployeeProfileDisplay();
 
     // ── 2. SD Card ────────────────────────────────────────────────────────
+    // Must exist before SDDatabase::begin() and before any worker task
+    // (nfc/upload/seed) is created — all three touch the SD card and were
+    // previously unsynchronized, which is the root cause of the long-idle
+    // NFC freeze. See sd_mutex.h for details.
+    sdMutexInit();
     showLoadingAnimation(20, "SD...");
     if (SDDatabase::begin()) {
         Serial.println("[Boot] SD OK");
@@ -1447,6 +1721,10 @@ void setup() {
     // from the portal (an NFC tap, the normal 5-min idle timeout, etc.).
     g_isScreenOff = []() { return screenIsOff; };
 
+    // Lets the Dashboard's "Pending Sync" stat tile report the real
+    // not-yet-uploaded queue depth via /api/status.
+    g_getPendingCount = []() { return pendingCount; };
+
     // ── 6. Ready — draw dashboard immediately, THEN sync in background ────
     showLoadingAnimation(100, "READY!");
     delay(200);   // brief flash of READY before dashboard
@@ -1460,6 +1738,45 @@ void setup() {
     enterState(STATE_DASHBOARD);
     lastActivityMs = millis();        // start screen timeout countdown from boot
     wasConnectedGlobal = wifiConfig.isConnected();  // sync state so loop() never fires a false reconnect event
+
+    // Created once, before the upload/seed workers exist, so it's always
+    // ready by the time either task's first trigger can fire.
+    g_networkMutex = xSemaphoreCreateMutex();
+
+    // ── 6b. Seed worker task (Core 0) — started BEFORE triggerInitialSync() ──
+    // Runs seedTodayAttendanceFromServer() (2-3 paginated HTTP calls, 5-10s)
+    // off Core 1 so a WiFi-reconnect mid-rush or a portal "Reseed Today"
+    // click never freezes NFC polling. loop() signals via g_seedTrigger.
+    //
+    // FIX (crash-on-boot / reboot loop): this task must exist BEFORE the
+    // very first triggerInitialSync() call below. requestSeedToday() falls
+    // back to calling seedTodayAttendanceFromServer() synchronously, on
+    // Core 1, inside setup(), whenever g_seedTrigger/g_seedTask don't exist
+    // yet. That synchronous HTTPS call was hitting lwIP's TCPIP core too
+    // early in boot (before it's ready to service a call made outside its
+    // own locked task context), causing:
+    //   assert failed: udp_new_ip_type ... "Required to lock TCPIP core
+    //   functionality!"
+    // which panics and reboots, then crashes again at the same spot on the
+    // next boot — a fast, silent-looking crash loop. Creating the seed
+    // worker task first means the boot-time seed request goes through the
+    // normal async/queued path (deferred to Core 0, after the system has
+    // fully settled) instead of running synchronously inside setup().
+    g_seedTrigger = xSemaphoreCreateBinary();
+    xTaskCreatePinnedToCore(
+        seedWorkerTask,    // task function
+        "seedWorker",      // name
+        // This task does the heaviest work of the three — paginated HTTP +
+        // AES decrypt of ~40KB+ JSON payloads (see [AES] PASS 1 in the boot
+        // log) — so it gets the most headroom (see nfcWorker note below).
+        16384,             // stack — enough for HTTP + JSON
+        nullptr,           // parameter
+        1,                 // priority (same as uploadWorker)
+        &g_seedTask,       // handle
+        0                  // Core 0 — keeps HTTP off Core 1
+    );
+    Serial.println("[Ready] Seed worker task started on Core 0");
+
     if (wifiConfig.isConnected()) {
         triggerInitialSync();
         updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
@@ -1505,24 +1822,10 @@ void setup() {
     );
     Serial.println("[Ready] Upload worker task started on Core 0");
 
-    // ── 9. Seed worker task (Core 0) ──────────────────────────────────────────
-    // Runs seedTodayAttendanceFromServer() (2-3 paginated HTTP calls, 5-10s)
-    // off Core 1 so a WiFi-reconnect mid-rush or a portal "Reseed Today"
-    // click never freezes NFC polling. loop() signals via g_seedTrigger.
-    g_seedTrigger = xSemaphoreCreateBinary();
-    xTaskCreatePinnedToCore(
-        seedWorkerTask,    // task function
-        "seedWorker",      // name
-        // This task does the heaviest work of the three — paginated HTTP +
-        // AES decrypt of ~40KB+ JSON payloads (see [AES] PASS 1 in the boot
-        // log) — so it gets the most headroom (see nfcWorker note above).
-        16384,             // stack — enough for HTTP + JSON
-        nullptr,           // parameter
-        1,                 // priority (same as uploadWorker)
-        &g_seedTask,       // handle
-        0                  // Core 0 — keeps HTTP off Core 1
-    );
-    Serial.println("[Ready] Seed worker task started on Core 0");
+    // ── 9. Seed worker task ──────────────────────────────────────────────────
+    // (moved earlier — see "Seed worker task (Core 0) — started BEFORE
+    // triggerInitialSync()" above step 6b — so it exists before the
+    // boot-time triggerInitialSync() call that needs it.)
 
     Serial.println("[Ready] NFC scanning active");
     Serial.printf("[Ready] Portal: http://%s:8080\n",
@@ -1539,6 +1842,7 @@ void loop() {
     static unsigned long lastWifiRetry   = 0;
     static unsigned long lastUploadFlush = 0;
     static unsigned long lastSocketPoll  = 0;
+    static unsigned long lastApScheduleCheck = 0;
     static unsigned long reconcilePollRateMs = RECONCILE_POLL_BASE_MS;
     static int            reconcileErrorCount = 0;
     static uint8_t       tick            = 0;
@@ -1546,6 +1850,37 @@ void loop() {
 
     wifiConfig.handleClient();
     wifiManager.handleClient();
+
+    // ── Setup hotspot (softAP) schedule — same 08:00-17:00 admin window as
+    // the idle reconcile burst just below (isAdminWorkingHours()), reused
+    // rather than a separate window: it's the same underlying reason ("no
+    // admin around to need either one"), so one schedule covers both instead
+    // of maintaining two near-identical windows. Does NOT affect uploads —
+    // the immediate background-upload trigger on screen-off (further down)
+    // and the background upload scheduler both stay on their own always-on
+    // schedule, since an employee can clock in well after 17:00 and that
+    // record still needs to reach the server promptly. Only the idle
+    // reconcile polling and this hotspot get throttled outside admin hours.
+    // The STA connection to the office network (what the portal is actually
+    // browsed over — see 192.168.1.72 in the screenshots) is untouched
+    // either way; this only toggles the device's own setup AP. Checked once
+    // a minute rather than every loop() — startAP()/stopAP() already no-op
+    // if already in the desired state, but there's no reason to even make
+    // that check thousands of times a second.
+    if (now - lastApScheduleCheck >= 60000) {
+        lastApScheduleCheck = now;
+        // clkEpoch == 0 means the clock hasn't synced yet (no STA connection
+        // yet, or NTP hasn't landed) — clkH/clkM would still read 00:00 in
+        // that state, which would read as "outside admin hours" and shut the
+        // one hotspot someone needs to initially configure the device over.
+        // Leave the AP alone until we have a real clock to judge by.
+        bool shouldBeOn = (clkEpoch == 0) || isAdminWorkingHours();
+        if (shouldBeOn && !wifiConfig.isAPActive()) {
+            wifiConfig.startAP();
+        } else if (!shouldBeOn && wifiConfig.isAPActive()) {
+            wifiConfig.stopAP();
+        }
+    }
 
     // ── Portal-triggered wake/sleep ─────────────────────────────────────────
     // Set by the Actions tab's "Wake Screen" / "Sleep Screen" buttons
@@ -1579,9 +1914,52 @@ void loop() {
     // subtraction below always non-negative.
     now = millis();
 
+    // ── Rush-mode edge detection (major clock-out lines) ────────────────────
+    // See RUSH_WINDOWS above. On the rising edge we force-wake the screen
+    // ahead of the line and hold it awake for the whole window (screen
+    // timeout is gated below). On the falling edge we run the deferred
+    // background work that was intentionally skipped during the rush —
+    // flush the pending upload queue, refresh the server-side cache via
+    // requestSeedToday(), and reset idle-poll state — in that order, one
+    // step at a time, rather than letting several tasks all wake up and
+    // fire at once right as the line clears.
+    static bool wasRushPrewakeActive = false;
+    bool rushPrewakeNow = isRushPrewakeActive();
+    if (rushPrewakeNow && !wasRushPrewakeActive) {
+        Serial.println("[Rush] Entering rush window — waking screen, holding it awake");
+        if (screenIsOff) wakeScreen();
+        else lastActivityMs = now;   // hold it awake even if already on
+    }
+    if (!rushPrewakeNow && wasRushPrewakeActive) {
+        Serial.println("[Rush] Rush window ended — running deferred maintenance");
+        // STEP 1: flush anything that piled up in the pending upload queue
+        // while background uploads were paused by isPeakHour().
+        if (wifiConfig.isConnected() && pendingCount > 0 && !isPeakHour()) {
+            lastUploadFlush = now;
+            if (g_uploadTrigger) xSemaphoreGive(g_uploadTrigger);
+        }
+        // STEP 2: refresh the server-side cache (SD mirror) now that the
+        // rush's own writes have landed. uploadWorkerTask/seedWorkerTask
+        // share g_networkMutex, so this naturally waits its turn behind
+        // STEP 1's flush instead of racing it.
+        if (wifiConfig.isConnected() && !isPeakHour()) {
+            requestSeedToday();
+        }
+        // STEP 3: fresh idle-poll state so background reconcile polling
+        // resumes cleanly (a full burst of IDLE_RECONCILE_BURST_COUNT)
+        // once the screen naturally times out again, rather than resuming
+        // mid-burst from before the rush started.
+        g_idlePollCount  = 0;
+        g_idleResting    = false;
+        g_lastIdlePollMs = now;
+        lastActivityMs   = now;   // let the normal timeout start fresh from here
+    }
+    wasRushPrewakeActive = rushPrewakeNow;
+
     // ── Screen timeout ────────────────────────────────────────────────────
     if (!screenIsOff &&
         currentState == STATE_DASHBOARD &&
+        !rushPrewakeNow &&
         (now - lastActivityMs >= SCREEN_TIMEOUT_MS)) {
         screenIsOff = true;
         // Backlight stays ON: on this board TFT_BL only gates the LED, the
@@ -1745,6 +2123,13 @@ void loop() {
                 g_cleanupPendingDate = g_lastSeenDate;  // yesterday — purge once fully synced
                 g_lastSeenDate = todayStr;
                 saveLastSeenDateToSD(todayStr);
+                // New day = new CSV file (todayFilename() rolls over with
+                // dateStr()). The cached check-in/check-out counters were
+                // counting rows in yesterday's file, so they'd silently
+                // report yesterday's numbers against today's (empty) file
+                // otherwise — drop them so the next dashboard stat pull does
+                // one fresh scan of the new file and reprimes correctly.
+                SDDatabase::resetTodayCountCache();
 
                 time_t t = (time_t)clkEpoch;
                 struct tm* tmNow = gmtime(&t);
@@ -1816,7 +2201,21 @@ void loop() {
         g_triggerPhotoSync = false;
         if (isConnected && currentState == STATE_DASHBOARD) {
             Serial.println("[Action] Manual photo sync triggered");
-            // Walk /employees/*.json and download any missing photo
+            // KNOWN REMAINING ISSUE: unlike seed/upload, this still runs
+            // directly in loop() on Core 1 — it blocks NFC polling and the
+            // clock for the whole walk + every HTTP photo download. It's
+            // manually triggered only (not part of the idle/reconcile path
+            // that causes the long-idle freeze), so it's lower priority, but
+            // it should eventually move to its own worker task the same way
+            // seedWorkerTask/uploadWorkerTask were split out. Left as-is for
+            // this pass — flagging so it isn't mistaken for already fixed.
+            SDLockGuard _sdLock;   // guards the directory walk itself; see sd_mutex.h.
+            // NOTE: this lock is held across the HTTP downloads below too,
+            // since the directory File handle (root/f) must stay open across
+            // them — an intentional trade-off for now: a manual photo sync
+            // is rare/admin-initiated, whereas the seed pass we fixed earlier
+            // runs automatically and repeatedly during idle, which is what
+            // actually causes the reported freeze.
             File root = SD_MMC.open("/employees");
             if (root) {
                 File f = root.openNextFile();
@@ -2078,7 +2477,21 @@ void loop() {
             nfcProcessCard(uid, uidLen);
 
             String cardId;
-            if (nfcData.length() >= MIN_CARD_ID_LEN) {
+            // Added isAllDigits(): a garbled read that's still >= MIN_CARD_ID_LEN
+            // long (e.g. '2400!41283567' — right length, one glitched byte) used
+            // to sail through this check and go all the way to a doomed SD/server
+            // lookup. Catching it here means that round trip never happens —
+            // the very next poll (30ms later) usually reads the same still-
+            // present card cleanly instead.
+            //
+            // Reads between MIN_PREFIX_LEN and MIN_CARD_ID_LEN are also let
+            // through now: these are the truncated-by-early-liftoff reads
+            // (see nfc_manager.cpp) rather than mid-string glitches, since a
+            // dropped RF field cuts the tag END, not the middle. STEP 1b in
+            // nfcWorkerBody() only accepts one of these if it uniquely
+            // matches a single cached employee's ID prefix — anything
+            // ambiguous or unknown still fails safe and prompts a re-tap.
+            if (nfcData.length() >= MIN_PREFIX_LEN && isAllDigits(nfcData)) {
                 cardId = nfcData;
             } else {
                 // Card is physically present (PN532 saw it) but the NDEF

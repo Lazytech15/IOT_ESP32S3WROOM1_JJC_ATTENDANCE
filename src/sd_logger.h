@@ -38,6 +38,7 @@
 #include <SD.h>
 #include <esp_system.h>   // esp_register_shutdown_handler
 #include <time.h>         // wall-clock timestamp for crash logs
+#include "sd_mutex.h"
 
 class SDLogger {
 public:
@@ -229,6 +230,11 @@ public:
         if (!_sdReady) return;
         if (suspended) return;
 
+        // Locked: this fires ~60x per employee during a seed/reconcile pass
+        // (see comment above) — without a lock this was the single biggest
+        // source of SD_MMC contention with an in-flight NFC tap, even more
+        // than the seed snapshot file itself. See sd_mutex.h.
+        SDLockGuard _sdLock;
         String path = _logPath();
         _rotateIfNeeded(path);
 
@@ -251,6 +257,7 @@ public:
     // programmatically like the main log.
     static void _writePriorityError(const String& line) {
         if (!_sdReady) return;
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         _ensureDir();
 
         const char* path = "/logs/priority_errors.log";
@@ -426,6 +433,7 @@ public:
     // ── readLog ───────────────────────────────────────────────────────────────
     static String readLog(int dayOffset = 0) {
         if (!_sdReady) return "";
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         String path = _logPath(dayOffset);
         if (!SD_MMC.exists(path)) return "(no log for this day)";
         File f = SD_MMC.open(path, FILE_READ);
@@ -442,6 +450,7 @@ public:
     // ── readCrashLog ──────────────────────────────────────────────────────────
     static String readCrashLog() {
         if (!_sdReady) return "";
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         if (!SD_MMC.exists("/logs/last_crash.log")) return "(no crash log)";
         File f = SD_MMC.open("/logs/last_crash.log", FILE_READ);
         if (!f) return "(open failed)";
@@ -457,6 +466,7 @@ public:
     // ── listLogFiles ─────────────────────────────────────────────────────────
     static String listLogFiles() {
         if (!_sdReady) return "";
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         if (!SD_MMC.exists("/logs")) return "";
         File dir = SD_MMC.open("/logs");
         if (!dir) return "";

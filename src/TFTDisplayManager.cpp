@@ -112,9 +112,27 @@ bool TFTDisplayManager::init(uint8_t rotation, bool /*invertColors — unused*/)
 
     Serial.println("[TFT] init() start");
 
-    // ── GPIO 9 = TFT_BL (backlight) — driven via LEDC PWM, not a plain digital
-    // pin, so setBacklight()/fadeBacklight() can actually dim the panel
-    // (screensaver burn-in protection) instead of only switching it on/off.
+    _tft = new TFT_eSPI();
+    if (!_tft) {
+        Serial.println("[TFT] ERROR: new TFT_eSPI() returned null!");
+        return false;
+    }
+
+    // NOTE: TFT_eSPI's own init() (because TFT_BL/TFT_BACKLIGHT_ON are
+    // defined in platformio.ini) does pinMode(TFT_BL, OUTPUT) +
+    // digitalWrite(TFT_BL, HIGH) internally to switch the backlight on.
+    // We let that run first, THEN attach LEDC afterwards — attaching LEDC
+    // before tft.init() caused TFT_eSPI's digitalWrite to fight over
+    // GPIO9 with the LEDC peripheral (the "IO 9 is not set as GPIO" error),
+    // and left GPIO9 stuck as a plain HIGH pin so setBacklight()/
+    // fadeBacklight() had no real effect afterwards (no dimming).
+    _tft->init();
+    Serial.println("[TFT] tft.init() done");
+
+    // ── GPIO 9 = TFT_BL (backlight) — (re)claimed for LEDC PWM here, AFTER
+    // tft.init() has finished touching the pin, so setBacklight()/
+    // fadeBacklight() can actually dim the panel instead of only
+    // switching it on/off.
 #if defined(ESP_ARDUINO_VERSION) && ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
     ledcAttach(TFT_BL, BACKLIGHT_PWM_FREQ, BACKLIGHT_PWM_RES_BITS);
     ledcWrite(TFT_BL, 255);
@@ -124,15 +142,6 @@ bool TFTDisplayManager::init(uint8_t rotation, bool /*invertColors — unused*/)
     ledcWrite(BACKLIGHT_PWM_CHANNEL, 255);
 #endif
     Serial.println("[TFT] Backlight GPIO9 → PWM (ledc), full brightness");
-
-    _tft = new TFT_eSPI();
-    if (!_tft) {
-        Serial.println("[TFT] ERROR: new TFT_eSPI() returned null!");
-        return false;
-    }
-
-    _tft->init();
-    Serial.println("[TFT] tft.init() done");
 
     _tft->invertDisplay(false);
     _tft->setRotation(rotation);

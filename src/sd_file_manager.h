@@ -20,6 +20,7 @@
 #include <SPI.h>
 #include <SD.h>
 #include "sd_logger.h"
+#include "sd_mutex.h"
 
 // ── FileInfo ──────────────────────────────────────────────────────────────────
 struct FileInfo {
@@ -36,6 +37,7 @@ public:
     // ── deleteFile ────────────────────────────────────────────────────────────
     // Remove a single file. Returns true if the file is gone afterwards.
     static bool deleteFile(const String& path) {
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         SDLogger::log("FMGR", SDLogger::INFO,
                       "deleteFile: " + path);
 
@@ -69,6 +71,7 @@ public:
     // ── deleteDir ─────────────────────────────────────────────────────────────
     // Recursively delete a directory and all its contents.
     static bool deleteDir(const String& path) {
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         SDLogger::log("FMGR", SDLogger::INFO,
                       "deleteDir: " + path);
 
@@ -96,6 +99,7 @@ public:
     // Rename (or move within same filesystem — same as move but explicit).
     // SD_MMC.rename() works across directories as long as it's the same card.
     static bool renameFile(const String& fromPath, const String& toPath) {
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         SDLogger::logf("FMGR", SDLogger::INFO,
                        "renameFile: '%s' -> '%s'",
                        fromPath.c_str(), toPath.c_str());
@@ -127,6 +131,7 @@ public:
     // Copy a file byte-for-byte. Source is unchanged.
     // Copies in 4 KB chunks to keep WDT happy on large files.
     static bool copyFile(const String& srcPath, const String& dstPath) {
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         SDLogger::logf("FMGR", SDLogger::INFO,
                        "copyFile: '%s' -> '%s'",
                        srcPath.c_str(), dstPath.c_str());
@@ -202,6 +207,7 @@ public:
     // ── moveFile ──────────────────────────────────────────────────────────────
     // Move = rename (atomic on FAT32) with a copy+delete fallback.
     static bool moveFile(const String& srcPath, const String& dstPath) {
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         SDLogger::logf("FMGR", SDLogger::INFO,
                        "moveFile: '%s' -> '%s'",
                        srcPath.c_str(), dstPath.c_str());
@@ -238,6 +244,7 @@ public:
     // ── ensureDir (public) ────────────────────────────────────────────────────
     // Create a directory (and any missing parents).
     static bool ensureDir(const String& path) {
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         return _ensureDir(path);
     }
 
@@ -246,6 +253,7 @@ public:
     // Returns total number of entries found (may exceed maxEntries).
     static int listDir(const String& path,
                        FileInfo* results, int maxEntries) {
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         if (!SD_MMC.exists(path)) return 0;
         File dir = SD_MMC.open(path);
         if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return 0; }
@@ -271,6 +279,7 @@ public:
     // ── listDirJson ───────────────────────────────────────────────────────────
     // Return directory listing as a JSON string (for web portal API).
     static String listDirJson(const String& path) {
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         if (!SD_MMC.exists(path)) return "{\"error\":\"path not found\"}";
         File dir = SD_MMC.open(path);
         if (!dir || !dir.isDirectory()) {
@@ -305,11 +314,13 @@ public:
 
     // ── fileExists ────────────────────────────────────────────────────────────
     static bool fileExists(const String& path) {
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         return SD_MMC.exists(path);
     }
 
     // ── fileSize ──────────────────────────────────────────────────────────────
     static size_t fileSize(const String& path) {
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         if (!SD_MMC.exists(path)) return 0;
         File f = SD_MMC.open(path, FILE_READ);
         if (!f) return 0;
@@ -321,6 +332,7 @@ public:
     // ── readTextFile ──────────────────────────────────────────────────────────
     // Read entire text file into a String (max 64 KB).
     static String readTextFile(const String& path) {
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         if (!SD_MMC.exists(path)) return "";
         File f = SD_MMC.open(path, FILE_READ);
         if (!f) return "";
@@ -334,6 +346,7 @@ public:
     // ── writeTextFile ─────────────────────────────────────────────────────────
     // Overwrite (or create) a text file with the given content.
     static bool writeTextFile(const String& path, const String& content) {
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         String dir = _parentDir(path);
         if (dir.length() > 1) _ensureDir(dir);
         if (SD_MMC.exists(path)) SD_MMC.remove(path);
@@ -354,6 +367,7 @@ public:
 private:
     // ── _ensureDir ────────────────────────────────────────────────────────────
     static bool _ensureDir(const String& path) {
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         if (path.length() <= 1) return true;
         if (SD_MMC.exists(path)) return true;
 
@@ -370,6 +384,7 @@ private:
 
     // ── _deleteDirContents ────────────────────────────────────────────────────
     static void _deleteDirContents(const String& path) {
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         File dir = SD_MMC.open(path);
         if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return; }
 

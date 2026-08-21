@@ -34,6 +34,7 @@
 #include "sd_database.h"
 #include "employee_profile_display.h"
 #include "attendance_http_service.h"
+#include "sd_mutex.h"
 
 #define PENDING_FILE   "/attendance/pending_sync.json"
 #define EMPLOYEES_FILE "/employees/employee_index.json"
@@ -81,6 +82,7 @@ public:
     // ── hasPending ────────────────────────────────────────────────────────────
     static bool hasPending() {
         if (!SDDatabase::isReady()) return false;
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         if (!SD_MMC.exists(PENDING_FILE)) return false;
         File f = SD_MMC.open(PENDING_FILE, FILE_READ);
         if (!f) return false;
@@ -247,6 +249,7 @@ public:
 private:
     // ── Load queue from SD into a JSON document ────────────────────────────────
     static void _loadQueue(DynamicJsonDocument& doc) {
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         doc.to<JsonArray>();  // ensure array type
 
         if (!SD_MMC.exists(PENDING_FILE)) return;
@@ -271,6 +274,7 @@ private:
 
     // ── Save queue to SD ────────────────────────────────────────────────────────
     static bool _saveQueue(DynamicJsonDocument& doc) {
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         File f = SD_MMC.open(PENDING_FILE, FILE_WRITE);
         if (!f) {
             Serial.println("[Sync] Cannot write queue file");
@@ -283,6 +287,7 @@ private:
 
     // ── Save employee UID index ────────────────────────────────────────────────
     static void _saveEmployeeIndex(JsonArray& employees) {
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
         File f = SD_MMC.open(EMPLOYEES_FILE, FILE_WRITE);
         if (!f) return;
         // Save compact array of {uid, nfcAccess, idNumber, fullName}
