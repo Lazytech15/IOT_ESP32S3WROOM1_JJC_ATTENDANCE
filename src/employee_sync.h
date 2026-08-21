@@ -31,6 +31,7 @@
 #include "attendance_http_service.h"
 #include "sd_database.h"
 #include "employee_profile_display.h"
+#include "sd_mutex.h"
 
 #define SYNC_META_PATH          "/employees/sync_meta.json"
 #define FULL_SYNC_INTERVAL_MS   (6UL * 3600UL * 1000UL)
@@ -180,7 +181,10 @@ public:
         Serial.println("[Photo] ══════════════════════════════════════════════");
         Serial.flush();
 
-        if (!SD_MMC.exists("/photos")) SD_MMC.mkdir("/photos");
+        {
+            SDLockGuard _sdLock;   // see sd_mutex.h
+            if (!SD_MMC.exists("/photos")) SD_MMC.mkdir("/photos");
+        }
 
         _updateProgress(80, "INIT_MEDIA...", "", 0, photoQueueLen);
 
@@ -194,8 +198,12 @@ public:
         int ph_fail  = 0;
         int ph_total = photoQueueLen;
 
-        File photoLog = SD_MMC.open("/employees/photo_results.csv", FILE_WRITE);
-        if (photoLog) photoLog.println("uid,result,bytes,http_code,error");
+        File photoLog;
+        {
+            SDLockGuard _sdLock;   // see sd_mutex.h
+            photoLog = SD_MMC.open("/employees/photo_results.csv", FILE_WRITE);
+            if (photoLog) photoLog.println("uid,result,bytes,http_code,error");
+        }
 
         for (int qi = 0; qi < ph_total && chunk; qi++) {
             String uid = photoQueue[qi];
@@ -450,6 +458,7 @@ private:
     static SyncMeta _loadMeta() {
         SyncMeta m;
         if (!SDDatabase::isReady()) return m;
+        SDLockGuard _sdLock;   // see sd_mutex.h
         if (!SD_MMC.exists(SYNC_META_PATH)) return m;
         File f = SD_MMC.open(SYNC_META_PATH, FILE_READ);
         if (!f) return m;
@@ -465,6 +474,7 @@ private:
 
     static void _saveMeta(const SyncMeta& m) {
         if (!SDDatabase::isReady()) return;
+        SDLockGuard _sdLock;   // see sd_mutex.h
         File f = SD_MMC.open(SYNC_META_PATH, FILE_WRITE);
         if (!f) return;
         DynamicJsonDocument doc(256);
@@ -590,6 +600,7 @@ private:
     // No nfc_uid or device_id in the socket payload — left blank in CSV.
     static bool _handleAttendanceCreated(JsonObject data) {
         if (!SDDatabase::isReady()) return false;
+        SDLockGuard _sdLock;   // see sd_mutex.h
 
         // ── Field extraction — match socket.php attendanceCreated payload ──
         String empUid    = _jsonStrObj(data, "employee_uid", "uid");
@@ -694,6 +705,7 @@ private:
     // emp_uid whose session prefix matches, falling back to any row for emp_uid.
     static bool _handleAttendanceUpdated(JsonObject data) {
         if (!SDDatabase::isReady()) return false;
+        SDLockGuard _sdLock;   // see sd_mutex.h
 
         String empUid       = _jsonStrObj(data, "employee_uid", "uid");
         String newClockType = _jsonStrObj(data, "clock_type",   "clock_type");
@@ -809,6 +821,7 @@ private:
     // can't know which rows were duplicates. The next full sync will reconcile.
     static bool _handleAttendanceDeleted(JsonObject data) {
         if (!SDDatabase::isReady()) return false;
+        SDLockGuard _sdLock;   // see sd_mutex.h
 
         String path = _attendanceTodayPath();
         if (!SD_MMC.exists(path)) return false;
@@ -984,6 +997,7 @@ private:
     }
 
     static void _removeEmployeeFromCache(const String& empId) {
+        SDLockGuard _sdLock;   // see sd_mutex.h
         String profPath  = "/employees/" + empId + ".json";
         String photoPath = "/photos/"    + empId + ".jpg";
         if (SD_MMC.exists(profPath))  SD_MMC.remove(profPath); 

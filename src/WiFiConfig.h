@@ -36,8 +36,20 @@ public:
   // Disconnect from WiFi
   void disconnect();
 
+  // Record/persist credentials for a connection that's already established
+  // (WiFi.status()==WL_CONNECTED) elsewhere — e.g. WiFiManager's portal
+  // /api/wifi/connect handler, which does its own WiFi.begin()+wait. Skips
+  // the redundant second WiFi.begin()/wait that connectToWiFi() would do.
+  void adoptCurrentConnection(String ssid, String password);
+
+  // Turn the device's own setup hotspot (softAP) on/off without touching
+  // the STA connection. Used to keep the hotspot off outside admin hours.
+  void startAP();
+  void stopAP();
+  bool isAPActive();
+
 private:
-  WebServer* server;
+  WebServer* server;  // unused (legacy port-80 UI removed); kept null, header stays for ABI stability
   Preferences preferences;
   
   String ssid;
@@ -45,15 +57,7 @@ private:
   String apSSID;
   String apPassword;
   bool isConnectedToWiFi;
-  
-  // Web server handlers
-  void setupRoutes();
-  void handleRoot();
-  void handleWiFiInfo();
-  void handleScan();
-  void handleConnect();
-  void handleDisconnect();
-  void handleNotFound();
+  bool apActive = false;
   
   // Helper functions
   void loadCredentials();
@@ -62,14 +66,7 @@ private:
   bool attemptConnection(String ssid, String password);
   void monitorConnection();
   
-  // Static wrapper functions for web server callbacks
   static WiFiConfig* instance;
-  static void staticHandleRoot();
-  static void staticHandleWiFiInfo();
-  static void staticHandleScan();
-  static void staticHandleConnect();
-  static void staticHandleDisconnect();
-  static void staticHandleNotFound();
 };
 
 #endif

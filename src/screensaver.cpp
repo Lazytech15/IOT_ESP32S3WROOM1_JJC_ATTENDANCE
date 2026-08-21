@@ -5,6 +5,7 @@
 #include <SD_MMC.h>
 #include <TJpg_Decoder.h>
 #include "TFTDisplayManager.h"
+#include "sd_mutex.h"
 
 // ── Module state ────────────────────────────────────────────────────────────
 static TFT_eSPI* _ssTft          = nullptr;
@@ -134,8 +135,12 @@ void drawScreensaver() {
         _logoDrawX = (screenW - scaledW) / 2;
         _logoDrawY = SS_LOGO_Y;
 
-        JRESULT res = TJpgDec.drawFsJpg(_logoDrawX, _logoDrawY,
-                                         SCREENSAVER_LOGO_PATH, SD_MMC);
+        JRESULT res;
+        {
+            SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
+            res = TJpgDec.drawFsJpg(_logoDrawX, _logoDrawY,
+                                     SCREENSAVER_LOGO_PATH, SD_MMC);
+        }
         if (res != JDR_OK) {
             Serial.printf("[Screensaver] drawFsJpg failed (code %d)\n", (int)res);
         }

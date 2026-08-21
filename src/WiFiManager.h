@@ -105,6 +105,17 @@ static std::function<void()> g_requestDashboardRefresh = nullptr;
 // ══════════════════════════════════════════════════════════════════════════════
 static std::function<bool()> g_isScreenOff = nullptr;
 
+// ══════════════════════════════════════════════════════════════════════════════
+// g_getPendingCount
+//
+// Same pattern as g_isScreenOff above: main.cpp's `pendingCount` (records
+// queued locally that haven't reached the server yet) is file-local static.
+// Set by main.cpp during setup() so /api/status — and the Dashboard's new
+// "Pending Sync" stat tile — can report the real queue depth instead of
+// nothing at all.
+// ══════════════════════════════════════════════════════════════════════════════
+static std::function<int()> g_getPendingCount = nullptr;
+
 // Some cores don't expose WIFI_SCAN_RUNNING; ensure we have a fallback
 #ifndef WIFI_SCAN_RUNNING
 #define WIFI_SCAN_RUNNING (-1)
@@ -325,6 +336,35 @@ label{font-size:.8rem;color:var(--dim);display:block;margin-bottom:4px}
   white-space:pre-wrap;word-break:break-all;max-height:400px;overflow-y:auto;margin-top:10px}
 .dir-row{background:rgba(13,148,136,.07);border-color:rgba(13,148,136,.2)}
 .dir-row .fn{color:var(--teal)}
+
+/* ── Mobile responsiveness ─────────────────────────────────────────────
+   This portal is normally opened on a phone browser on the office WiFi
+   (see the IP-pill screenshots), not a desktop — the rules below make the
+   layout usable down to ~320px-wide screens instead of just shrinking
+   proportionally and forcing horizontal scrolling / tiny tap targets. */
+@media (max-width:600px){
+  .wrap{padding:8px}
+  .topbar{flex-wrap:wrap;gap:8px;padding:10px 12px}
+  .topbar-title{font-size:1rem}
+  .ip-pill{font-size:.68rem;padding:3px 8px}
+  .tabs{gap:4px}
+  .tab{flex:1 1 auto;text-align:center;padding:7px 8px;font-size:.76rem}
+  .card{padding:12px;margin-bottom:10px}
+  .card-title{font-size:.78rem;margin-bottom:10px}
+  .stat-row{grid-template-columns:repeat(2,1fr);gap:8px}
+  .stat{padding:10px}
+  .stat-n{font-size:1.5rem}
+  table{font-size:.75rem}
+  th,td{padding:6px 6px}
+  .btn{padding:7px 14px;font-size:.8rem}
+  .erow-grid{grid-template-columns:1fr}
+}
+@media (max-width:360px){
+  .topbar-title{font-size:.88rem}
+  .ip-pill{display:none}  /* redundant with the Network card on Dashboard — reclaim space on very narrow phones */
+  .stat-row{grid-template-columns:repeat(2,1fr);gap:6px}
+  .stat-n{font-size:1.3rem}
+}
 </style></head><body><div class="wrap">
 <div class="topbar">
   <span class="topbar-title">&#9670; JJC Attendance</span>
@@ -492,7 +532,16 @@ button:hover{background:linear-gradient(135deg,#f97316,#fbbf24)}
         _srv.sendContent(wOk ? "#10b981" : "#ef4444");
         _srv.sendContent(";font-size:1rem' id='live-wifi'>");
         _srv.sendContent(wOk ? "Online" : "Offline");
-        _srv.sendContent("</div><div class='stat-l'>WiFi</div></div></div>");
+        _srv.sendContent("</div><div class='stat-l'>WiFi</div></div>"
+            // Pending Sync — records queued on the SD card but not yet
+            // uploaded to the server (offline taps, upload retries, or a
+            // dead network window). The one number that tells the admin
+            // "is this device actually caught up" at a glance.
+            "<div class='stat'><div class='stat-n' id='live-pending'>...</div><div class='stat-l'>Pending Sync</div></div>"
+            // Free heap — cheap early-warning number for the low-memory
+            // conditions this firmware already guards against elsewhere.
+            "<div class='stat'><div class='stat-n' style='color:#a3e635' id='live-heap'>...<span style='font-size:1rem'>KB</span></div><div class='stat-l'>Free Heap</div></div>"
+            "</div>");
 
         _srv.sendContent(
             "<div class='card'><div class='card-title' style='display:flex;align-items:center;gap:8px'>"
@@ -507,15 +556,42 @@ button:hover{background:linear-gradient(135deg,#f97316,#fbbf24)}
             _srv.sendContent("<p style='font-size:.85rem;color:#94a3b8;margin-top:6px'>IP: <strong>" + _cfg->getIPAddress() + "</strong></p></div>");
         }
 
+        _srv.sendContent(
+            "<div class='card'><div class='card-title'>Device</div>"
+            "<p style='font-size:.85rem;color:#94a3b8'>Device time: <strong id='live-time' style='color:var(--text)'>...</strong></p>"
+            "<p style='font-size:.85rem;color:#94a3b8;margin-top:6px'>Uptime: <strong id='live-uptime' style='color:var(--text)'>...</strong></p></div>");
+
         // JS: load stats via AJAX + SSE live updates
         _srv.sendContent(R"DASH(<script>
 (function(){
-  fetch('/api/status').then(function(r){return r.json();}).then(function(d){
+  function fmtUptime(sec){
+    var d=Math.floor(sec/86400); sec%=86400;
+    var h=Math.floor(sec/3600); sec%=3600;
+    var m=Math.floor(sec/60);
+    return (d>0?d+'d ':'')+h+'h '+m+'m';
+  }
+  function applyStatus(d){
     if(d.ins!==undefined)document.getElementById('live-ins').textContent=d.ins;
     if(d.outs!==undefined)document.getElementById('live-outs').textContent=d.outs;
     if(d.free_mb!==undefined)document.getElementById('live-mb').innerHTML=d.free_mb+'<span style="font-size:1rem">MB</span>';
     if(d.wifi!==undefined){var w=document.getElementById('live-wifi');w.textContent=d.wifi?'Online':'Offline';w.style.color=d.wifi?'#10b981':'#ef4444';}
-  }).catch(function(){});
+    if(d.pending!==undefined && d.pending>=0){
+      var p=document.getElementById('live-pending');
+      p.textContent=d.pending;
+      p.style.color=d.pending>0?'#f97316':'#10b981';
+    }
+    if(d.heap_kb!==undefined)document.getElementById('live-heap').innerHTML=d.heap_kb+'<span style="font-size:1rem">KB</span>';
+    if(d.device_time!==undefined){var t=document.getElementById('live-time'); if(t)t.textContent=d.device_time;}
+    if(d.uptime!==undefined){var u=document.getElementById('live-uptime'); if(u)u.textContent=fmtUptime(d.uptime);}
+  }
+  function loadStatus(){
+    fetch('/api/status').then(function(r){return r.json();}).then(applyStatus).catch(function(){});
+  }
+  loadStatus();
+  // Fields that don't ride the SSE 'stats' event (pending/heap/uptime/
+  // device time) still need to look "live" — poll them on a plain timer
+  // rather than touching the SSE emitter in main.cpp for four extra fields.
+  setInterval(loadStatus, 15000);
   var es=new EventSource('/api/events');
   var dot=document.getElementById('live-dot');
   var st=document.getElementById('live-status');
@@ -524,13 +600,7 @@ button:hover{background:linear-gradient(135deg,#f97316,#fbbf24)}
   es.onopen=function(){dot.style.background='#10b981';st.textContent='Live';};
   es.onerror=function(){dot.style.background='#ef4444';st.textContent='Reconnecting...';};
   es.addEventListener('stats',function(e){
-    try{
-      var d=JSON.parse(e.data);
-      if(d.ins!==undefined)document.getElementById('live-ins').textContent=d.ins;
-      if(d.outs!==undefined)document.getElementById('live-outs').textContent=d.outs;
-      if(d.free_mb!==undefined)document.getElementById('live-mb').innerHTML=d.free_mb+'<span style="font-size:1rem">MB</span>';
-      if(d.wifi!==undefined){var w=document.getElementById('live-wifi');w.textContent=d.wifi?'Online':'Offline';w.style.color=d.wifi?'#10b981':'#ef4444';}
-    }catch(err){}
+    try{ applyStatus(JSON.parse(e.data)); }catch(err){}
   });
   es.addEventListener('scan',function(e){
     try{
@@ -787,6 +857,19 @@ browseDir();
   </div>
  
   <div id="dateLabel" style="font-size:.78rem;color:#64748b;margin-bottom:10px"></div>
+
+  <!-- Sort control (replaces clickable table column headers) -->
+  <div class="sort-bar">
+    <select id="sortSelect" onchange="onSortSelectChange()">
+      <option value="4">Sort: Name</option>
+      <option value="1">Sort: Time</option>
+      <option value="3">Sort: Emp UID</option>
+      <option value="5">Sort: Department</option>
+      <option value="6">Sort: Clock Type</option>
+    </select>
+    <button type="button" class="sort-dir-btn" id="sortDirBtn" onclick="toggleSortDir()">&#8593; Asc</button>
+  </div>
+
   <div id="tableArea"><p style="color:#64748b;font-size:.82rem">Loading...</p></div>
 </div>
  
@@ -813,28 +896,58 @@ browseDir();
 </div>
  
 <style>
-/* Sort header */
-.th-sort{cursor:pointer;user-select:none;white-space:nowrap}
-.th-sort:hover{color:var(--text)}
-.sort-arrow{margin-left:4px;font-size:.65rem;color:var(--teal)}
- 
-.erow{background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:8px;
-  padding:12px;margin-bottom:10px;position:relative}
+/* ── Sort control (replaces clickable table headers) ── */
+.sort-bar{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+.sort-bar select{width:auto;flex:1;min-width:140px}
+.sort-dir-btn{background:rgba(255,255,255,.06);border:1px solid var(--border);
+  border-radius:6px;color:var(--text);padding:8px 12px;font-size:.8rem;cursor:pointer;white-space:nowrap}
+.sort-dir-btn:hover{border-color:var(--teal)}
+
+/* ── Record list (card container, mobile-first — replaces <table>) ── */
+.rec-list{display:flex;flex-direction:column;gap:10px}
+.rec-card{background:var(--card);border:1px solid var(--border);border-radius:12px;
+  padding:14px 16px}
+.rec-card-top{display:flex;justify-content:space-between;align-items:flex-start;
+  gap:10px;margin-bottom:10px}
+.rec-name{font-size:.9rem;font-weight:700;color:var(--text);line-height:1.3;word-break:break-word}
+.rec-date{font-size:.72rem;color:var(--dim);margin-top:2px}
+.rec-grid{display:flex;flex-direction:column}
+.rec-field{display:flex;justify-content:space-between;align-items:center;gap:12px;
+  padding:7px 0;border-bottom:1px solid rgba(255,255,255,.05)}
+.rec-field:last-child{border-bottom:none}
+.rec-field .rf-label{font-size:.74rem;color:var(--dim);white-space:nowrap}
+.rec-field .rf-val{font-size:.8rem;color:var(--text);font-weight:500;text-align:right;
+  word-break:break-word}
+.rec-actions{display:flex;justify-content:flex-end;margin-top:10px}
+
+/* ── Row editor (card style, matches record list) ── */
+.erow{background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:10px;
+  padding:14px;margin-bottom:10px}
 .erow:hover{border-color:var(--teal)}
-.erow-header{display:flex;align-items:center;gap:8px;margin-bottom:10px}
-.erow-num{font-size:.7rem;color:var(--dim);min-width:24px}
+.erow-header{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.erow-num{font-size:.7rem;color:var(--dim);min-width:20px}
+.erow-header-name{font-size:.72rem;color:var(--dim);flex:1;min-width:0;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .erow-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .erow-field label{font-size:.72rem;color:var(--dim);display:block;margin-bottom:3px}
 .erow-field input,.erow-field select{background:rgba(255,255,255,.06);border:1px solid var(--border);
   border-radius:5px;color:var(--text);padding:6px 8px;font-size:.8rem;width:100%}
 .erow-field input:focus,.erow-field select:focus{outline:none;border-color:var(--teal)}
-.del-row-btn{position:absolute;top:10px;right:10px;background:rgba(239,68,68,.15);
+.del-row-btn{background:rgba(239,68,68,.15);
   color:var(--red);border:1px solid rgba(239,68,68,.3);border-radius:5px;
-  padding:3px 8px;font-size:.72rem;cursor:pointer}
+  padding:4px 10px;font-size:.72rem;cursor:pointer;white-space:nowrap;margin-left:auto}
 .del-row-btn:hover{background:rgba(239,68,68,.3)}
+
+@media (max-width:600px){
+  #editorModal{padding:0}
+  #editorModal>div{padding:14px 12px;border-radius:0;max-width:100%;min-height:100vh;margin:0}
+  .erow-grid{grid-template-columns:1fr}
+  .rec-card{padding:12px 14px}
+  .rec-name{font-size:.85rem}
+}
 .badge-morning_in,.badge-morning_out,.badge-afternoon_in,.badge-afternoon_out,
 .badge-evening_in,.badge-evening_out{display:inline-block;padding:2px 8px;
-  border-radius:4px;font-size:.72rem;font-weight:600}
+  border-radius:4px;font-size:.72rem;font-weight:600;white-space:nowrap}
 .badge-morning_in,.badge-afternoon_in,.badge-evening_in{background:rgba(34,211,238,.15);color:#22d3ee}
 .badge-morning_out,.badge-afternoon_out,.badge-evening_out{background:rgba(249,115,22,.15);color:#f97316}
 </style>
@@ -1085,21 +1198,33 @@ function clearSearch(){
   applyFilters();
 }
  
-// ── Sortable header helper ────────────────────────────────────────────────────
+// ── Sort control helpers (dropdown + direction toggle, replaces header clicks) ─
 function sortBy(col){
   if(_sortCol === col){ _sortAsc = !_sortAsc; }
   else { _sortCol = col; _sortAsc = true; }
   applyFilters();
 }
- 
-function _thArrow(col){
-  if(_sortCol !== col) return '<span class="sort-arrow">&#8645;</span>';
-  return _sortAsc
-    ? '<span class="sort-arrow" style="color:#22d3ee">&#8593;</span>'
-    : '<span class="sort-arrow" style="color:#f97316">&#8595;</span>';
+
+function onSortSelectChange(){
+  var sel = document.getElementById('sortSelect');
+  _sortCol = parseInt(sel.value, 10);
+  applyFilters();
 }
- 
-// ── Table renderer ────────────────────────────────────────────────────────────
+
+function toggleSortDir(){
+  _sortAsc = !_sortAsc;
+  var btn = document.getElementById('sortDirBtn');
+  if(btn) btn.innerHTML = _sortAsc ? '&#8593; Asc' : '&#8595; Desc';
+  applyFilters();
+}
+
+// ── Field row helper (label left, value right) ─────────────────────────────────
+function _recField(label, val){
+  return '<div class="rec-field"><span class="rf-label">'+label+'</span>'
+       + '<span class="rf-val">'+(val && val.length ? val : '&mdash;')+'</span></div>';
+}
+
+// ── Record list renderer (stacked cards — replaces <table>) ────────────────────
 function renderTable(filtered){
   var d = window._csvData || {};
   var total = _allDisplayRows.length;
@@ -1122,58 +1247,37 @@ function renderTable(filtered){
     return;
   }
  
-  // Column defs: [label, sortColIdx]
-  var cols = [
-    ['Date',          0],
-    ['Time',          1],
-    ['NFC UID',       2],
-    ['Emp UID',       3],
-    ['Name (Last, First)', 4],
-    ['Department',    5],
-    ['Clock Type',    6],
-    ['Device',        7],
-  ];
- 
-  var h = '<div style="overflow-x:auto"><table><thead><tr>';
-  cols.forEach(function(c){
-    var ci = c[1];
-    h += '<th class="th-sort" onclick="sortBy('+ci+')" style="cursor:pointer">'
-       + c[0] + _thArrow(ci) + '</th>';
-  });
-  // Edit button column (no sort)
-  if(!d.pulled_from_server) h += '<th></th>';
-  h += '</tr></thead><tbody>';
+  var h = '<div class="rec-list">';
  
   filtered.forEach(function(r){
     var row  = r.cells;
     var idx  = r.origIdx;
-    h += '<tr>';
-    // Date
-    h += '<td style="color:#22d3ee;white-space:nowrap;font-size:.78rem">'+r.date+'</td>';
-    // Timestamp (col 0)
-    h += '<td>'+(row[0]||'')+'</td>';
-    // nfc_uid (col 1)
-    h += '<td>'+(row[1]||'')+'</td>';
-    // emp_uid (col 2)
-    h += '<td>'+(row[2]||'')+'</td>';
-    // Name — Last, First (col 3)
-    h += '<td style="font-weight:600;color:#e2e8f0">'+r.lastFirst+'</td>';
-    // Department (col 4)
-    h += '<td>'+(row[4]||'')+'</td>';
-    // event_type badge (col 5)
-    var et  = (row[5]||'').trim();
+    var et   = (row[5]||'').trim();
     var isIn = et.endsWith('_in') || et==='check-in';
     var cls  = isIn ? 'badge-in' : (et.endsWith('_out')||et==='check-out') ? 'badge-out' : 'badge-denied';
-    h += '<td><span class="badge '+cls+'">'+et+'</span></td>';
-    // device_id (col 6)
-    h += '<td style="font-size:.75rem;color:#64748b">'+(row[6]||'')+'</td>';
-    // Edit button
+ 
+    h += '<div class="rec-card">';
+    h += '<div class="rec-card-top">';
+    h += '<div><div class="rec-name">'+r.lastFirst+'</div>'
+       + '<div class="rec-date">'+r.date+'</div></div>';
+    h += '<span class="badge '+cls+'">'+et+'</span>';
+    h += '</div>';
+ 
+    h += '<div class="rec-grid">';
+    h += _recField('Time',       row[0]||'');
+    h += _recField('NFC UID',    row[1]||'');
+    h += _recField('Emp UID',    row[2]||'');
+    h += _recField('Department', row[4]||'');
+    h += _recField('Device',     row[6]||'');
+    h += '</div>';
+ 
     if(!d.pulled_from_server){
-      h += '<td><button class="btn btn-ghost btn-sm" onclick="editRow('+idx+')">&#9998;</button></td>';
+      h += '<div class="rec-actions"><button class="btn btn-ghost btn-sm" onclick="editRow('+idx+')">&#9998; Edit</button></div>';
     }
-    h += '</tr>';
+    h += '</div>';
   });
-  h += '</tbody></table></div>';
+ 
+  h += '</div>';
   document.getElementById('tableArea').innerHTML = h;
 }
  
@@ -1208,7 +1312,8 @@ function openEditor(focusIdx){
     html += '<div class="erow-header">';
     html += '<span class="erow-num">#'+(i+1)+'</span>';
     html += '<span class="badge '+badgeCls+'" id="badge_'+i+'">'+et+'</span>';
-    html += '<span style="font-size:.72rem;color:var(--dim);margin-left:8px">'+displayName+'</span>';
+    html += '<span class="erow-header-name">'+displayName+'</span>';
+    html += '<button class="del-row-btn" onclick="deleteRow('+i+')">&#128465; Delete</button>';
     html += '</div>';
  
     html += '<div class="erow-grid">';
@@ -1234,8 +1339,6 @@ function openEditor(focusIdx){
     html += _roField('Department', (row[4]||'').replace(/"/g,''));
     html += _roField('Emp UID', (row[2]||'').replace(/"/g,''));
     html += '</div>';
- 
-    html += '<button class="del-row-btn" onclick="deleteRow('+i+')">&#128465; Delete</button>';
     html += '</div>';
   });
  
@@ -1734,6 +1837,18 @@ loadStatus();loadNets();
         doc["ins"]     = max(0, SDDatabase::countTodayCheckIns());
         doc["outs"]    = max(0, SDDatabase::countTodayCheckOuts());
         doc["screen_off"] = g_isScreenOff ? g_isScreenOff() : false;
+        // Records queued locally but not yet uploaded to the server.
+        doc["pending"] = g_getPendingCount ? g_getPendingCount() : -1;
+        // Free heap — cheap early warning for the low-heap issues this
+        // firmware already guards against elsewhere (OOM checks around
+        // JSON parsing, staleKeys[], etc.).
+        doc["heap_kb"] = (int)(ESP.getFreeHeap() / 1024);
+        struct tm ti;
+        if (getLocalTime(&ti, 0)) {
+            char buf[9];
+            snprintf(buf, sizeof(buf), "%02d:%02d:%02d", ti.tm_hour, ti.tm_min, ti.tm_sec);
+            doc["device_time"] = buf;
+        }
         String out; serializeJson(doc,out);
         _srv.sendHeader("Access-Control-Allow-Origin","*");
         _srv.send(200,"application/json",out);
@@ -2446,6 +2561,22 @@ loadStatus();loadNets();
         // fine, while the Clock-In/Clock-Out name strip — only ever touched
         // here or by a fresh tap — kept showing the deleted person forever.
         if (fileArg == "today" || fileArg == "__today__") {
+            // Drop the cached check-in/check-out counters so the stats
+            // refresh triggered just below (via g_requestDashboardRefresh ->
+            // g_pendingStatsRefresh) does one real re-scan of the just-edited
+            // CSV instead of returning the pre-delete cached number.
+            // countTodayCheckIns()/countTodayCheckOuts() only ever increment
+            // their cache on SDDatabase::logAttendance() writes — this
+            // handler rewrites the CSV directly (skipping the deleted row)
+            // and never goes through logAttendance(), so without this reset
+            // the dashboard kept showing the old, too-high count even though
+            // "Attendance updated" fired and the row was really gone. Same
+            // fix already applied to the bulk server-reconcile purge path
+            // above (search resetTodayCountCache) — this was the other,
+            // more common path (a manual single-row delete) that was
+            // missing it.
+            SDDatabase::resetTodayCountCache();
+
             // Don't touch the TFT directly here — see g_requestDashboardRefresh's
             // doc comment above for why (screensaver-corruption guard).
             if (g_requestDashboardRefresh) g_requestDashboardRefresh();
@@ -3112,14 +3243,38 @@ loadStatus();loadNets();
                             reconcileMap.remove(staleKeys[k2].c_str());
                         }
                         String mapPath = "/attendance/server_ids_" + fileDateStr + ".json";
+                        // Write back in the flat "key=id" format (see
+                        // SDDatabase's Server-ID Map section) rather than
+                        // serializeJson()'ing straight back to a JSON object
+                        // — otherwise every reconcile pass would silently
+                        // flip the file back to the old slow format, undoing
+                        // the append-only optimization on the very next tap.
                         File mf = SD_MMC.open(mapPath, FILE_WRITE);
-                        if (mf) { serializeJson(reconcileMap, mf); mf.close(); }
+                        if (mf) {
+                            for (JsonPair kv : reconcileMap.as<JsonObject>()) {
+                                mf.print(kv.key().c_str());
+                                mf.print('=');
+                                mf.println((long)kv.value().as<long>());
+                            }
+                            mf.close();
+                        }
 
                         // Tell JS how many rows were purged — it will re-fetch automatically
                         if (removedCount > 0) {
                             doc["rows_removed"] = removedCount;
                             Serial.printf("[WM] B2: %d stale rows removed, JS will reload\n",
                                           removedCount);
+
+                            // This path rewrites the CSV directly instead of going
+                            // through SDDatabase::removeAttendanceRow(), so it never
+                            // touches _cachedIns/_cachedOuts. Without this, the
+                            // dashboard's check-in/out counts would stay stale (too
+                            // high by the purged amount) until midnight rollover.
+                            // Cheapest correct fix: drop the cache so the next
+                            // countTodayCheckIns()/countTodayCheckOuts() call does one
+                            // real rescan — only happens on days a stale row is
+                            // actually found, which is rare.
+                            SDDatabase::resetTodayCountCache();
                         }
                     } else {
                         if (rf2) rf2.close();
@@ -3211,6 +3366,21 @@ loadStatus();loadNets();
         String pass = req["password"] | "";
         if (ssid.length()==0) { _srv.send(200,"application/json","{\"success\":false,\"error\":\"No SSID\"}"); return; }
 
+        // If we're already associated with a (different) network, the ESP32
+        // WiFi driver won't reliably switch on a bare WiFi.begin() call while
+        // still attached to the old AP — it either ignores the new begin() or
+        // the connection attempt silently times out, leaving the portal stuck
+        // on the old network. That's why "Connect" to a different network only
+        // worked after first hitting "Disconnect". Force a clean STA teardown
+        // first (keeping the AP radio up — false — so the portal itself stays
+        // reachable while we switch) and give the driver a moment to settle
+        // before starting the new association.
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("[WiFi] Switching networks — disconnecting from " + WiFi.SSID() + " first");
+            WiFi.disconnect(false, false);
+            delay(300);
+        }
+
         Serial.println("[WiFi] Connecting to: " + ssid);
         WiFi.begin(ssid.c_str(), pass.length()>0 ? pass.c_str() : nullptr);
         int attempts = 0;
@@ -3218,7 +3388,12 @@ loadStatus();loadNets();
             delay(500); attempts++;
         }
         if (WiFi.status() == WL_CONNECTED) {
-            if (_cfg) _cfg->connectToWiFi(ssid, pass);
+            // Just update WiFiConfig's tracked ssid/password/state directly —
+            // it's already connected via the WiFi.begin() above, so routing
+            // through connectToWiFi()/attemptConnection() would call
+            // WiFi.begin() a second time and wait up to another 20s for no
+            // reason.
+            if (_cfg) _cfg->adoptCurrentConnection(ssid, pass);
             DynamicJsonDocument r(128);
             r["success"]=true; r["ip"]=WiFi.localIP().toString();
             String out; serializeJson(r,out);

@@ -5,6 +5,7 @@
 #include "employee_profile_display.h"
 #include "aes_decryptor.h"
 #include "sd_database.h"
+#include "sd_mutex.h"
 
 #define AES_KEY_B64 "wSDp34MhW1pp7RJ8V01ovioEMYKI2hJceZ91VzZcA7s="
 
@@ -316,6 +317,70 @@ private:
         return ok;
     }
 
+    // ── postAndDecrypt (bulk variant) ───────────────────────────────────────
+    // Same as postAndDecrypt() above but with a caller-supplied response
+    // timeout instead of the hardcoded 8000ms. Added (not edited into the
+    // original) so every existing caller keeps its current 8s behavior
+    // unchanged — only recordAttendanceBulk() uses this one, since a
+    // 200-record batch on a slow link legitimately needs longer than a
+    // single-record POST.
+    //
+    // Note: the body-read path (readHttpBodyReliable → _readChunked/_readFixed)
+    // has its own separate 12000ms hard deadline for reading the response
+    // body once headers arrive. That's untouched here — it's sized for
+    // response bodies up to 65KB and the bulk endpoint's JSON response
+    // (one small object per record) stays well under that, so it was not
+    // the bottleneck this timeout is meant to address.
+    bool postAndDecryptWithTimeout(const String& url,
+                                   const String& payload,
+                                   DynamicJsonDocument& outDoc,
+                                   uint32_t connectTimeoutMs,
+                                   uint32_t responseTimeoutMs,
+                                   int* outHttpCode = nullptr) {
+        Serial.println("[HTTP] POST(bulk) " + url + "  timeout=" + String(responseTimeoutMs) + "ms");
+        Serial.flush();
+
+        http.setConnectTimeout(connectTimeoutMs);
+        http.setTimeout(responseTimeoutMs);
+        http.begin(url);
+        addCommonHeaders();
+        int code = http.POST(payload);
+        Serial.println("[HTTP] Response code: " + String(code));
+        Serial.flush();
+        if (outHttpCode) *outHttpCode = code;
+
+        if (code <= 0) {
+            Serial.println("[HTTP] ❌ Connection error: " + http.errorToString(code));
+            Serial.flush();
+            http.end();
+            return false;
+        }
+
+        String body = readHttpBodyReliable(http, 65536);
+        http.end();
+
+        Serial.println("[HTTP] Body length: " + String(body.length()));
+        Serial.flush();
+
+        if (code != 200 && code != 403) {
+            Serial.println("[HTTP] ❌ Unexpected HTTP code: " + String(code));
+            return false;
+        }
+        if (body.length() == 0) {
+            Serial.println("[HTTP] ❌ Empty response body");
+            return false;
+        }
+
+        yield();
+        bool ok = decryptServerResponse(decryptor, body, outDoc);
+        if (!ok) {
+            Serial.println("[HTTP] ❌ Failed to decrypt/parse response");
+        } else {
+            debugPrintDecrypted(body, outDoc);
+        }
+        return ok;
+    }
+
     static JsonArray _findEmployeesArray(DynamicJsonDocument& doc) {
         if (doc.containsKey("employees")) {
             JsonArray arr = doc["employees"].as<JsonArray>();
@@ -341,6 +406,47 @@ public:
             Serial.println("[HTTP] ❌ WARNING: AES decryptor init failed!");
         }
         Serial.flush();
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // postBulkAttendance — sends an ALREADY-BUILT bulk payload in ONE POST.
+    // Takes a raw JSON payload string rather than main.cpp's PendingRecord
+    // struct directly: PendingRecord is declared in main.cpp, after this
+    // header is #included, so it isn't visible here. Building the payload
+    // in main.cpp (which already has the struct) and handing this function
+    // a plain String keeps this header self-contained — no reordering of
+    // main.cpp's #includes required.
+    //
+    // connectTimeoutMs/responseTimeoutMs default to a much longer window
+    // than the single-record recordAttendance()'s 8s (see
+    // postAndDecryptWithTimeout's comment) — a large batch over a slow link
+    // needs real headroom, and this call only ever runs on the background
+    // upload task (Core 0), so a longer block here never freezes NFC
+    // polling or the clock on Core 1.
+    //
+    // Returns true if the HTTP call itself succeeded (200); outResults holds
+    // whatever the server's route returns for this batch — currently
+    // syncAttendanceRecords()'s shape (processed_count/duplicate_count/
+    // error_count/errors[]), since the bulk-record route delegates to it.
+    // The caller (flushPendingBulk() in main.cpp) reads outResults["errors"]
+    // to know which indices to keep/retry.
+    //
+    // Public (unlike postAndDecryptWithTimeout, which stays private and is
+    // only called internally by this method) so main.cpp can call it
+    // directly on the AttendanceHTTPService instance.
+    // ══════════════════════════════════════════════════════════════════════
+    bool postBulkAttendance(const String& payload,
+                            DynamicJsonDocument& outResults,
+                            uint32_t connectTimeoutMs = 8000,
+                            uint32_t responseTimeoutMs = 25000) {
+        int httpCode = 0;
+        bool ok = postAndDecryptWithTimeout(serverURL + "/api/attendance/bulk-record",
+                                            payload, outResults,
+                                            connectTimeoutMs, responseTimeoutMs,
+                                            &httpCode);
+        Serial.printf("[Bulk] postBulkAttendance: httpCode=%d, ok=%s\n",
+                      httpCode, ok ? "true" : "false");
+        return ok;
     }
 
     void setAuthToken(const String& token) { authToken = token; }
@@ -1421,8 +1527,15 @@ public:
 
     // ── Snapshot file ─────────────────────────────────────────────────────────
     String snapPath = "/attendance/esp32_" + date + ".json";
-    File snapFile = SD_MMC.open(snapPath.c_str(), FILE_WRITE);
-    if (snapFile) { snapFile.print("["); }
+    File snapFile;
+    {
+        // Guard only the actual SD call, not the pagination loop below —
+        // see sd_mutex.h. Holding this across the whole multi-minute pass
+        // is what let a seed pass collide with an in-flight NFC tap.
+        SDLockGuard _sdLock;
+        snapFile = SD_MMC.open(snapPath.c_str(), FILE_WRITE);
+        if (snapFile) { snapFile.print("["); }
+    }
     bool snapFirst = true;
 
     int totalSeeded   = 0;
@@ -1724,7 +1837,11 @@ public:
         totalReceived += pageCount;
 
         // ── Append to snapshot file ───────────────────────────────────────────
+        // Locked per-page (not for the whole multi-minute pass) so a waiting
+        // NFC tap only ever stalls behind one page's worth of SD writes.
+        // See sd_mutex.h.
         if (snapFile) {
+            SDLockGuard _sdLock;
             for (JsonObject row : rows) {
                 if (!snapFirst) snapFile.print(",");
                 snapFirst = false;
@@ -1943,6 +2060,7 @@ public:
 
     // ── Finalise snapshot ─────────────────────────────────────────────────────
     if (snapFile) {
+        SDLockGuard _sdLock;
         snapFile.print("]");
         snapFile.close();
         SDLogger::log("Esp32Sync", SDLogger::INFO,
@@ -2468,8 +2586,18 @@ public:
 
             if (mapChanged) {
                 String mapPath = "/attendance/server_ids_" + date + ".json";
+                // Flat "key=id" format, same reasoning as WiFiManager.h's
+                // reconcile write-back — keeps the file from flipping back
+                // to the old JSON-object format on every reconcile pass.
                 File mf = SD_MMC.open(mapPath.c_str(), FILE_WRITE);
-                if (mf) { serializeJson(mapDoc, mf); mf.close(); }
+                if (mf) {
+                    for (JsonPair kv : mapObj) {
+                        mf.print(kv.key().c_str());
+                        mf.print('=');
+                        mf.println((long)kv.value().as<long>());
+                    }
+                    mf.close();
+                }
             }
         } else {
             SD_MMC.remove(tmpPath);

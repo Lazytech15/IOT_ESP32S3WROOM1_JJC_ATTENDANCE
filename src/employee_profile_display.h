@@ -9,6 +9,7 @@
 #include <SD.h>
 #include "TFTDisplayManager.h"
 #include "sd_logger.h"
+#include "sd_mutex.h"
 #include <TJpg_Decoder.h>
 
 #ifndef SCREEN_W
@@ -269,6 +270,7 @@ private:
     // Core Drawing Engine for Rectangular Constraints
     bool _drawRectJpeg(const String& path, int x, int y, int maxW, int maxH, uint16_t bg) {
         if (!_tft || !SD_MMC.exists(path)) return false;
+        SDLockGuard _sdLock;   // serialize SD_MMC access across tasks — see sd_mutex.h
 
         File f = SD_MMC.open(path, FILE_READ);
         if (!f || f.size() < 4) { if (f) f.close(); return false; }

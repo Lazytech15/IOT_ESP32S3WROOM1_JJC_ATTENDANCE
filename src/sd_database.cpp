@@ -24,9 +24,14 @@
 
 #include "sd_database.h"
 #include "sd_logger.h"
+#include "sd_mutex.h"
+
+SemaphoreHandle_t g_sdMutex = nullptr;
 
 bool SDDatabase::_ready = false;
 DateProviderFn SDDatabase::_dateProvider = nullptr;
+int SDDatabase::_cachedIns  = -1;
+int SDDatabase::_cachedOuts = -1;
 
 void SDDatabase::setDateProvider(DateProviderFn fn) {
     _dateProvider = fn;
@@ -54,6 +59,7 @@ static String _sanitizeForFilename(const String& s) {
 // begin
 // ══════════════════════════════════════════════════════════════════════════════
 bool SDDatabase::begin() {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     Serial.println("[SD] Initializing SD card (SDMMC 1-bit)...");
     Serial.printf("[SD] Pins — CLK:%d  CMD:%d  D0:%d\n",
                   SD_MMC_CLK_PIN, SD_MMC_CMD_PIN, SD_MMC_D0_PIN);
@@ -106,6 +112,7 @@ bool SDDatabase::isReady() { return _ready; }
 // Helpers
 // ══════════════════════════════════════════════════════════════════════════════
 bool SDDatabase::ensureDir(const char* path) {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!SD_MMC.exists(path)) {
         if (!SD_MMC.mkdir(path)) {
             Serial.printf("[SD] Failed to create dir: %s\n", path);
@@ -154,6 +161,7 @@ bool SDDatabase::logAttendance(const String& timestamp,
                                 const EmployeeProfile& emp,
                                 const String& eventType,
                                 const String& deviceId) {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!_ready) return false;
 
     String fname = todayFilename();
@@ -181,6 +189,19 @@ bool SDDatabase::logAttendance(const String& timestamp,
     f.println(row);
     f.close();
 
+    // Keep the in-memory today-count cache in sync incrementally instead of
+    // invalidating it — this is what lets countTodayCheckIns()/
+    // countTodayCheckOuts() stay O(1) after the first scan of the day. Only
+    // bump the cache if it's already primed (_cachedIns >= 0); if this is
+    // the very first write before anything has called countToday*() yet,
+    // leave it at -1 so the next call does one real scan (which will count
+    // this row correctly) rather than guessing at a partial state.
+    if (eventType.endsWith("_in")) {
+        if (_cachedIns >= 0) _cachedIns++;
+    } else if (eventType.endsWith("_out")) {
+        if (_cachedOuts >= 0) _cachedOuts++;
+    }
+
     // Routed through SDLogger so it's automatically silenced during bulk
     // SERVER_SEED catch-up writes (which happen inside seedTodayAttendance-
     // FromServer()'s suspendSDWrite() window — see that function) while
@@ -195,19 +216,32 @@ bool SDDatabase::logAttendance(const String& timestamp,
 // readTodayCSV / readCSV
 // ══════════════════════════════════════════════════════════════════════════════
 String SDDatabase::readTodayCSV() {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!_ready) return "";
     return readCSV(todayFilename());
 }
 
 String SDDatabase::readCSV(const String& dateOrPath) {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!_ready) return "";
     String path = dateOrPath;
     if (!path.startsWith("/")) path = "/attendance/" + dateOrPath + ".csv";
     if (!SD_MMC.exists(path)) return "";
     File f = SD_MMC.open(path, FILE_READ);
     if (!f) return "";
+    // Preallocate + chunked read instead of the old one-byte-at-a-time
+    // `out += (char)f.read()` loop. String::concat() on this core reallocates
+    // to the exact new size on every call rather than doubling, so appending
+    // one char at a time on a multi-KB file meant a fresh heap realloc per
+    // byte — expensive and fragmenting on a device that stays up for weeks.
     String out;
-    while (f.available()) out += (char)f.read();
+    out.reserve(f.size() + 1);
+    uint8_t buf[512];
+    while (f.available()) {
+        size_t n = f.read(buf, sizeof(buf));
+        if (n == 0) break;
+        out.concat((const char*)buf, n);
+    }
     f.close();
     return out;
 }
@@ -216,6 +250,7 @@ String SDDatabase::readCSV(const String& dateOrPath) {
 // listAttendanceDates
 // ══════════════════════════════════════════════════════════════════════════════
 String SDDatabase::listAttendanceDates() {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!_ready) return "";
     File dir = SD_MMC.open("/attendance");
     if (!dir) return "";
@@ -233,47 +268,21 @@ String SDDatabase::listAttendanceDates() {
 // ══════════════════════════════════════════════════════════════════════════════
 // countTodayCheckIns / countTodayCheckOuts
 // ══════════════════════════════════════════════════════════════════════════════
-int SDDatabase::countEventInCSV(const String& path, const String& eventType) {
-    if (!_ready) return -1;
-    if (!SD_MMC.exists(path)) return 0;
-    File f = SD_MMC.open(path, FILE_READ);
-    if (!f) return -1;
-    int count = 0;
-    while (f.available()) {
-        String line = f.readStringUntil('\n');
-        line.trim();
-        if (line.length() == 0 || line.startsWith("timestamp")) continue;
-
-        // CSV: timestamp,nfc_uid,employee_uid,name,dept,event_type,device_id
-        // Parse out col5 (event_type) properly so we match the exact field,
-        // not a substring anywhere in the row (e.g. employee name containing "in").
-        int c0 = line.indexOf(',');
-        int c1 = (c0>=0) ? line.indexOf(',', c0+1) : -1;
-        int c2 = (c1>=0) ? line.indexOf(',', c1+1) : -1;
-        int c3 = (c2>=0) ? line.indexOf(',', c2+1) : -1;
-        int c4 = (c3>=0) ? line.indexOf(',', c3+1) : -1;
-        int c5 = (c4>=0) ? line.indexOf(',', c4+1) : -1;
-        if (c4 < 0 || c5 < 0) continue;
-
-        String ev = line.substring(c4+1, c5);
-        ev.trim();
-        if (ev.startsWith("\"")) ev = ev.substring(1);
-        if (ev.endsWith("\""))   ev = ev.substring(0, ev.length()-1);
-
-        if (ev == eventType) count++;
-    }
-    f.close();
-    return count;
-}
 
 // ── Count helpers: match all session variants ─────────────────────────────────
 // Clock types written to CSV:  morning_in, morning_out, afternoon_in,
 //                              afternoon_out, evening_in, evening_out
 // A "check-in"  = any event ending in "_in"
 // A "check-out" = any event ending in "_out"
-int SDDatabase::countTodayCheckIns() {
-    if (!_ready) return 0;
-    String path = todayFilename();
+//
+// PERF: these used to do a full linear read of today's CSV on every single
+// call (measured 50-200ms — see the STATE_NFC_PROFILE comment in main.cpp
+// that used to defer this to the next loop() tick to avoid blocking NFC
+// polling). Now cached in _cachedIns/_cachedOuts: the first call each day
+// does one real scan to prime the cache, logAttendance() keeps it in sync
+// incrementally on every write, and resetTodayCountCache() is called on
+// midnight rollover so a new day starts from a fresh scan of the new file.
+static int _scanEventSuffix(const String& path, const char* suffix) {
     if (!SD_MMC.exists(path)) return 0;
     File f = SD_MMC.open(path, FILE_READ);
     if (!f) return 0;
@@ -293,46 +302,42 @@ int SDDatabase::countTodayCheckIns() {
         ev.trim();
         if (ev.startsWith("\"")) ev = ev.substring(1);
         if (ev.endsWith("\""))   ev = ev.substring(0, ev.length()-1);
-        if (ev.endsWith("_in")) count++;
+        if (ev.endsWith(suffix)) count++;
     }
     f.close();
-    Serial.printf("[SD] countTodayCheckIns = %d\n", count);
     return count;
 }
 
-int SDDatabase::countTodayCheckOuts() {
+void SDDatabase::resetTodayCountCache() {
+    _cachedIns  = -1;
+    _cachedOuts = -1;
+}
+
+int SDDatabase::countTodayCheckIns() {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!_ready) return 0;
-    String path = todayFilename();
-    if (!SD_MMC.exists(path)) return 0;
-    File f = SD_MMC.open(path, FILE_READ);
-    if (!f) return 0;
-    int count = 0;
-    while (f.available()) {
-        String line = f.readStringUntil('\n');
-        line.trim();
-        if (line.length() == 0 || line.startsWith("timestamp")) continue;
-        int c0 = line.indexOf(',');
-        int c1 = (c0>=0) ? line.indexOf(',', c0+1) : -1;
-        int c2 = (c1>=0) ? line.indexOf(',', c1+1) : -1;
-        int c3 = (c2>=0) ? line.indexOf(',', c2+1) : -1;
-        int c4 = (c3>=0) ? line.indexOf(',', c3+1) : -1;
-        int c5 = (c4>=0) ? line.indexOf(',', c4+1) : -1;
-        if (c4 < 0 || c5 < 0) continue;
-        String ev = line.substring(c4+1, c5);
-        ev.trim();
-        if (ev.startsWith("\"")) ev = ev.substring(1);
-        if (ev.endsWith("\""))   ev = ev.substring(0, ev.length()-1);
-        if (ev.endsWith("_out")) count++;
+    if (_cachedIns < 0) {
+        _cachedIns = _scanEventSuffix(todayFilename(), "_in");
+        Serial.printf("[SD] countTodayCheckIns = %d (full scan — cache primed)\n", _cachedIns);
     }
-    f.close();
-    Serial.printf("[SD] countTodayCheckOuts = %d\n", count);
-    return count;
+    return _cachedIns;
+}
+
+int SDDatabase::countTodayCheckOuts() {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
+    if (!_ready) return 0;
+    if (_cachedOuts < 0) {
+        _cachedOuts = _scanEventSuffix(todayFilename(), "_out");
+        Serial.printf("[SD] countTodayCheckOuts = %d (full scan — cache primed)\n", _cachedOuts);
+    }
+    return _cachedOuts;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
 // saveEmployeeProfile / loadEmployeeProfile / hasEmployeeProfile
 // ══════════════════════════════════════════════════════════════════════════════
 bool SDDatabase::saveEmployeeProfile(const String& empUid, const EmployeeProfile& emp) {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!_ready || empUid.length() == 0) return false;
 
     String path = "/employees/" + empUid + ".json";
@@ -360,6 +365,7 @@ bool SDDatabase::saveEmployeeProfile(const String& empUid, const EmployeeProfile
 }
 
 bool SDDatabase::loadEmployeeProfile(const String& empUid, EmployeeProfile& out) {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!_ready || empUid.length() == 0) return false;
 
     String path = "/employees/" + empUid + ".json";
@@ -397,6 +403,7 @@ bool SDDatabase::loadEmployeeProfile(const String& empUid, EmployeeProfile& out)
 }
 
 bool SDDatabase::hasEmployeeProfile(const String& empUid) {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!_ready || empUid.length() == 0) return false;
     return SD_MMC.exists("/employees/" + empUid + ".json");
 }
@@ -405,6 +412,7 @@ bool SDDatabase::hasEmployeeProfile(const String& empUid) {
 // savePhoto / hasPhoto / photoPath
 // ══════════════════════════════════════════════════════════════════════════════
 bool SDDatabase::savePhoto(const String& empUid, const uint8_t* data, size_t length) {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!_ready || empUid.length() == 0 || !data || length == 0) return false;
     ensureDir("/photos");
 
@@ -467,6 +475,7 @@ bool SDDatabase::savePhoto(const String& empUid, const uint8_t* data, size_t len
 }
 
 bool SDDatabase::hasPhoto(const String& empUid) {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!_ready || empUid.length() == 0) return false;
     // Check all supported formats — server may send WebP, JPEG, or PNG
     const char* exts[] = {".webp", ".jpg", ".png", nullptr};
@@ -491,11 +500,13 @@ String SDDatabase::photoPath(const String& empUid) {
 // freeBytes / printInfo
 // ══════════════════════════════════════════════════════════════════════════════
 uint64_t SDDatabase::freeBytes() {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!_ready) return 0;
     return SD_MMC.totalBytes() - SD_MMC.usedBytes();
 }
 
 void SDDatabase::printInfo() {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!_ready) { Serial.println("[SD] Not mounted"); return; }
     Serial.printf("[SD] Total: %llu MB  Used: %llu MB  Free: %llu MB\n",
                   SD_MMC.totalBytes() / 1048576,
@@ -508,6 +519,7 @@ void SDDatabase::printInfo() {
 // hasCheckedInToday
 // ══════════════════════════════════════════════════════════════════════════════
 bool SDDatabase::hasCheckedInToday(const String& empUid) {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!_ready) return false;
     String path = todayFilename();
     if (!SD_MMC.exists(path)) return false;
@@ -545,6 +557,7 @@ bool SDDatabase::hasCheckedInToday(const String& empUid) {
 // e.g. "morning_in,morning_out,afternoon_in"
 // ══════════════════════════════════════════════════════════════════════════════
 String SDDatabase::loadAttendanceToday(const String& empUid) {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!_ready) return "";
     String path = todayFilename();
     if (!SD_MMC.exists(path)) return "";
@@ -619,6 +632,7 @@ String SDDatabase::loadAttendanceToday(const String& empUid) {
 // already used by loadAttendanceToday()/countTodayCheckIns().
 // ══════════════════════════════════════════════════════════════════════════════
 bool SDDatabase::removeAttendanceRow(const String& empUid, const String& clockType) {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!_ready || empUid.length() == 0 || clockType.length() == 0) return false;
 
     String path = todayFilename();
@@ -631,7 +645,9 @@ bool SDDatabase::removeAttendanceRow(const String& empUid, const String& clockTy
     }
 
     String keptLines;
-    bool   removedAny = false;
+    bool   removedAny   = false;
+    int    removedInCt  = 0;
+    int    removedOutCt = 0;
 
     while (rf.available()) {
         String line = rf.readStringUntil('\n');
@@ -668,6 +684,8 @@ bool SDDatabase::removeAttendanceRow(const String& empUid, const String& clockTy
 
         if (matches) {
             removedAny = true;
+            if (clockType.endsWith("_in"))  removedInCt++;
+            if (clockType.endsWith("_out")) removedOutCt++;
             Serial.println("[SD] removeAttendanceRow: dropping -> " + line);
         } else {
             keptLines += line + "\n";
@@ -689,6 +707,13 @@ bool SDDatabase::removeAttendanceRow(const String& empUid, const String& clockTy
     wf.print(keptLines);
     wf.close();
 
+    // Keep the count cache in sync with what was actually dropped, same
+    // reasoning as the increment in logAttendance(). Only adjust if primed
+    // (>= 0); clamp at 0 defensively so a mismatched cache can never go
+    // negative and poison future increments.
+    if (_cachedIns  >= 0) _cachedIns  = max(0, _cachedIns  - removedInCt);
+    if (_cachedOuts >= 0) _cachedOuts = max(0, _cachedOuts - removedOutCt);
+
     Serial.println("[SD] removeAttendanceRow: uid=" + empUid +
                    " type=" + clockType + " removed — CSV rewritten (" + path + ")");
     return true;
@@ -708,6 +733,7 @@ bool SDDatabase::removeAttendanceRow(const String& empUid, const String& clockTy
 // New filename: /employees/nfc_04-A3-2F-12-6B-4C-80.json  ← valid
 // ══════════════════════════════════════════════════════════════════════════════
 bool SDDatabase::saveNfcMapping(const String& cardId, const String& empUid) {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!_ready || cardId.length() == 0 || empUid.length() == 0) return false;
 
     String safeId = _sanitizeForFilename(cardId);
@@ -729,6 +755,7 @@ bool SDDatabase::saveNfcMapping(const String& cardId, const String& empUid) {
 }
 
 String SDDatabase::loadUidForNfc(const String& cardId) {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!_ready || cardId.length() == 0) return "";
 
     // First check: if cardId itself is an employee uid (numeric id scan)
@@ -756,46 +783,150 @@ String SDDatabase::loadUidForNfc(const String& cardId) {
     Serial.println("[SD] loadUidForNfc: found empUid=" + uid);
     return uid;
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// loadUidForNfcPrefix
+//
+// Fallback for a short/truncated NDEF read (card left the RF field before the
+// full ID was captured — see nfc_manager.cpp). Scans /employees for mapping
+// files whose name starts with "nfc_<prefix>". Only returns a uid when
+// EXACTLY ONE file matches — 0 matches (unknown) or 2+ matches (ambiguous
+// prefix shared by more than one employee) both return "" so callers never
+// silently clock in the wrong person. Caller is responsible for only
+// invoking this with a prefix long enough to be safe (see MIN_PREFIX_LEN in
+// main.cpp) — this function itself has no opinion on minimum length.
+// ══════════════════════════════════════════════════════════════════════════════
+String SDDatabase::loadUidForNfcPrefix(const String& prefix) {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
+    if (!_ready || prefix.length() == 0) return "";
+
+    File dir = SD_MMC.open("/employees");
+    if (!dir || !dir.isDirectory()) return "";
+
+    String safePrefix = _sanitizeForFilename(prefix);
+    String needle      = "nfc_" + safePrefix;
+
+    String matchUid   = "";
+    int    matchCount = 0;
+
+    File f = dir.openNextFile();
+    while (f) {
+        if (!f.isDirectory()) {
+            String name = String(f.name());
+            int slash = name.lastIndexOf('/');
+            if (slash >= 0) name = name.substring(slash + 1);
+
+            if (name.startsWith(needle)) {
+                matchCount++;
+                if (matchCount == 1) {
+                    DynamicJsonDocument doc(128);
+                    if (deserializeJson(doc, f) == DeserializationError::Ok) {
+                        matchUid = doc["uid"] | "";
+                    }
+                } else {
+                    // Second+ match found — no need to keep scanning further,
+                    // the prefix is already proven ambiguous.
+                    f.close();
+                    break;
+                }
+            }
+        }
+        f = dir.openNextFile();
+    }
+    dir.close();
+
+    if (matchCount != 1 || matchUid.length() == 0) {
+        Serial.printf("[SD] loadUidForNfcPrefix: prefix '%s' matched %d employee(s) — ambiguous/unknown, rejecting\n",
+                      prefix.c_str(), matchCount);
+        return "";
+    }
+
+    Serial.printf("[SD] loadUidForNfcPrefix: prefix '%s' uniquely matched empUid=%s\n",
+                  prefix.c_str(), matchUid.c_str());
+    return matchUid;
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // Server-ID Map  — /attendance/server_ids_YYYY-MM-DD.json
 // Stores the server DB record `id` returned after a successful attendance POST
 // so edits can use PUT /{id} instead of POST, preventing duplicate rows.
 // Key: "empUid|clockType|HH:MM:SS"
+//
+// PERF: this used to be a single JSON object, read-parsed-modified-
+// reserialized-rewritten on EVERY save (full O(n) read+write per tap, plus a
+// fixed 4096-byte DynamicJsonDocument capacity that silently stops accepting
+// new keys once ~80-100 entries are in it — no error, just quietly-dropped
+// mappings past that point, which then fall back to POST and risk duplicate
+// server rows). Now stored as flat append-only "key=id" lines on disk:
+// saves are O(1) appends with no capacity ceiling, and the O(n) cost only
+// happens on the rarer read paths (portal viewing the map, or an edit/
+// delete). loadServerIdMapJson() still hands back a proper JSON object so
+// existing consumers (WiFiManager.h, attendance_http_service.h) don't need
+// to change at all.
 // ══════════════════════════════════════════════════════════════════════════════
 
 static String _serverIdMapPath(const String& date) {
     return "/attendance/server_ids_" + date + ".json";
 }
 
+// One-time migration: if a file from before this update still holds the old
+// single-JSON-object format (starts with '{'), convert it to flat "key=id"
+// lines in place. No-op (fast peek + close) once a file is already flat, so
+// this is cheap to call unconditionally at the top of every map operation —
+// it only does real work the first time this firmware touches a date file
+// left over from the previous build.
+static void _migrateServerIdMapIfNeeded(const String& path) {
+    if (!SD_MMC.exists(path)) return;
+    File pf = SD_MMC.open(path, FILE_READ);
+    if (!pf) return;
+    int firstByte = pf.peek();
+    if (firstByte != '{') { pf.close(); return; }   // already flat, or empty
+
+    DynamicJsonDocument doc(8192);
+    DeserializationError err = deserializeJson(doc, pf);
+    pf.close();
+    if (err) {
+        Serial.println("[SD] server-id map migration: parse failed, leaving file as-is: " + path);
+        return;   // don't risk data loss on a parse error — leave the old file alone
+    }
+
+    File wf = SD_MMC.open(path, FILE_WRITE);   // truncates
+    if (!wf) return;
+    for (JsonPair kv : doc.as<JsonObject>()) {
+        wf.print(kv.key().c_str());
+        wf.print('=');
+        wf.println((long)kv.value().as<long>());
+    }
+    wf.close();
+    Serial.println("[SD] Migrated server-id map to flat format: " + path);
+}
+
+static String _serverIdKey(const String& empUid, const String& clockType, const String& timeStr) {
+    String t = timeStr;
+    int sp = t.indexOf(' ');
+    if (sp >= 0) t = t.substring(sp + 1);   // "YYYY-MM-DD HH:MM:SS" → "HH:MM:SS"
+    return empUid + "|" + clockType + "|" + t;
+}
+
 bool SDDatabase::saveServerIdMapping(const String& date, const String& empUid,
                                       const String& clockType, const String& timeStr,
                                       int serverId) {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!_ready || serverId <= 0 || date.length() == 0) return false;
 
     String path = _serverIdMapPath(date);
-    DynamicJsonDocument doc(4096);
+    _migrateServerIdMapIfNeeded(path);
 
-    // Load existing map (if any)
-    if (SD_MMC.exists(path)) {
-        File rf = SD_MMC.open(path, FILE_READ);
-        if (rf) { deserializeJson(doc, rf); rf.close(); }
-    }
+    String key = _serverIdKey(empUid, clockType, timeStr);
 
-    // Extract time-only portion (HH:MM:SS) from timeStr
-    String t = timeStr;
-    int sp = t.indexOf(' ');
-    if (sp >= 0) t = t.substring(sp + 1);  // "YYYY-MM-DD HH:MM:SS" → "HH:MM:SS"
-
-    String key = empUid + "|" + clockType + "|" + t;
-    doc[key] = serverId;
-
-    // Write back
-    File wf = SD_MMC.open(path, FILE_WRITE);
+    File wf = SD_MMC.open(path, FILE_APPEND);
     if (!wf) {
         Serial.println("[SD] saveServerIdMapping: cannot open " + path);
         return false;
     }
-    serializeJson(doc, wf);
+    wf.print(key);
+    wf.print('=');
+    wf.println(serverId);
     wf.close();
 
     Serial.printf("[SD] Saved server_id=%d for key=%s\n", serverId, key.c_str());
@@ -804,67 +935,94 @@ bool SDDatabase::saveServerIdMapping(const String& date, const String& empUid,
 
 int SDDatabase::getServerIdForRecord(const String& date, const String& empUid,
                                       const String& clockType, const String& timeStr) {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!_ready || date.length() == 0) return 0;
 
     String path = _serverIdMapPath(date);
     if (!SD_MMC.exists(path)) return 0;
+    _migrateServerIdMapIfNeeded(path);
+
+    String needle = _serverIdKey(empUid, clockType, timeStr) + "=";
 
     File f = SD_MMC.open(path, FILE_READ);
     if (!f) return 0;
-    DynamicJsonDocument doc(4096);
-    deserializeJson(doc, f);
+    int result = 0;
+    // Scan to the end rather than stopping at the first match: if the same
+    // key was ever saved twice (re-sync, retry), the LAST line wins, same
+    // "last write" semantics the old doc[key]=val approach had.
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) continue;
+        if (line.startsWith(needle)) {
+            result = line.substring(needle.length()).toInt();
+        }
+    }
     f.close();
-
-    String t = timeStr;
-    int sp = t.indexOf(' ');
-    if (sp >= 0) t = t.substring(sp + 1);
-
-    String key = empUid + "|" + clockType + "|" + t;
-    int id = doc[key] | 0;
-    return id;
+    return result;
 }
 
 String SDDatabase::loadServerIdMapJson(const String& date) {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!_ready || date.length() == 0) return "{}";
     String path = _serverIdMapPath(date);
     if (!SD_MMC.exists(path)) return "{}";
+    _migrateServerIdMapIfNeeded(path);
+
     File f = SD_MMC.open(path, FILE_READ);
     if (!f) return "{}";
-    String out;
-    while (f.available()) { out += (char)f.read(); yield(); }
+    DynamicJsonDocument doc(8192);
+    while (f.available()) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) continue;
+        int eq = line.lastIndexOf('=');
+        if (eq < 0) continue;
+        doc[line.substring(0, eq)] = line.substring(eq + 1).toInt();
+        yield();
+    }
     f.close();
+    String out;
+    serializeJson(doc, out);
     return out;
 }
 
 bool SDDatabase::removeServerIdMapping(const String& date, const String& empUid,
                                         const String& clockType, const String& timeStr) {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
     if (!_ready || date.length() == 0) return false;
 
-    String path = "/attendance/server_ids_" + date + ".json";
-    if (!SD_MMC.exists(path)) return true;  // nothing to remove
+    String path = _serverIdMapPath(date);
+    if (!SD_MMC.exists(path)) return true;   // nothing to remove
+    _migrateServerIdMapIfNeeded(path);
 
-    DynamicJsonDocument doc(4096);
-    {
-        File rf = SD_MMC.open(path, FILE_READ);
-        if (!rf) return false;
-        deserializeJson(doc, rf);
-        rf.close();
+    String needle = _serverIdKey(empUid, clockType, timeStr) + "=";
+
+    File rf = SD_MMC.open(path, FILE_READ);
+    if (!rf) return false;
+    String kept;
+    bool removedAny = false;
+    while (rf.available()) {
+        String line = rf.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) continue;
+        if (line.startsWith(needle)) {
+            removedAny = true;
+        } else {
+            kept += line + "\n";
+        }
+        yield();
     }
+    rf.close();
 
-    String t = timeStr;
-    int sp = t.indexOf(' ');
-    if (sp >= 0) t = t.substring(sp + 1);  // strip date portion if present
+    if (!removedAny) return true;   // key not found — already gone
 
-    String key = empUid + "|" + clockType + "|" + t;
-    if (!doc.containsKey(key)) return true;  // key not found — already gone
-
-    doc.remove(key);
-
-    File wf = SD_MMC.open(path, FILE_WRITE);
-    if (!wf) return false;
-    serializeJson(doc, wf);
+    File wf = SD_MMC.open(path, FILE_WRITE);   // truncates
+    if (!wf) {
+        Serial.println("[SD] removeServerIdMapping: cannot reopen for write: " + path);
+        return false;
+    }
+    wf.print(kept);
     wf.close();
-
-    Serial.printf("[SD] Removed server_id map entry: %s\n", key.c_str());
     return true;
 }
