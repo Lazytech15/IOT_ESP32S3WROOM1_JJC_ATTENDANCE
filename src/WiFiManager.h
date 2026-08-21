@@ -2561,6 +2561,22 @@ loadStatus();loadNets();
         // fine, while the Clock-In/Clock-Out name strip — only ever touched
         // here or by a fresh tap — kept showing the deleted person forever.
         if (fileArg == "today" || fileArg == "__today__") {
+            // Drop the cached check-in/check-out counters so the stats
+            // refresh triggered just below (via g_requestDashboardRefresh ->
+            // g_pendingStatsRefresh) does one real re-scan of the just-edited
+            // CSV instead of returning the pre-delete cached number.
+            // countTodayCheckIns()/countTodayCheckOuts() only ever increment
+            // their cache on SDDatabase::logAttendance() writes — this
+            // handler rewrites the CSV directly (skipping the deleted row)
+            // and never goes through logAttendance(), so without this reset
+            // the dashboard kept showing the old, too-high count even though
+            // "Attendance updated" fired and the row was really gone. Same
+            // fix already applied to the bulk server-reconcile purge path
+            // above (search resetTodayCountCache) — this was the other,
+            // more common path (a manual single-row delete) that was
+            // missing it.
+            SDDatabase::resetTodayCountCache();
+
             // Don't touch the TFT directly here — see g_requestDashboardRefresh's
             // doc comment above for why (screensaver-corruption guard).
             if (g_requestDashboardRefresh) g_requestDashboardRefresh();
