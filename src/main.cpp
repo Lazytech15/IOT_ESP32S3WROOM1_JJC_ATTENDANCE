@@ -833,6 +833,14 @@ static void pollSocketEvents() {
 }
 
 // ─── NTP Time Sync ────────────────────────────────────────────────────────────
+// Survives ESP.restart() (RTC memory keeps its value across a software
+// reset) but resets to 0 on a real power cycle — exactly what we want for
+// capping consecutive "reboot to retry NTP" attempts without risking an
+// infinite bootloop if NTP is unreachable for a longer stretch (bad DNS,
+// blocked UDP 123, etc.) instead of just a one-off hiccup.
+RTC_DATA_ATTR static uint8_t g_ntpBootRetryCount = 0;
+static const uint8_t NTP_BOOT_MAX_REBOOTS = 3;
+
 void syncNTPTime() {
     if (!wifiConfig.isConnected()) return;
     Serial.println("[Time] Syncing NTP...");
@@ -858,6 +866,51 @@ void syncNTPTime() {
     } else {
         Serial.println("[Time] NTP failed after 10s");
     }
+}
+
+// Boot-time-only guard against the "stopwatch clock" symptom: if WiFi came
+// up but NTP never landed, clkEpoch stays 0 and the free-running ++clkS
+// ticker in updateClockTick() (below) just counts up from 00:00:00 like a
+// stopwatch instead of showing a real time — because as far as it knows,
+// 00:00:00 IS the current time. A couple of quick in-place retries usually
+// catches a transient NTP hiccup; if those still fail, a fresh reboot (full
+// WiFi/NTP re-init) fixes it far more often than retrying in the same
+// session does, so we do that — but only up to NTP_BOOT_MAX_REBOOTS in a
+// row, so a genuinely unreachable NTP server degrades to "dashboard runs
+// with an unsynced clock" instead of bootlooping forever.
+void ensureClockSyncedOrReboot() {
+    if (!wifiConfig.isConnected()) {
+        // No WiFi at boot — expected/acceptable offline mode, not the bug
+        // being guarded against here. Don't burn a reboot attempt on it.
+        return;
+    }
+    if (clkEpoch != 0) {
+        g_ntpBootRetryCount = 0;   // clean sync — reset the streak for next time
+        return;
+    }
+
+    Serial.println("[Time] NTP didn't land on first try — retrying before giving up...");
+    for (int i = 0; i < 2 && clkEpoch == 0; i++) {
+        delay(1000);
+        syncNTPTime();
+    }
+    if (clkEpoch != 0) {
+        g_ntpBootRetryCount = 0;
+        return;
+    }
+
+    if (g_ntpBootRetryCount < NTP_BOOT_MAX_REBOOTS) {
+        g_ntpBootRetryCount++;
+        Serial.printf("[Time] Still no NTP after retries — rebooting to refresh "
+                      "(attempt %d/%d)\n", g_ntpBootRetryCount, NTP_BOOT_MAX_REBOOTS);
+        delay(300);
+        ESP.restart();
+        // unreachable — ESP.restart() doesn't return
+    }
+
+    Serial.println("[Time] NTP still unavailable after max reboot attempts — "
+                    "continuing with an unsynced clock rather than bootlooping forever");
+    g_ntpBootRetryCount = 0;   // don't carry the streak into the next real boot
 }
 
 // ─── Photo cache helper ───────────────────────────────────────────────────────
@@ -1692,6 +1745,11 @@ void setup() {
     if (wifiConfig.isConnected()) {
         showLoadingAnimation(65, ("WiFi: " + wifiConfig.getSSID()).c_str());
         syncNTPTime();
+        // Guards against the "clock shows a stopwatch instead of the real
+        // time" symptom — see ensureClockSyncedOrReboot()'s comment above.
+        // Reboots (a bounded number of times) instead of proceeding into the
+        // dashboard with an un-synced clock if NTP didn't land.
+        ensureClockSyncedOrReboot();
     } else {
         showLoadingAnimation(65, "WiFi: AP mode");
         Serial.println("[Boot] WiFi not connected — SD-only");
