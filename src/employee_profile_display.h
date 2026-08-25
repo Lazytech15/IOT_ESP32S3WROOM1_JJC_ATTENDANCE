@@ -77,17 +77,33 @@ public:
     void showError(const String& message) {
         if (!_tft) return;
         _tft->fillScreen(TFTColors::BG_DARK);
-        int cx = SCREEN_W / 2, cy = 110;
+        int cx = SCREEN_W / 2, cy = 100;
         _tft->fillCircle(cx, cy, 40, TFTColors::ERROR);
         _tft->setTextColor(TFTColors::WHITE, TFTColors::ERROR);
         _tft->setTextDatum(MC_DATUM);
         _tft->drawString("X", cx, cy, 6);
         _tft->setTextColor(TFTColors::ERROR, TFTColors::BG_DARK);
-        _tft->drawString("ACCESS DENIED", SCREEN_W / 2, 175, 4);
+        _tft->drawString("ACCESS DENIED", SCREEN_W / 2, 165, 4);
+
+        // FIX: this used to setTextColor+drawString the raw `message` as a
+        // single line at font size 2, truncated to 26 chars. Two problems
+        // in practice: an embedded "\n" (every caller passes one, e.g.
+        // "Tap too quick\nHold card ~1 sec") isn't a line break to
+        // drawString() — it just renders as an unprintable glyph/gap in the
+        // middle of the line — and font size 2 is small enough on a 240px
+        // panel that an employee glancing up mid-stride in a line often
+        // couldn't read the reason before the screen moved on. Now the
+        // message is actually split into up to two real lines and drawn at
+        // font size 4 (same size as the "ACCESS DENIED" heading above it),
+        // matching the longer NFC_ERROR_DISPLAY_MS this now gets to be read.
         _tft->setTextColor(TFTColors::TEXT_SECONDARY, TFTColors::BG_DARK);
-        String m = message;
-        if (m.length() > 26) m = m.substring(0, 26);
-        _tft->drawString(m, SCREEN_W / 2, 205, 2);
+        int nl = message.indexOf('\n');
+        String line1 = (nl >= 0) ? message.substring(0, nl) : message;
+        String line2 = (nl >= 0) ? message.substring(nl + 1) : "";
+        _tft->drawString(line1, SCREEN_W / 2, 210, 4);
+        if (line2.length() > 0) {
+            _tft->drawString(line2, SCREEN_W / 2, 248, 4);
+        }
         _tft->setTextDatum(TL_DATUM);
     }
 

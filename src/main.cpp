@@ -7,7 +7,8 @@
 //                       delays after each step. Total target boot < 4s.
 //
 //  2. FAST TAP        — NFC → SD write → profile display in < 200ms.
-//                       Profile shown for exactly PROFILE_DISPLAY_MS (2s),
+//                       Profile shown for PROFILE_DISPLAY_MS (1.5s, unified
+//                       across peak and non-peak — see define below),
 //                       then auto-returns to dashboard for next tap.
 //
 //  3. OFFLINE-FIRST   — Every scan is ALWAYS written to SD first (< 5ms).
@@ -111,8 +112,21 @@
 // Peak:      800ms — fast turnover during rush-hour lineups.
 // The display auto-shortens during peak hours so the queue moves faster.
 // A new card from a DIFFERENT employee also short-circuits the wait immediately.
-#define PROFILE_DISPLAY_MS      2000
-#define PROFILE_DISPLAY_PEAK_MS  800   // rush-hour display time
+// Unified display idle-timeout, day-round. Previously peak hour used a
+// separate, shorter 800ms window to keep the line moving — but with the
+// instant-swap behavior in STATE_NFC_PROFILE (a buffered next tap always
+// replaces the current profile right away, regardless of this timer), the
+// timer only ever matters for the gap AFTER the last tap in a burst. 1.5s
+// there is a middle ground: noticeably faster than the old 3s idle window,
+// without cutting it so close that someone glancing at their own profile
+// misses seeing it.
+#define PROFILE_DISPLAY_MS      1500
+// Error/warning screens (e.g. "Tap too quick") get more time than a normal
+// success profile — 2s wasn't enough to actually read a message that's new
+// to the employee, since the old, small, un-split text was hard to read in
+// that window too. 3s gives enough time to read it now that it's rendered
+// bigger and on two clear lines (see EmployeeProfileDisplay::showError()).
+#define NFC_ERROR_DISPLAY_MS    3000
 
 // ── UPLOAD SCHEDULER ──────────────────────────────────────────────────────────
 #define UPLOAD_FLUSH_MS      600000    // upload cadence: 10 minutes (was 500ms — was causing freeze after every scan)
@@ -169,14 +183,38 @@
 String deviceId = "Attendance_Display_01";
 
 // ─── Software clock ──────────────────────────────────────────────────────────
-static uint8_t  clkH = 0, clkM = 0, clkS = 0;
-static uint32_t clkEpoch = 0;
+// volatile + critical section: clkH/clkM/clkS/clkEpoch are written by
+// tickClock() on Core 1 (loop()'s free-running per-second ticker) AND by
+// resyncClockFromRTC() on Core 0 (called from wakeScreen(), which the NFC
+// task calls on every tap). Without synchronization, a tap's RTC resync
+// (Core 0) and a tick (Core 1) landing at the same moment can interleave
+// their writes to these 4 fields — e.g. Core 1's tick can silently overwrite
+// a freshly RTC-corrected clkEpoch with a stale pre-resync value +1 second,
+// leaving clkH/clkM/clkS showing the correct new time but clkEpoch (which
+// dateStr() derives the logged date from) still one day behind. That's what
+// produced attendance records with the right time but the previous day's
+// date. portMUX_TYPE serializes the writers so a tick and a resync can never
+// interleave field-by-field.
+static portMUX_TYPE g_clockMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile uint8_t  clkH = 0, clkM = 0, clkS = 0;
+static volatile uint32_t clkEpoch = 0;
 
 static void tickClock() {
-    if (++clkS >= 60) { clkS = 0;
-    if (++clkM >= 60) { clkM = 0;
-    if (++clkH >= 24) { clkH = 0; if (clkEpoch) clkEpoch += 86400; }}}
-    if (clkEpoch) clkEpoch++;
+    portENTER_CRITICAL(&g_clockMux);
+    // Rewritten as explicit read-modify-write (x = x + 1) instead of ++x
+    // on a volatile: pre/post-increment of volatile-qualified values is
+    // deprecated in C++20 and was producing -Wvolatile warnings. Behavior
+    // is unchanged, just spelled out instead of relying on ++.
+    clkS = clkS + 1;
+    if (clkS >= 60) { clkS = 0;
+        clkM = clkM + 1;
+        if (clkM >= 60) { clkM = 0;
+            clkH = clkH + 1;
+            if (clkH >= 24) { clkH = 0; if (clkEpoch) clkEpoch += 86400; }
+        }
+    }
+    if (clkEpoch) clkEpoch = clkEpoch + 1;
+    portEXIT_CRITICAL(&g_clockMux);
 }
 
 static int catchUpClock(unsigned long& lastClock) {
@@ -190,6 +228,15 @@ static int catchUpClock(unsigned long& lastClock) {
     for (int i = 0; i < ticks; i++) tickClock();
     return ticks;
 }
+// clkEpoch == 0 means the software clock has never been NTP/RTC-synced —
+// clkH/clkM/clkS are just free-running ticks from 00:00:00 since boot
+// (the "stopwatch" symptom). Callers should show a placeholder instead
+// of painting those raw values as if they were real time.
+static inline bool clockIsSynced() { return clkEpoch != 0; }
+// Defined below, near ensureClockSyncedOrReboot() — forward-declared here
+// because wakeScreen() (which needs it) comes first in the file.
+static bool handleUnsyncedClockOrReboot(bool onScreensaver);
+
 static String clockStr() {
     char b[12]; snprintf(b, sizeof(b), "%02d:%02d:%02d", clkH, clkM, clkS);
     return b;
@@ -313,8 +360,12 @@ EmployeeProfileDisplay* empDisplay = nullptr;
 static bool initialSyncDone = false;
 
 // ─── Screen timeout ───────────────────────────────────────────────────────────
-static unsigned long lastActivityMs  = 0;   // last time the screen was "touched"
-static bool          screenIsOff     = false;
+// volatile: read/written from both loop() (Core 1) and nfcWorkerTask (Core 0).
+// Without volatile the compiler can cache stale copies per-core, so a tap
+// landing on Core 0 could read a stale screenIsOff==false and skip
+// wakeScreen() entirely — screen stays dim even though a card was tapped.
+static volatile unsigned long lastActivityMs  = 0;   // last time the screen was "touched"
+static volatile bool          screenIsOff     = false;
 
 // ─── Screensaver burn-in protection ────────────────────────────────────────────
 // A second, shorter timer that fires only while the screensaver is already
@@ -323,15 +374,26 @@ static bool          screenIsOff     = false;
 // indefinitely (LCD panels can still develop image persistence, just more
 // slowly than OLED). Restored to full brightness by wakeScreen().
 #define DIM_AFTER_SCREENSAVER_MS   10000   // 10 seconds into the screensaver
-#define SCREENSAVER_DIM_LEVEL      60      // ~24% brightness — still readable
-static unsigned long g_screensaverEnteredMs = 0;
-static bool          g_screensaverDimmed    = false;
+// Previously 60 (~24% duty) — on this backlight LED, PWM brightness doesn't
+// scale linearly with duty cycle, so 24% still looked almost full-bright and
+// read as "not dimming" even though the fade was running correctly. Dropped
+// to a much darker level that's still non-zero (never fully black, so the
+// clock/date stay legible) but is now unmistakably dimmer than the initial
+// screensaver brightness.
+#define SCREENSAVER_DIM_LEVEL      18      // ~7% brightness — clearly dim, still readable
+// volatile: g_screensaverDimmed is cleared by wakeScreen() on Core 0 (NFC
+// task) but set by loop() on Core 1 — same cross-core visibility issue as
+// screenIsOff above.
+static volatile unsigned long g_screensaverEnteredMs = 0;
+static volatile bool          g_screensaverDimmed    = false;
 
 static bool          wasConnectedGlobal = false;  // tracks WiFi state across loop()
 
 // Set true by wakeScreen() so loop()'s clock branch resets lastClock to now,
 // preventing a huge catch-up burst of ticks after a long standby.
-static bool g_clockNeedsReset = false;
+// volatile: set on Core 0 (nfcWorkerTask -> wakeScreen()), read/cleared on
+// Core 1 (loop()) — same cross-core visibility issue as the flags above.
+static volatile bool g_clockNeedsReset = false;
 
 // Re-sync the software clock from the ESP32 RTC (no network needed).
 // The RTC keeps ticking during standby / screen-off, so this instantly
@@ -339,10 +401,17 @@ static bool g_clockNeedsReset = false;
 static void resyncClockFromRTC() {
     struct tm timeinfo;
     if (getLocalTime(&timeinfo, 0)) {
+        // mktime() takes a libc mutex internally (via tzset), which is not
+        // safe to call inside a FreeRTOS critical section - compute it
+        // before entering the critical section (see syncNTPTime() for the
+        // same fix and full explanation).
+        uint32_t epoch = (uint32_t)mktime(&timeinfo);
+        portENTER_CRITICAL(&g_clockMux);
         clkH     = timeinfo.tm_hour;
         clkM     = timeinfo.tm_min;
         clkS     = timeinfo.tm_sec;
-        clkEpoch = (uint32_t)mktime(&timeinfo);
+        clkEpoch = epoch;
+        portEXIT_CRITICAL(&g_clockMux);
         Serial.printf("[Clock] RTC resync on wake: %02d:%02d:%02d\n",
                       clkH, clkM, clkS);
     } else {
@@ -372,7 +441,8 @@ static void wakeScreen() {
 
         TFTDisplayManager::backlightOn();
         drawStaticUI();
-        updateClock(clkH, clkM, clkS);
+        if (clockIsSynced()) updateClock(clkH, clkM, clkS);
+        else                 handleUnsyncedClockOrReboot(false);
         updateDate(buildDateStr());
         updateAttendanceStats(max(0, SDDatabase::countTodayCheckIns()),
                               max(0, SDDatabase::countTodayCheckOuts()));
@@ -855,11 +925,19 @@ void syncNTPTime() {
     }
 
     if (getLocalTime(&timeinfo, 0)) {
+        // mktime() internally takes a libc mutex (via tzset) to read the TZ
+        // env var, which is illegal inside a FreeRTOS critical section and
+        // was causing abort()/reboot. Compute it beforehand and only guard
+        // the shared clock variable assignment with the critical section.
+        uint32_t epoch = (uint32_t)mktime(&timeinfo);
+        portENTER_CRITICAL(&g_clockMux);
         clkH     = timeinfo.tm_hour;
         clkM     = timeinfo.tm_min;
         clkS     = timeinfo.tm_sec;
-        clkEpoch = (uint32_t)mktime(&timeinfo);
+        clkEpoch = epoch;
+        portEXIT_CRITICAL(&g_clockMux);
         SDDatabase::setDateProvider([]() -> String { return dateStr(); });
+        g_ntpBootRetryCount = 0;   // clean sync — reset the reboot-cap streak
         Serial.printf("[Time] OK: %04d-%02d-%02d %02d:%02d:%02d\n",
                       timeinfo.tm_year+1900, timeinfo.tm_mon+1, timeinfo.tm_mday,
                       clkH, clkM, clkS);
@@ -911,6 +989,36 @@ void ensureClockSyncedOrReboot() {
     Serial.println("[Time] NTP still unavailable after max reboot attempts — "
                     "continuing with an unsynced clock rather than bootlooping forever");
     g_ntpBootRetryCount = 0;   // don't carry the streak into the next real boot
+}
+
+// Runtime counterpart to ensureClockSyncedOrReboot(): called from the
+// dashboard/screensaver render paths at the moment they'd otherwise have
+// to paint a "--:--:--" stopwatch placeholder because clkEpoch is still 0.
+// Per request, that placeholder is now a last resort — the device reboots
+// to force a fresh WiFi/NTP re-init first, since a reboot recovers from a
+// stuck/never-associated WiFi state that WiFi.reconnect() alone sometimes
+// doesn't. Reuses the same RTC_DATA_ATTR g_ntpBootRetryCount/
+// NTP_BOOT_MAX_REBOOTS cap as the boot-time guard so a genuinely
+// unreachable network (e.g. no WiFi configured at all) degrades to the
+// dashed placeholder after a few tries instead of bootlooping forever.
+// Returns true if it drew the placeholder (caller should do nothing else
+// this tick); false means a reboot was just issued (unreachable in
+// practice — ESP.restart() doesn't return).
+static bool handleUnsyncedClockOrReboot(bool onScreensaver) {
+    if (g_ntpBootRetryCount < NTP_BOOT_MAX_REBOOTS) {
+        g_ntpBootRetryCount++;
+        Serial.printf("[Time] Clock still unsynced on dashboard — rebooting to "
+                      "recover NTP (attempt %d/%d)\n",
+                      g_ntpBootRetryCount, NTP_BOOT_MAX_REBOOTS);
+        delay(300);
+        ESP.restart();
+        // unreachable — ESP.restart() doesn't return
+    }
+    Serial.println("[Time] Clock still unsynced after max reboot attempts — "
+                    "showing placeholder rather than bootlooping forever");
+    if (onScreensaver) updateScreensaverClockUnsynced();
+    else                updateClockUnsynced();
+    return true;
 }
 
 // ─── Photo cache helper ───────────────────────────────────────────────────────
@@ -1439,13 +1547,21 @@ static void uploadWorkerTask(void* /*param*/) {
 // 9. Broadcast SSE to portal
 // ════════════════════════════════════════════════════════════════════════════
 static void nfcWorkerBody(const String& cardIdentifier) {
+    // Belt-and-suspenders: force full brightness before the profile/photo
+    // ever gets drawn, regardless of what state the backlight was already
+    // in. wakeScreen() below already does this when screenIsOff, but this
+    // guarantees the employee's photo is never shown at anything less than
+    // full brightness even in an edge case that isn't screenIsOff.
+    TFTDisplayManager::backlightOn();
+
     // ── Wake display / refresh clock immediately ──────────────────────────
     if (screenIsOff) {
         wakeScreen();   // full restore: backlight + drawStaticUI + clock
     } else {
         // Screen already on — repaint clock right now before any blocking
         // SD / server work, so the display never appears frozen mid-scan
-        updateClock(clkH, clkM, clkS);
+        if (clockIsSynced()) updateClock(clkH, clkM, clkS);
+        else                 handleUnsyncedClockOrReboot(false);
         updateDate(buildDateStr());
     }
 
@@ -1525,9 +1641,17 @@ static void nfcWorkerBody(const String& cardIdentifier) {
         }
 
         Serial.println("[STEP-3] Fetching from server...");
-        bool granted = attService.authenticateNFC(cardIdentifier, deviceId, emp);
+        bool commError = false;
+        bool granted = attService.authenticateNFC(cardIdentifier, deviceId, emp, &commError);
         if (!granted) {
-            empDisplay->showError(emp.hasData ? "Access Denied" : "Card Not Registered");
+            if (commError) {
+                // We couldn't reach/parse the server — this is NOT a
+                // registration verdict, so don't tell the employee their
+                // card isn't registered. See authenticateNFC()'s comment.
+                empDisplay->showError("Connection Error\nTap again");
+            } else {
+                empDisplay->showError(emp.hasData ? "Access Denied" : "Card Not Registered");
+            }
             enterState(STATE_NFC_ERROR);
             return;
         }
@@ -1568,6 +1692,17 @@ static void nfcWorkerBody(const String& cardIdentifier) {
     if (SDDatabase::isReady()) {
         SDDatabase::logAttendance(ts, cardIdentifier, emp, clockType, deviceId);
         Serial.println("[STEP-7] SD logged");
+    }
+
+    // ── STEP 7b: Raw tap log (debug-only, separate from /attendance/) ────
+    // Every physical tap that reaches this point, unconditionally — name +
+    // NFC UID + time — so a mis-dated or mis-typed attendance row can be
+    // cross-checked against "what did the reader actually see, and when".
+    // Lives in /tap_log/, its own per-date file, never synced to the server
+    // and never touched by the Attendance Editor (that only edits the
+    // server DB via attendance.php, which has no route to this file).
+    if (SDDatabase::isReady()) {
+        SDDatabase::logRawTap(ts, emp.fullName, cardIdentifier);
     }
 
     // ── STEP 8: Enqueue (upload handled later by flushPending) ───────────
@@ -2047,11 +2182,18 @@ void loop() {
     }
 
     // ── Screensaver burn-in protection: dim after N seconds ────────────────
+    // Re-enabled per request. Note the original tradeoff still applies:
+    // fadeBacklight() blocks loop() (and therefore NFC polling) for up to
+    // ~800ms while it steps the backlight down. In practice a tap landing
+    // in that exact window is rare, and full brightness for the actual
+    // profile/photo screen is unaffected either way (nfcWorkerBody() always
+    // forces backlightOn() before drawing a profile, dim or not).
     if (screenIsOff && !g_screensaverDimmed &&
         (now - g_screensaverEnteredMs >= DIM_AFTER_SCREENSAVER_MS)) {
-        g_screensaverDimmed = true;
-        TFTDisplayManager::fadeBacklight(SCREENSAVER_DIM_LEVEL, 400);
-        Serial.println("[Screen] Screensaver dimmed (burn-in protection)");
+        if (TFTDisplayManager::fadeBacklight(SCREENSAVER_DIM_LEVEL, 800)) {
+            g_screensaverDimmed = true;
+            Serial.println("[Screen] Screensaver dimmed (burn-in protection)");
+        }
     }
 
     // ── Idle reconcile burst (screen-off polling for portal edits/deletes) ─
@@ -2402,13 +2544,26 @@ void loop() {
 
         case STATE_NFC_PROFILE: {
             // During peak hours use a shorter display window so the queue moves faster.
-            unsigned long displayMs = isPeakHour() ? PROFILE_DISPLAY_PEAK_MS : PROFILE_DISPLAY_MS;
-
-            // A buffered next-card also short-circuits the wait immediately:
-            // the current person has clearly moved on, so show the next one now.
+            unsigned long displayMs = PROFILE_DISPLAY_MS;   // same value, peak or not — see define above
+            // Display duration only matters if NO one else taps: it resets
+            // every time a fresh profile appears, so an employee's photo
+            // stays up as long as the reader stays quiet. A buffered
+            // next-card always wins immediately and swaps straight into the
+            // new profile — no intermediate dashboard in between. FIX: the
+            // old code called drawStaticUI() (painting the full dashboard)
+            // and THEN immediately called handleNFCDetected() for the
+            // buffered card, which overwrote it with the loading screen a
+            // moment later — that showed up as a visible flash of the
+            // dashboard on a fast-moving line. Now a swap skips the
+            // dashboard redraw entirely.
             bool nextCardReady = (_nextPendingCard.length() > 0);
 
-            if (stateElapsed() >= displayMs || nextCardReady) {
+            if (nextCardReady) {
+                String buffered = _nextPendingCard;
+                _nextPendingCard = "";
+                Serial.println("[NFC] Processing buffered scan-ahead card: " + buffered);
+                handleNFCDetected(buffered);
+            } else if (stateElapsed() >= displayMs) {
                 enterState(STATE_DASHBOARD);
                 drawStaticUI();
                 updateStatusDots(isConnected, SDDatabase::isReady(), true);
@@ -2426,21 +2581,12 @@ void loop() {
                                    String(timeShort));
                 }
                 resetScreenTimer();
-
-                // If a card was buffered while we were showing the profile,
-                // process it immediately without waiting for the next loop tick.
-                if (nextCardReady) {
-                    String buffered = _nextPendingCard;
-                    _nextPendingCard = "";
-                    Serial.println("[NFC] Processing buffered scan-ahead card: " + buffered);
-                    handleNFCDetected(buffered);
-                }
             }
             break;
         }
 
         case STATE_NFC_ERROR:
-            if (stateElapsed() >= PROFILE_DISPLAY_MS) {
+            if (stateElapsed() >= NFC_ERROR_DISPLAY_MS) {
                 enterState(STATE_DASHBOARD);
                 drawStaticUI();
                 updateStatusDots(isConnected, SDDatabase::isReady(), true);
@@ -2466,10 +2612,12 @@ void loop() {
             tick += (uint8_t)ticked;
             if (!screenIsOff) {
                 pulseStatus(tick % 2);
-                updateClock(clkH, clkM, clkS);
+                if (clockIsSynced()) updateClock(clkH, clkM, clkS);
+                else                 handleUnsyncedClockOrReboot(false);
                 if (tick % 60   == 0) updateDate(buildDateStr());
             } else {                                      // screensaver is showing
-                updateScreensaverClock(clkH, clkM, clkS);
+                if (clockIsSynced()) updateScreensaverClock(clkH, clkM, clkS);
+                else                 handleUnsyncedClockOrReboot(true);
                 if (tick % 60   == 0) updateScreensaverDate(buildDateStr());
             }
             if (tick % 3600 == 0 && isConnected) syncNTPTime();
@@ -2568,6 +2716,17 @@ void loop() {
                 // prompt and skip the network call entirely — no server
                 // round trip can ever succeed with the raw UID anyway.
                 if (currentState == STATE_DASHBOARD) {
+                    // BUG FIX: this is the one NFC error path that draws
+                    // directly here on Core 1 instead of going through
+                    // nfcWorkerBody() (which always wakeScreen()s first) —
+                    // a fast tap that drops the card before the NDEF text
+                    // finishes reading lands exactly here. Without this
+                    // wake, showError() painted the error card straight on
+                    // top of a still-dimmed screensaver (never cleared,
+                    // never brought back to full brightness) — the
+                    // overlap/stuck-dim bug. Rule: any NFC activity —
+                    // success OR failure — wakes the screen first.
+                    if (screenIsOff) wakeScreen();
                     empDisplay->showError("Read failed\nTap again");
                     enterState(STATE_NFC_ERROR);
                     resetScreenTimer();
@@ -2604,7 +2763,29 @@ void loop() {
             }
 
         } else {
-            if (_cardConfirmCt > 0) { _lastRawCard = ""; _cardConfirmCt = 0; }
+            // Card lifted off the reader before cardConfirmed() ever reached
+            // CARD_CONFIRM_NEEDED agreeing reads (a "quick tap and go").
+            // BUG FIX: this used to just silently reset the counters here —
+            // on a busy line, an employee who taps and immediately walks off
+            // got zero feedback and zero attendance record, with nothing in
+            // Serial/SD to show a tap even happened. Now an abandoned,
+            // never-confirmed tap surfaces the same on-screen error a failed
+            // read gets, so the employee sees it didn't register instead of
+            // assuming it did. A tap that WAS already confirmed and handed
+            // off to handleNFCDetected() (_cardConfirmCt == CARD_CONFIRM_NEEDED)
+            // is a normal, successful card lift-off — that case still resets
+            // silently since the record was already saved.
+            if (_cardConfirmCt > 0) {
+                bool wasUnconfirmed = (_cardConfirmCt < CARD_CONFIRM_NEEDED);
+                _lastRawCard   = "";
+                _cardConfirmCt = 0;
+                if (wasUnconfirmed && currentState == STATE_DASHBOARD) {
+                    if (screenIsOff) wakeScreen();
+                    empDisplay->showError("Tap too quick\nHold ~1 sec");
+                    enterState(STATE_NFC_ERROR);
+                    resetScreenTimer();
+                }
+            }
         }
         nfc_poll_end:;
     }

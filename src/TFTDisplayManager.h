@@ -129,11 +129,15 @@ public:
     static void backlightOff();
     
     /**
-     * Fade backlight to target brightness
+     * Fade backlight to target brightness. Returns true if the fade
+     * completed uninterrupted, false if it was aborted early (e.g. a tap
+     * woke the screen mid-fade via backlightOn() on the other core) — the
+     * caller should treat false as "didn't actually reach target" rather
+     * than assuming the dim happened.
      * @param targetBrightness Target brightness (0-255)
      * @param durationMs Duration of fade in milliseconds
      */
-    static void fadeBacklight(uint8_t targetBrightness, uint16_t durationMs = 500);
+    static bool fadeBacklight(uint8_t targetBrightness, uint16_t durationMs = 500);
     
     // ─────────────────────────────────────────────────────────────────────────
     // Color Utilities
@@ -256,8 +260,14 @@ public:
 private:
     static TFT_eSPI* _tft;
     static bool _initialized;
-    static uint8_t _currentBrightness;
+    // volatile: written from loop() on Core 1 (screensaver dim/fade) and
+    // from the NFC worker task on Core 0 (wakeScreen() -> backlightOn()).
+    // Also guarded by _backlightMux below so the actual ledcWrite() can't
+    // be interleaved between cores (that interleaving is what caused the
+    // visible flicker at low dim levels).
+    static volatile uint8_t _currentBrightness;
     static uint8_t _rotation;
+    static portMUX_TYPE _backlightMux;
     
     // Private constructor (static class)
     TFTDisplayManager() = delete;

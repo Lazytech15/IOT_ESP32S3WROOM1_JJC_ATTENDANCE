@@ -453,12 +453,24 @@ public:
 
     // ══════════════════════════════════════════════════════════════════════════
     // authenticateNFC
+    //
+    // outCommError (optional): distinguishes "server explicitly said this
+    // card isn't registered" from "we couldn't even reach/parse the server".
+    // Both used to collapse into the same false return, which meant a
+    // network hiccup or decrypt failure showed the employee the exact same
+    // "Card Not Registered" card as a genuinely unregistered NFC tag — so a
+    // real registration problem and a Wi-Fi blip were indistinguishable
+    // both on-screen and to whoever reads the complaint afterward. Left
+    // false only when the server was reached and returned a well-formed
+    // "not found" response.
     // ══════════════════════════════════════════════════════════════════════════
     bool authenticateNFC(const String& nfcUid,
                          const String& deviceId,
-                         EmployeeProfile& employee) {
+                         EmployeeProfile& employee,
+                         bool* outCommError = nullptr) {
         Serial.println("\n[HTTP] 🔐 Authenticating NFC: " + nfcUid);
         Serial.flush();
+        if (outCommError) *outCommError = false;
 
         DynamicJsonDocument reqDoc(256);
         reqDoc["nfc_access"] = nfcUid;
@@ -471,8 +483,10 @@ public:
 
         DynamicJsonDocument respDoc(8192);
         if (!postAndDecrypt(serverURL + "/api/nfc-auth", payload, respDoc)) {
-            Serial.println("[HTTP] ❌ authenticateNFC failed");
+            Serial.println("[HTTP] ❌ authenticateNFC failed — request/decrypt error, "
+                            "NOT a \"not registered\" response");
             Serial.flush();
+            if (outCommError) *outCommError = true;
             return false;
         }
 
@@ -480,6 +494,8 @@ public:
             String msg = respDoc["message"] | respDoc["error"] | "Unknown error";
             Serial.println("[HTTP] ❌ Server error: " + msg);
             Serial.flush();
+            // Server was reached and responded — this IS a real "not
+            // registered"/denied verdict, not a comm failure.
             return false;
         }
 
@@ -498,6 +514,9 @@ public:
                 Serial.print(String(kv.key().c_str()) + " ");
             Serial.println();
             Serial.flush();
+            // Server responded but the payload shape wasn't what we expect —
+            // treat as a comm/protocol problem, not a registration verdict.
+            if (outCommError) *outCommError = true;
             return false;
         }
 

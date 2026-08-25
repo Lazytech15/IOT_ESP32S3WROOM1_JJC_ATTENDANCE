@@ -166,6 +166,17 @@ void updateScreensaverClock(uint8_t h, uint8_t m, uint8_t s) {
     _ssTft->drawString(buf, screenW / 2, SS_TIME_Y, 7);   // font 7 = 7-seg digits
 }
 
+// Unsynced counterpart to updateScreensaverClock() — see
+// dashboard.cpp's updateClockUnsynced() for why this exists.
+void updateScreensaverClockUnsynced() {
+    if (!_ssTft) return;
+
+    int16_t screenW = _ssTft->width();
+    _ssTft->setTextDatum(MC_DATUM);
+    _ssTft->setTextColor(TFT_WHITE, TFT_BLACK);
+    _ssTft->drawString("--:--:--", screenW / 2, SS_TIME_Y, 7);
+}
+
 void updateScreensaverDate(const String& dateStr) {
     if (!_ssTft) return;
 

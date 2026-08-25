@@ -50,6 +50,19 @@ public:
                                const String& eventType,
                                const String& deviceId);
 
+    // ── Raw NFC tap log — separate from /attendance/, for debugging only ──
+    // Appends one line per physical card tap to /tap_log/YYYY-MM-DD.csv,
+    // regardless of whether the tap resolved to a known employee, was a
+    // duplicate, etc. — a plain "who tapped when" record that never gets
+    // touched by anything else on the device (not read by the dashboard,
+    // not uploaded, not editable from the web portal's Attendance Editor —
+    // that editor only ever talks to the server DB via attendance.php,
+    // which has no route into this file at all). Purely local, append-only,
+    // for tracing what the reader actually saw on a given day.
+    static bool logRawTap(const String& timeStr,
+                           const String& employeeName,
+                           const String& nfcUid);
+
     static String readTodayCSV();
     static String readCSV(const String& dateOrPath);
     static String listAttendanceDates();
@@ -126,6 +139,7 @@ private:
     static int    _cachedOuts;
     static bool   ensureDir(const char* path);
     static String todayFilename();
+    static String todayTapLogFilename();
     static String csvEscape(const String& s);
 
     SDDatabase() = delete;

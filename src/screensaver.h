@@ -54,6 +54,7 @@ void drawScreensaver();
 
 // Repaints just the HH:MM:SS line (military/24h format).
 void updateScreensaverClock(uint8_t h, uint8_t m, uint8_t s);
+void updateScreensaverClockUnsynced();
 
 // Repaints just the date line, e.g. "August 19, 2026".
 void updateScreensaverDate(const String& dateStr);

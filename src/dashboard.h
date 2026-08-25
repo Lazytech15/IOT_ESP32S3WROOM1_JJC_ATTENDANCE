@@ -57,6 +57,7 @@ void dashboardInit();
 void showLoadingAnimation(int progress, const char* message);
 void drawStaticUI();
 void updateClock(uint8_t h, uint8_t m, uint8_t s);
+void updateClockUnsynced();
 void updateDate(const String& dateStr);
 void updateAttendanceStats(int checkIns, int checkOuts);
 void updateLastScan(const String& name, const String& eventType, const String& timeStr);

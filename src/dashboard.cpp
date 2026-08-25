@@ -294,6 +294,22 @@ void updateClock(uint8_t h, uint8_t m, uint8_t s) {
     t->setTextDatum(TL_DATUM);
 }
 
+// Clock has never been NTP/RTC-synced (clkEpoch == 0 in main.cpp): show a
+// dashed placeholder instead of the free-running software clock, which
+// otherwise counts up from 00:00:00 like a stopwatch and can be mistaken
+// for a real (wrong) time. Same "--:--:--" convention already used by
+// updateDate()'s unsynced fallback and the Z8 last-scan strips.
+void updateClockUnsynced() {
+    TFT_eSPI* t = tft();
+    if (!t) return;
+
+    t->setTextColor(TFTColors::WHITE, TFTColors::BG_DARK);
+    t->setTextDatum(MC_DATUM);
+    t->drawString("--:--:--", SCREEN_W / 2, Z3_CLOCK_CY, 7);
+
+    t->setTextDatum(TL_DATUM);
+}
+
 void updateDate(const String& dateStr) {
     TFT_eSPI* t = tft();
     if (!t) return;

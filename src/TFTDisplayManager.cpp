@@ -19,8 +19,9 @@
 // ── Static member definitions ─────────────────────────────────────────────────
 TFT_eSPI* TFTDisplayManager::_tft              = nullptr;
 bool      TFTDisplayManager::_initialized      = false;
-uint8_t   TFTDisplayManager::_currentBrightness = 255;
+volatile uint8_t TFTDisplayManager::_currentBrightness = 255;
 uint8_t   TFTDisplayManager::_rotation         = TFT_ROTATION;
+portMUX_TYPE TFTDisplayManager::_backlightMux  = portMUX_INITIALIZER_UNLOCKED;
 
 // ── TFTColors — zero-initialised; initColors() fills real values ──────────────
 namespace TFTColors {
@@ -169,26 +170,50 @@ int16_t   TFTDisplayManager::getWidth()  { return _tft ? (int16_t)_tft->width() 
 int16_t   TFTDisplayManager::getHeight() { return _tft ? (int16_t)_tft->height() : SCREEN_HEIGHT; }
 
 // ── Backlight (GPIO 9, LEDC PWM — full analog dimming, not just on/off) ──────
+// Critical section wraps both the shared _currentBrightness write and the
+// ledcWrite() call so a Core 0 tap (backlightOn()) and a Core 1 fade
+// (fadeBacklight()'s step loop) can never interleave on the same LEDC
+// register — that interleaving was the source of the flicker at low dim
+// levels (both cores racing to write the backlight duty cycle).
 void TFTDisplayManager::setBacklight(uint8_t brightness) {
+    portENTER_CRITICAL(&_backlightMux);
     _currentBrightness = brightness;
 #if defined(ESP_ARDUINO_VERSION) && ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
     ledcWrite(TFT_BL, brightness);
 #else
     ledcWrite(BACKLIGHT_PWM_CHANNEL, brightness);
 #endif
+    portEXIT_CRITICAL(&_backlightMux);
 }
 void TFTDisplayManager::backlightOn()  { setBacklight(255); }
 void TFTDisplayManager::backlightOff() { setBacklight(0); }
-void TFTDisplayManager::fadeBacklight(uint8_t target, uint16_t durationMs) {
-    int step  = (target > _currentBrightness) ? 1 : -1;
-    int steps = abs((int)target - (int)_currentBrightness);
-    if (steps == 0) return;
+bool TFTDisplayManager::fadeBacklight(uint8_t target, uint16_t durationMs) {
+    int start = _currentBrightness;
+    int step  = (target > start) ? 1 : -1;
+    int steps = abs((int)target - start);
+    if (steps == 0) return true;   // already at target — nothing to abort
     uint32_t delayPerStep = durationMs / steps;
-    for (int b = _currentBrightness; b != target; b += step) {
+    // Tracks the value THIS function last wrote (starts at the brightness
+    // already on hardware). The abort check compares against `lastWritten`,
+    // not against the upcoming step `b` — comparing to `b` before it was
+    // ever written meant every step after the first looked like an
+    // external change and the fade aborted on its very second iteration,
+    // silently never dimming at all.
+    int lastWritten = start;
+    for (int b = start + step; ; b += step) {
+        // If a tap woke the screen mid-fade (backlightOn() ran on Core 0
+        // and jumped _currentBrightness to 255), stop stepping down —
+        // otherwise this loop would keep dragging the brightness back
+        // toward `target` right after the wake, which looked like the
+        // screen "flickering" instead of staying lit. Report the abort so
+        // the caller doesn't wrongly assume the target was reached.
+        if (_currentBrightness != (uint8_t)lastWritten) return false;
         setBacklight((uint8_t)b);
+        lastWritten = b;
         delay(delayPerStep);
+        if (b == target) break;
     }
-    setBacklight(target);
+    return true;
 }
 
 // ── Color utility ─────────────────────────────────────────────────────────────

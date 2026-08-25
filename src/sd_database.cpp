@@ -98,6 +98,7 @@ bool SDDatabase::begin() {
     ensureDir("/attendance");
     ensureDir("/employees");
     ensureDir("/photos");
+    ensureDir("/tap_log");   // raw debug log, separate from /attendance/
 
     _ready = true;
     ensureDir("/logs");
@@ -209,6 +210,56 @@ bool SDDatabase::logAttendance(const String& timestamp,
     // that window. No extra condition needed: the suspend flag already
     // lines up with exactly the case we want quieted.
     SDLogger::logf("SD", SDLogger::INFO, "Logged: %s", row.c_str());
+    return true;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// logRawTap — raw debug log, one row per physical NFC tap
+// /tap_log/YYYY-MM-DD.csv (falls back to /tap_log/day_XXXXXX.csv pre-NTP,
+// same pattern as todayFilename()). Deliberately dumb and separate from
+// /attendance/: no event-type resolution, no employee-record lookups beyond
+// the name already resolved by the caller, nothing here ever gets synced to
+// the server or read back by the device — it's purely "what did the reader
+// see and when", for tracing tap-to-record issues after the fact.
+// ══════════════════════════════════════════════════════════════════════════════
+String SDDatabase::todayTapLogFilename() {
+    if (_dateProvider) {
+        String d = _dateProvider();
+        if (d.length() == 10) return "/tap_log/" + d + ".csv";
+    }
+    unsigned long day = millis() / 86400000UL;
+    char buf[40];
+    snprintf(buf, sizeof(buf), "/tap_log/day_%06lu.csv", day);
+    return String(buf);
+}
+
+bool SDDatabase::logRawTap(const String& timeStr,
+                            const String& employeeName,
+                            const String& nfcUid) {
+    SDLockGuard _sdLock;   // serialize SD_MMC access across tasks (see sd_mutex.h)
+    if (!_ready) return false;
+
+    String fname = todayTapLogFilename();
+    bool isNew = !SD_MMC.exists(fname);
+
+    File f = SD_MMC.open(fname, FILE_APPEND);
+    if (!f) {
+        Serial.println("[SD] Cannot open tap log for append: " + fname);
+        return false;
+    }
+
+    if (isNew) {
+        f.println("time,name,nfc_uid");
+    }
+
+    String ts   = (timeStr.length() > 0) ? timeStr : String(millis());
+    String name = (employeeName.length() > 0) ? employeeName : "UNKNOWN";
+    String row  = csvEscape(ts) + "," + csvEscape(name) + "," + csvEscape(nfcUid);
+
+    f.println(row);
+    f.close();
+
+    SDLogger::logf("SD", SDLogger::INFO, "TapLog: %s", row.c_str());
     return true;
 }
 
