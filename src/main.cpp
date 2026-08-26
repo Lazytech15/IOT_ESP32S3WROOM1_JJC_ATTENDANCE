@@ -244,21 +244,31 @@ static String clockStr() {
 static String dateStr() {
     if (!clkEpoch) return "";
     time_t t = (time_t)clkEpoch;
-    struct tm* tm = gmtime(&t);
+    // clkEpoch is a true UTC instant (mktime() below converts the local
+    // wall-clock reading to UTC before storing it). Must decode it back
+    // with localtime_r(), NOT gmtime() — gmtime() reads the UTC calendar
+    // date, which for a UTC+8 site is still "yesterday" from local
+    // midnight until 08:00 local time. That mismatch was silently
+    // stamping every clock-in before 8 AM with the previous day's date
+    // even though the displayed/logged HH:MM:SS was correct.
+    struct tm tm;
+    localtime_r(&t, &tm);
     char b[12];
     snprintf(b, sizeof(b), "%04d-%02d-%02d",
-             tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday);
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
     return b;
 }
 static String buildDateStr() {
     if (clkEpoch) {
         static const char* days[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
         time_t t = (time_t)clkEpoch;
-        struct tm* tm = gmtime(&t);
+        // See dateStr() above — must use localtime_r(), not gmtime().
+        struct tm tm;
+        localtime_r(&t, &tm);
         char b[32];
         snprintf(b, sizeof(b), "%s - %04d-%02d-%02d",
-                 days[tm->tm_wday],
-                 tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday);
+                 days[tm.tm_wday],
+                 tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
         return String(b);
     }
     return "--- AWAITING SYNC ---";
@@ -2331,9 +2341,12 @@ void loop() {
                 // one fresh scan of the new file and reprimes correctly.
                 SDDatabase::resetTodayCountCache();
 
+                // Same gmtime()-vs-localtime() pitfall as dateStr() above —
+                // use local calendar day, not UTC, to decide "is it Monday".
                 time_t t = (time_t)clkEpoch;
-                struct tm* tmNow = gmtime(&t);
-                if (tmNow->tm_wday == 1) {  // Monday
+                struct tm tmNow;
+                localtime_r(&t, &tmNow);
+                if (tmNow.tm_wday == 1) {  // Monday
                     Serial.println("[Rollover] Monday — weekly employee re-sync flagged");
                     g_weeklyRefreshPending = true;
                 }

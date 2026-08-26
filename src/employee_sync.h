@@ -32,6 +32,8 @@
 #include "sd_database.h"
 #include "employee_profile_display.h"
 #include "sd_mutex.h"
+#include "WiFiManager.h"   // g_isScreenOff — lets the terminal-UI drawers below
+                           // know if the screensaver currently owns the TFT
 
 #define SYNC_META_PATH          "/employees/sync_meta.json"
 #define FULL_SYNC_INTERVAL_MS   (6UL * 3600UL * 1000UL)
@@ -1005,7 +1007,37 @@ private:
     }
 
     // ── TERMINAL UI ───────────────────────────────────────────────────────────
+    // _screenOwnedByScreensaver() — true while the screensaver (not the
+    // dashboard/sync UI) is the thing actually on the TFT right now.
+    //
+    // Every draw function below used to write straight to TFT_eSPI with no
+    // regard for what was currently displayed. If a full/weekly employee
+    // sync (or a manual "Sync Employees" portal action) landed while the
+    // device was sitting in the screensaver, these functions would paint
+    // the terminal-boot progress UI directly on top of it. The screensaver
+    // only ever repaints its own small clock/date regions (never a full
+    // fillScreen), so the result was a corrupted hybrid of both screens
+    // that never cleaned itself up until the next full dashboard redraw
+    // (e.g. the next real NFC tap). This mirrors the same
+    // g_isScreenOff-based guard main.cpp already uses around its own
+    // drawStaticUI()/updateStatusDots() calls — see the "screensaver-
+    // corruption guard" comments there.
+    //
+    // g_isScreenOff is a std::function set once in main.cpp's setup() (see
+    // WiFiManager.h) so this header — which has no direct access to
+    // main.cpp's file-local `screenIsOff` — can still ask the same
+    // question. If it hasn't been wired up yet (e.g. very early boot),
+    // fail open (assume the screen is available) rather than silently
+    // skipping every draw.
+    static bool _screenOwnedByScreensaver() {
+        return g_isScreenOff ? g_isScreenOff() : false;
+    }
+
     static void _showDownloadHeader(const char* title) {
+        if (_screenOwnedByScreensaver()) {
+            Serial.println("[Sync] Screensaver active — skipping TFT header draw");
+            return;
+        }
         TFT_eSPI* tft = TFTDisplayManager::getTFT();
         if (!tft) return;
         
@@ -1032,6 +1064,15 @@ private:
     }
 
     static void _updateProgress(int pct, const char* status, const String& detail, int cur, int total) {
+        // Same screensaver-corruption guard as _showDownloadHeader() above.
+        // Bail before touching any of the _syncLogs/_lastDraw bookkeeping
+        // too — those exist purely to drive what gets drawn, so there's
+        // nothing useful to keep in sync while drawing is skipped. The
+        // next call after the screensaver ends will just start a fresh
+        // frame (statusChanged/detailChanged will be true), so no visual
+        // history is actually lost.
+        if (_screenOwnedByScreensaver()) return;
+
         TFT_eSPI* tft = TFTDisplayManager::getTFT();
         if (!tft) return;
         
@@ -1135,6 +1176,12 @@ private:
     static void _showError(const char* msg) {
         Serial.println("[Sync] ❌ ERROR: " + String(msg));
         Serial.flush();
+        // Same screensaver-corruption guard as the other terminal-UI
+        // drawers above — the error is still fully logged to Serial either
+        // way, only the on-screen banner (plus its blocking 3s delay,
+        // which would otherwise stall the sync task while the screensaver
+        // is up for no visible benefit) is skipped.
+        if (_screenOwnedByScreensaver()) return;
         TFT_eSPI* tft = TFTDisplayManager::getTFT();
         if (!tft) return;
         
